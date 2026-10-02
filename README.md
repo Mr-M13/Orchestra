@@ -35,6 +35,7 @@ Application code comes after the foundations justify it.
 
 - [Vision](VISION.md)
 - [Orchestration lessons and failure-mode audit](docs/foundation/ORCHESTRATION-LESSONS-AUDIT.md) — living evidence from prior and current orchestration experience, translated into design invariants and architectural requirements.
+- [Domain Model v1](docs/foundation/DOMAIN-MODEL.md) — the provider-agnostic concepts, relationships and distinctions Orchestra uses to reason about goals, work, workers, evidence, authority, recovery and verified outcomes.
 
 The lessons audit remains open to new evidence throughout development; completing the initial audit does not freeze what Orchestra can learn.
 
