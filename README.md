@@ -36,6 +36,7 @@ Application code comes after the foundations justify it.
 - [Vision](VISION.md)
 - [Orchestration lessons and failure-mode audit](docs/foundation/ORCHESTRATION-LESSONS-AUDIT.md) — living evidence from prior and current orchestration experience, translated into design invariants and architectural requirements.
 - [Domain Model v1](docs/foundation/DOMAIN-MODEL.md) — the provider-agnostic concepts, relationships and distinctions Orchestra uses to reason about goals, work, workers, evidence, authority, recovery and verified outcomes.
+- [Authoritative State Model v1](docs/foundation/AUTHORITATIVE-STATE-MODEL.md) — defines where truth lives, which state is Orchestra-owned versus externally authoritative, what is append-only or derived, and how reconciliation, retries, staleness and coordinator authority work.
 
 The lessons audit remains open to new evidence throughout development; completing the initial audit does not freeze what Orchestra can learn.
 
