@@ -40,6 +40,7 @@ Application code comes after the foundations justify it.
 - [Failure and Recovery Model v1](docs/foundation/FAILURE-RECOVERY-MODEL.md) — classifies failure modes and defines safe retry, reconciliation, artifact preservation, escalation, crash recovery and unknown-outcome handling.
 - [Security and Authority Model v1](docs/foundation/SECURITY-AUTHORITY-MODEL.md) — separates identity, authentication, capability, access and authority; defines scoped delegation, credential boundaries, human approvals, least privilege, audit and compromise containment without hard-coding project policy.
 - [Testing and Verification Model v1](docs/foundation/TESTING-VERIFICATION-MODEL.md) — defines claims, evidence, verification scope/results, proof levels, freshness, independence, invalidation and outcome verification without turning narrow green checks into broad certainty.
+- [Learning Mode v1](docs/foundation/LEARNING-MODE.md) — lets understanding grow through real project work using adaptive, evidence-grounded explanations while keeping teaching separate from authority, verification and orchestration.
 
 The lessons audit remains open to new evidence throughout development; completing the initial audit does not freeze what Orchestra can learn.
 
