@@ -31,6 +31,13 @@ We will begin with understanding before implementation:
 
 Application code comes after the foundations justify it.
 
+### Foundation documents
+
+- [Vision](VISION.md)
+- [Orchestration lessons and failure-mode audit](docs/foundation/ORCHESTRATION-LESSONS-AUDIT.md) — living evidence from prior and current orchestration experience, translated into design invariants and architectural requirements.
+
+The lessons audit remains open to new evidence throughout development; completing the initial audit does not freeze what Orchestra can learn.
+
 ## Human relationship
 
 Orchestra should increase human capability rather than obscure the system behind automation. It should preserve evidence, explain important decisions, make uncertainty visible, and keep genuine human decisions with the human.
