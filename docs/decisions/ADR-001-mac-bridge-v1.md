@@ -13,14 +13,14 @@ The local `dzn-deepseek` wrapper currently adds `--approve-for-me` and changes i
 
 - Use an outbound HTTPS polling process and GitHub Issues as the v1 durable queue. GitHub remains authoritative for issue and label state; a private local state directory records heartbeat, attempts, PID, exit code and output path.
 - Require an allowlisted issue author, explicit approval label, and exactly one named worker label before launch. Remove the approval label as part of claiming to prevent redelivery after a crash.
-- Configure one explicit local project root and one worker at a time. Invoke the Codex CLI directly with `exec` and `workspace-write`; applying the approval label is the human gate for that attempt because the daemon has no interactive approval channel. Do not allow sandbox escalation or turn issue content into shell commands or paths.
+- Configure one trusted local Git source root and one worker at a time. Fetch its configured base ref and create a separate Git worktree/branch per issue before invoking Codex directly with `exec` and `workspace-write`. Applying the approval label is the human gate for that attempt because the daemon has no interactive approval channel. Do not allow sandbox escalation or turn issue content into shell commands or paths.
 - Capture output locally with owner-only permissions. Publish lifecycle status only, not logs or local paths, to GitHub.
 - On uncertain worker recovery, preserve the issue and workspace, mark the task interrupted after confirming the process is gone, and require explicit re-approval. Never retry automatically.
 - Reuse the host's Git credential helper. Keep credentials and configuration outside the repository.
 
 ## Consequences
 
-The bridge has no inbound listener and needs no third-party package. GitHub outage pauses intake while local logs/state remain. A task is execution input, not proof of success. Human issue-label authority and Codex's configured confirmation behavior remain essential. v1 does not provide multi-Mac leases, automatic retries, remote cancellation, independent verification or production deployment authority.
+The bridge has no inbound listener and needs no third-party package. GitHub outage pauses intake while local logs/state remain. Separate issue worktrees prevent workers from mixing edits in the trusted source checkout. Worktrees remain local for review; v1 does not push branches or open PRs. A task is execution input, not proof of success. Human issue-label authority remains essential. v1 does not provide multi-Mac leases, automatic retries, remote cancellation, independent verification or production deployment authority.
 
 ## Rejected for v1
 

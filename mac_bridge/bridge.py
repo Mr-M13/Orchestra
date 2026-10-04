@@ -11,6 +11,7 @@ import sys
 import threading
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +38,7 @@ class Config:
     project_root: Path
     state_dir: Path
     workers: dict[str, Worker]
+    base_ref: str = "origin/main"
     poll_seconds: int = 30
     approved_label: str = "bridge-approved"
     claimed_label: str = "bridge-claimed"
@@ -50,6 +52,9 @@ class Config:
         state_dir = Path(raw["state_dir"]).expanduser().resolve()
         if state_dir == root or state_dir.is_relative_to(root):
             raise ValueError("state_dir must be outside the worker project root")
+        base_ref = raw.get("base_ref", "origin/main")
+        if not re.fullmatch(r"origin/[A-Za-z0-9._/-]+", base_ref) or ".." in base_ref.split("/"):
+            raise ValueError("base_ref must name a remote-tracking branch such as origin/main")
         workers = {
             key: Worker(key, tuple(value["command"]), value.get("codex_home"))
             for key, value in raw["workers"].items()
@@ -67,7 +72,7 @@ class Config:
                 raise ValueError(f"{worker.name} command bypasses approval; refusing unsafe profile")
         return cls(
             repository=raw["repository"], project_root=root,
-            state_dir=state_dir, workers=workers,
+            state_dir=state_dir, base_ref=base_ref, workers=workers,
             poll_seconds=max(10, int(raw.get("poll_seconds", 30))),
             approved_label=raw.get("approved_label", "bridge-approved"),
             claimed_label=raw.get("claimed_label", "bridge-claimed"),
@@ -165,6 +170,49 @@ class Bridge:
         os.chmod(temp, 0o600)
         temp.replace(self.state_path)
 
+    def _git(self, directory: Path, *args: str, allow_failure: bool = False) -> tuple[int, str]:
+        proc = subprocess.run(
+            ["/usr/bin/git", "-C", str(directory), *args], capture_output=True, text=True,
+            check=False, timeout=120, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+        if proc.returncode and not allow_failure:
+            raise RuntimeError(f"Git workspace operation failed ({args[0]}), exit {proc.returncode}")
+        return proc.returncode, proc.stdout.strip()
+
+    def _prepare_workspace(self, number: int, branch: str, previous: dict[str, Any] | None) -> Path:
+        worktree = self.config.state_dir / "worktrees" / f"issue-{number}"
+        if previous and previous.get("workspace_path"):
+            prior_path = Path(previous["workspace_path"]).resolve()
+            if prior_path != worktree.resolve():
+                raise RuntimeError("recorded task workspace does not match its issue")
+            if worktree.exists():
+                _, common_root = self._git(worktree, "rev-parse", "--path-format=absolute", "--git-common-dir")
+                _, expected_common = self._git(self.config.project_root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+                _, current_branch = self._git(worktree, "branch", "--show-current")
+                if Path(common_root).resolve() != Path(expected_common).resolve() or current_branch != branch:
+                    raise RuntimeError("saved task workspace is not the expected isolated branch")
+                return worktree
+        if worktree.exists():
+            raise RuntimeError("task worktree path already exists without a matching saved attempt")
+
+        _, remote_url = self._git(self.config.project_root, "remote", "get-url", "origin")
+        parsed = urlparse(remote_url)
+        remote_repo = parsed.path.strip("/").removesuffix(".git").lower()
+        if parsed.scheme != "https" or parsed.hostname != "github.com" or remote_repo != self.config.repository.lower():
+            raise RuntimeError("project root origin must be the configured GitHub repository over HTTPS")
+        self._git(self.config.project_root, "fetch", "--no-tags", "origin", self.config.base_ref.split("/", 1)[1])
+        ref = "refs/heads/" + branch
+        exists, _ = self._git(self.config.project_root, "show-ref", "--verify", "--quiet", ref, allow_failure=True)
+        if exists == 0:
+            raise RuntimeError("task branch already exists without its saved worktree")
+        if exists != 1:
+            raise RuntimeError("could not verify task branch availability")
+        worktree.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(worktree.parent, 0o700)
+        self._git(self.config.project_root, "worktree", "add", "--detach", str(worktree), self.config.base_ref)
+        self._git(worktree, "switch", "-c", branch)
+        return worktree
+
     def heartbeat(self) -> dict[str, Any]:
         self.state["heartbeat"] = utc_now()
         self.state["workers"] = {
@@ -243,15 +291,20 @@ class Bridge:
         attempt = int(previous.get("attempt", 0)) + 1 if previous else 1
         if previous:
             history.append({key: value for key, value in previous.items() if key != "history"})
+        branch = previous.get("branch", f"bridge/issue-{number}") if previous else f"bridge/issue-{number}"
+        worktree = self.config.state_dir / "worktrees" / f"issue-{number}"
         # Claim remotely before spawning so a crash cannot silently start duplicate workers.
         self.github.add_label(number, self.config.claimed_label)
         self.github.remove_label(number, self.config.approved_label)
         self.github.remove_label(number, self.config.done_label)
         self.github.remove_label(number, "bridge-failed")
         self.state["tasks"][task_id] = {"status": "starting", "worker": worker.name, "attempt": attempt,
-                                        "history": history, "started_at": utc_now(), "reported": False}
+                                        "history": history, "branch": branch, "workspace_path": str(worktree),
+                                        "started_at": utc_now(), "reported": False}
         self._save()
-        self.github.comment(number, f"Mac Bridge accepted this task for `{worker.name}`. The approval label authorizes this attempt; task input stays within the configured workspace-write sandbox.")
+        task_root = self._prepare_workspace(number, branch, previous)
+        self.state["tasks"][task_id]["workspace_path"] = str(task_root)
+        self.github.comment(number, f"Mac Bridge accepted this task for `{worker.name}` on isolated branch `{branch}`. The approval label authorizes this attempt; task input stays within the configured workspace-write sandbox.")
         out = self.config.state_dir / f"issue-{number}.log"
         fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         prompt_path = self.config.state_dir / f"issue-{number}.prompt.txt"
@@ -264,13 +317,13 @@ class Bridge:
         # The explicit GitHub approval label is the per-attempt human gate. In a daemon
         # there is no interactive approval channel; never escalate beyond this sandbox.
         args = [*worker.command, "--ask-for-approval", "never", "exec", "--sandbox", "workspace-write",
-                "--cd", str(self.config.project_root), "-"]
+                "--cd", str(task_root), "-"]
         env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
         if worker.codex_home:
             env["CODEX_HOME"] = str(Path(worker.codex_home).expanduser())
         try:
             prompt_input = prompt_path.open("rb")
-            proc = self.popen(args, cwd=self.config.project_root, env=env, stdin=prompt_input,
+            proc = self.popen(args, cwd=task_root, env=env, stdin=prompt_input,
                               stdout=fd, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
         finally:
             if "prompt_input" in locals():
@@ -297,7 +350,7 @@ class Bridge:
                 continue
             number = int(task_id)
             if not task.get("commented"):
-                self.github.comment(number, f"Bridge worker `{task['worker']}` finished with exit code {task['exit_code']}. Local state contains the exit status and output path.")
+                self.github.comment(number, f"Bridge worker `{task['worker']}` finished with exit code {task['exit_code']} on `{task.get('branch', 'unknown branch')}`. Local state contains the output path.")
                 task["commented"] = True
                 self._save()
             self.github.remove_label(number, self.config.claimed_label)
