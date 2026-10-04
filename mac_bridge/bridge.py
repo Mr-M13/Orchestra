@@ -238,7 +238,7 @@ class Bridge:
         self.github.remove_label(number, self.config.approved_label)
         self.state["tasks"][str(number)] = {"status": "starting", "worker": worker.name, "started_at": utc_now()}
         self._save()
-        self.github.comment(number, f"Mac Bridge accepted this task for `{worker.name}`. The issue body is treated as untrusted task input; the worker runs with workspace-write and normal approval behavior.")
+        self.github.comment(number, f"Mac Bridge accepted this task for `{worker.name}`. The approval label authorizes this attempt; task input stays within the configured workspace-write sandbox.")
         out = self.config.state_dir / f"issue-{number}.log"
         fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         prompt_path = self.config.state_dir / f"issue-{number}.prompt.txt"
