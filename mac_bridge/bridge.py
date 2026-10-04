@@ -168,7 +168,8 @@ class Bridge:
     def heartbeat(self) -> dict[str, Any]:
         self.state["heartbeat"] = utc_now()
         self.state["workers"] = {
-            name: {"running": any(row[3] == name for row in self.children.values())}
+            name: {"running": any(task.get("worker") == name and task.get("status") in {"starting", "running"}
+                                   for task in self.state["tasks"].values())}
             for name in self.config.workers
         }
         self._save()
@@ -184,7 +185,10 @@ class Bridge:
                 continue
             number = int(issue["number"])
             task_id = str(number)
-            if task_id in self.state["tasks"]:
+            previous = self.state["tasks"].get(task_id)
+            if previous and previous.get("status") in {"starting", "running"}:
+                continue
+            if previous and previous.get("status") not in {"interrupted", "failed", "succeeded"}:
                 continue
             labels = {x["name"] for x in issue.get("labels", [])}
             if len([label for label in labels if label.startswith("bridge-worker:")]) != 1:
@@ -233,10 +237,19 @@ class Bridge:
 
     def _start_issue(self, issue: dict[str, Any], worker: Worker) -> None:
         number = int(issue["number"])
+        task_id = str(number)
+        previous = self.state["tasks"].get(task_id)
+        history = list(previous.get("history", [])) if previous else []
+        attempt = int(previous.get("attempt", 0)) + 1 if previous else 1
+        if previous:
+            history.append({key: value for key, value in previous.items() if key != "history"})
         # Claim remotely before spawning so a crash cannot silently start duplicate workers.
         self.github.add_label(number, self.config.claimed_label)
         self.github.remove_label(number, self.config.approved_label)
-        self.state["tasks"][str(number)] = {"status": "starting", "worker": worker.name, "started_at": utc_now()}
+        self.github.remove_label(number, self.config.done_label)
+        self.github.remove_label(number, "bridge-failed")
+        self.state["tasks"][task_id] = {"status": "starting", "worker": worker.name, "attempt": attempt,
+                                        "history": history, "started_at": utc_now(), "reported": False}
         self._save()
         self.github.comment(number, f"Mac Bridge accepted this task for `{worker.name}`. The approval label authorizes this attempt; task input stays within the configured workspace-write sandbox.")
         out = self.config.state_dir / f"issue-{number}.log"
@@ -264,7 +277,7 @@ class Bridge:
                 prompt_input.close()
             os.close(fd)
         self.children[proc.pid] = (proc, out, number, worker.name)
-        self.state["tasks"][str(number)].update({"status": "running", "pid": proc.pid, "log": str(out)})
+        self.state["tasks"][task_id].update({"status": "running", "pid": proc.pid, "log": str(out)})
         self._save()
 
     def reap(self) -> None:
@@ -275,16 +288,28 @@ class Bridge:
             self.children.pop(pid)
             status = "succeeded" if result == 0 else "failed"
             entry = self.state["tasks"][str(number)]
-            entry.update({"status": status, "exit_code": result, "finished_at": utc_now()})
+            entry.update({"status": status, "exit_code": result, "finished_at": utc_now(), "reported": False})
             self._save()
-            self.github.comment(number, f"Bridge worker `{worker}` finished with exit code {result}. Local state contains the exit status and output path.")
+
+    def publish_terminal_states(self) -> None:
+        for task_id, task in self.state["tasks"].items():
+            if task.get("status") not in {"succeeded", "failed"} or task.get("reported"):
+                continue
+            number = int(task_id)
+            if not task.get("commented"):
+                self.github.comment(number, f"Bridge worker `{task['worker']}` finished with exit code {task['exit_code']}. Local state contains the exit status and output path.")
+                task["commented"] = True
+                self._save()
             self.github.remove_label(number, self.config.claimed_label)
-            self.github.add_label(number, self.config.done_label if result == 0 else "bridge-failed")
+            self.github.add_label(number, self.config.done_label if task["status"] == "succeeded" else "bridge-failed")
+            task["reported"] = True
+            self._save()
 
     def run(self) -> None:
         while not self.stopping.is_set():
             try:
                 self.reap()
+                self.publish_terminal_states()
                 self.intake_once()
                 self.heartbeat()
             except Exception as exc:
@@ -312,6 +337,7 @@ def main(argv: list[str] | None = None) -> int:
     bridge = Bridge(config, github)
     if args.once:
         bridge.reap()
+        bridge.publish_terminal_states()
         bridge.intake_once()
         bridge.heartbeat()
         return 0

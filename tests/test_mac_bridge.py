@@ -112,11 +112,30 @@ class BridgeTests(unittest.TestCase):
         log_path.write_text("worker output including private details")
         proc.code = 0
         self.bridge.reap()
+        self.bridge.publish_terminal_states()
         self.assertEqual(self.bridge.state["tasks"]["7"]["status"], "succeeded")
         comments = [call.args[1] for call in self.github.comment.call_args_list]
         self.assertEqual(len(comments), 2)
         self.assertTrue(any("finished with exit code 0" in value for value in comments))
         self.assertTrue(all("private details" not in value for value in comments))
+
+    def test_explicit_reapproval_creates_a_new_attempt(self):
+        self.bridge.state["tasks"]["7"] = {"status": "interrupted", "attempt": 1, "worker": "codex", "exit_code": None}
+        self.github.issues.return_value = [issue()]
+        self.assertEqual(self.bridge.intake_once(), 1)
+        current = self.bridge.state["tasks"]["7"]
+        self.assertEqual(current["attempt"], 2)
+        self.assertEqual(current["history"][0]["status"], "interrupted")
+
+    def test_terminal_github_update_retries_after_api_failure(self):
+        self.bridge.state["tasks"]["7"] = {"status": "succeeded", "worker": "codex", "exit_code": 0,
+                                             "reported": False}
+        self.github.comment.side_effect = [RuntimeError("offline"), None]
+        with self.assertRaisesRegex(RuntimeError, "offline"):
+            self.bridge.publish_terminal_states()
+        self.assertFalse(self.bridge.state["tasks"]["7"].get("commented", False))
+        self.bridge.publish_terminal_states()
+        self.assertTrue(self.bridge.state["tasks"]["7"]["reported"])
 
     def test_config_rejects_state_inside_worker_checkout(self):
         config_path = self.state / "config.json"
