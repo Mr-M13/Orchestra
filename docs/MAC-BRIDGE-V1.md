@@ -7,7 +7,7 @@ The Mac Bridge is a small local worker dispatcher. It initiates HTTPS requests t
 - The bridge watches only the configured repository and `bridge-approved` issues.
 - Only configured GitHub authors can cause work to launch. Use GitHub's issue-label permission controls so only trusted operators can apply `bridge-approved` and `bridge-worker:*` labels.
 - Exactly one of `bridge-worker:codex`, `bridge-worker:dzn-ina`, or `bridge-worker:dzn-deepseek` must be present.
-- One worker runs at a time in the configured project root. Applying `bridge-approved` is the human approval for that one task attempt. The worker receives Codex `exec` with `workspace-write` and no interactive approval channel; it cannot request escalation, and command failures return to the worker. The root is a single explicit allowlist.
+- One worker runs at a time. For each issue the bridge fetches the configured base ref and creates an isolated Git worktree and `bridge/issue-<number>` branch under the private state directory. Applying `bridge-approved` is the human approval for that one task attempt. The worker receives Codex `exec` with `workspace-write` and no interactive approval channel; it cannot request escalation, and command failures return to the worker.
 - Issue bodies are user task input. Bridge settings are not derived from issue text. Bodies above 64 KiB stay queued.
 - A worker that exits unexpectedly is recorded as interrupted and is never retried automatically. Reapply `bridge-approved` only after checking the workspace and local log.
 - No secrets are stored in repository files. GitHub credentials come from the host's configured Git credential helper. State, prompts and logs are written with owner-only permissions under the configured state directory.
@@ -18,7 +18,7 @@ The bridge is intentionally not a general remote shell. It does not accept comma
 ## Configure
 
 1. Install Python 3.11 or newer and Codex CLI. Confirm the host's Git credential helper can authenticate to GitHub without prompting (`git credential fill` for `github.com`). Do not put a token in this file.
-2. Create a private working copy of this repository and select the one local Git repository the bridge may expose to workers. Do not point `project_root` at a production checkout.
+2. Select a local Git repository whose HTTPS `origin` matches the configured GitHub issue queue. `project_root` is used as the trusted source for fetching; the bridge creates per-issue worktrees under the private state directory so worker changes stay isolated from that checkout. Do not point it at a production checkout.
 3. Create a configuration file outside this repository, for example `~/Library/Application Support/Orchestra/bridge.json`, with mode `0600`:
 
 ```json
@@ -26,6 +26,7 @@ The bridge is intentionally not a general remote shell. It does not accept comma
   "repository": "OWNER/ORCHESTRA",
   "project_root": "/Users/ACCOUNT/Projects/Orchestra",
   "state_dir": "/Users/ACCOUNT/Library/Application Support/Orchestra/state",
+  "base_ref": "origin/main",
   "poll_seconds": 30,
   "approved_authors": ["YOUR-GITHUB-LOGIN"],
   "workers": {
@@ -53,9 +54,9 @@ python3 -m mac_bridge.bridge --config "$HOME/Library/Application Support/Orchest
 
 ## Queue and status
 
-Create an issue in the configured repository. An authorized operator adds `bridge-approved` and exactly one `bridge-worker:<name>` label. The daemon claims it, records the worker and PID locally, posts a start comment, and launches it in the configured project root. Completion adds `bridge-done` or `bridge-failed`; stdout/stderr are in `state/issue-<number>.log`. The local `state/state.json` file records the last heartbeat and task lifecycle.
+Create an issue in the configured repository. An authorized operator adds `bridge-approved` and exactly one `bridge-worker:<name>` label. The daemon claims it, fetches the configured base branch, creates a fresh local branch/worktree, records the worker and PID locally, posts a start comment, and launches it there. Completion adds `bridge-done` or `bridge-failed`; stdout/stderr are in `state/issue-<number>.log`. The local `state/state.json` file records the last heartbeat, attempt lifecycle, branch, and worktree path. The bridge leaves worktrees and branches in place for inspection; it does not push or create PRs.
 
-If a bridge process restarts while a worker still exists, the configured workspace remains busy until that process exits. If it is confirmed gone, the issue is marked interrupted and must be explicitly re-approved. This avoids duplicate workers after an ambiguous crash.
+If a bridge process restarts while a worker still exists, the configured workspace remains busy until that process exits. If it is confirmed gone, the issue is marked interrupted and must be explicitly re-approved. A re-approved attempt reuses its preserved issue worktree; unrelated tasks get separate worktrees. This avoids duplicate workers after an ambiguous crash or branch collisions between issues.
 
 ## Current limits
 

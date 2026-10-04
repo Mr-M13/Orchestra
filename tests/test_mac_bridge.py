@@ -37,6 +37,7 @@ class BridgeTests(unittest.TestCase):
         self.github.issues.return_value = [issue()]
         self.popen = Mock(side_effect=FakeProcess)
         self.bridge = Bridge(self.config, self.github, self.popen)
+        self.bridge._prepare_workspace = Mock(return_value=self.root)
 
     def tearDown(self):
         self.bridge.lock_file.close()
@@ -144,6 +145,30 @@ class BridgeTests(unittest.TestCase):
         config_path.write_text(json.dumps(raw))
         with self.assertRaisesRegex(ValueError, "outside the worker project root"):
             Config.load(config_path)
+
+    def test_new_issue_workspace_fetches_default_and_creates_isolated_branch(self):
+        del self.bridge._prepare_workspace
+        with patch.object(self.bridge, "_git", side_effect=[
+            (0, "https://github.com/owner/repo.git"), (0, ""), (1, ""), (0, ""), (0, "")
+        ]) as git:
+            path = self.bridge._prepare_workspace(7, "bridge/issue-7", None)
+        self.assertEqual(path, self.state / "worktrees" / "issue-7")
+        calls = [call.args for call in git.call_args_list]
+        self.assertEqual(calls[1][1:], ("fetch", "--no-tags", "origin", "main"))
+        self.assertEqual(calls[3][1:], ("worktree", "add", "--detach", str(path), "origin/main"))
+        self.assertEqual(calls[4][1:], ("switch", "-c", "bridge/issue-7"))
+
+    def test_reapproved_attempt_reuses_its_existing_worktree(self):
+        path = self.state / "worktrees" / "issue-7"
+        path.mkdir(parents=True)
+        previous = {"workspace_path": str(path)}
+        del self.bridge._prepare_workspace
+        with patch.object(self.bridge, "_git", side_effect=[(0, str(self.root / ".git")),
+                                                              (0, str(self.root / ".git")),
+                                                              (0, "bridge/issue-7")]) as git:
+            result = self.bridge._prepare_workspace(7, "bridge/issue-7", previous)
+        self.assertEqual(result, path)
+        self.assertEqual(git.call_count, 3)
 
 
 if __name__ == "__main__":
