@@ -23,11 +23,13 @@ Task states are `accepted`, `approval_required`, `starting`, `running`, `cancel_
 
 ## Security boundary
 
-OMCP uses local stdio transport. The secure tunnel authenticates its remote client and owns access to the OMCP process. OMCP maps that process to one fixed principal from an owner-only configuration file; it does not accept identity, credentials or permissions in tool arguments.
+OMCP uses local stdio transport. Secure MCP Tunnel is a transport and access boundary, not a per-user identity bridge. OpenAI documents authentication of the tunnel client to the control plane, Platform organization-level Tunnels permissions, and association with ChatGPT workspaces. ChatGPT custom-app access is governed separately by workspace permissions and security restrictions. The tunnel documentation does not promise that an individual ChatGPT caller identity is passed to a local stdio process.
 
-The configured `authentication` value is an audit description only. Environment identity values are a trust handoff from the tunnel, not proof by themselves: only the tunnel launcher may set them after authenticating a caller. A manually set marker does not make an unauthenticated relay safe.
+OMCP therefore supports a fixed process principal from an owner-only configuration file; it does not accept identity, credentials or permissions in tool arguments. This principal identifies the dedicated OMCP service/workspace authority, not the human who invoked the app. All callers who can use the app share that authority. This model is acceptable only after an operator verifies that the custom app and its workspace association are restricted to the intended operator(s), and that the associated Platform organization grants tunnel use only to authorized operators. If that access boundary cannot be verified, do not expose OMCP mutating tools. Keep the tunnel on the read-only Bridge server.
 
-Each principal receives explicit permissions. Missing authority fails closed. At startup, OMCP requires both `OMCP_TUNNEL_AUTHENTICATED=1` and an `OMCP_AUTHENTICATED_CALLER` value equal to the owner-only configured principal identity. The current Secure MCP Tunnel documents authentication of the tunnel client to the control plane and workspace/organization access, but does not document passing an individual caller identity to a local stdio process. Therefore the launcher must establish the binding from the authenticated tunnel/app configuration and the dedicated, access-restricted workspace principal; environment values alone are not authentication. If that boundary cannot be demonstrated for the deployed app, do not expose OMCP mutating tools. This implementation supports one fixed workspace principal per dedicated tunnel process, not individual per-request user identities.
+The configured `authentication` value is an audit description only. Environment identity values bind the process to the configured principal; they do not prove the identity of an individual ChatGPT caller. A manually set marker does not make an unauthenticated relay safe.
+
+Each principal receives explicit permissions. Missing authority fails closed. At startup, OMCP requires both `OMCP_TUNNEL_AUTHENTICATED=1` and an `OMCP_AUTHENTICATED_CALLER` value equal to the owner-only configured principal identity. These values are a local operator assertion that the dedicated tunnel/app boundary was verified; Secure MCP Tunnel does not supply or attest them. A launcher must not set them merely because the tunnel client has a valid runtime key or because a request arrived over the tunnel. Record the access-control evidence and review it whenever app or workspace membership changes. This implementation supports one fixed principal per dedicated tunnel process, not individual per-request user identities. See the [Secure MCP Tunnel permissions and association model](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels#permissions-and-access) and [workspace association guidance](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels#associate-tunnels-with-the-right-organizations-and-workspaces).
 
 Every submitted task requires human approval; the request cannot disable the gate. The remote MCP surface cannot decide approvals. A local operator must run `python3 -m omcp.approval --config <config> --task-id <id> --decision approve|reject` from an interactive Mac terminal and enter a reason. The local approval actor is separate from the tunnel submitter. Task input is untrusted and cannot alter sandbox or approval settings. Workers:
 
@@ -52,7 +54,7 @@ Use Python 3.11 or newer and a current Codex CLI. Create a state directory outsi
   "state_dir": "/Users/ACCOUNT/Library/Application Support/Orchestra/omcp-state",
   "base_ref": "origin/main",
   "principal": {
-    "identity": "chatgpt:orchestra-tunnel",
+    "identity": "orchestra:dedicated-workspace",
     "authentication": "authenticated-mcp-tunnel",
     "permissions": [
       "status:read",
@@ -85,12 +87,12 @@ cd /Users/ACCOUNT/Projects/Orchestra
 python3 -m omcp.server --config "$HOME/Library/Application Support/Orchestra/omcp.json"
 ```
 
-Configure the authenticated tunnel to authenticate a caller first, then launch a dedicated server process with the repository as its working directory and these environment values set by the tunnel launcher:
+Only configure a dedicated OMCP profile after verifying and recording the intended ChatGPT workspace membership/app access and Platform organization Tunnels Use access. The user of the app is not individually identified to the stdio server; all invocations run as the fixed principal. Then launch a dedicated server process with the repository as its working directory and these environment values set by the local operator-controlled launcher:
 ```sh
 OMCP_TUNNEL_AUTHENTICATED=1
-OMCP_AUTHENTICATED_CALLER=chatgpt:orchestra-tunnel
+OMCP_AUTHENTICATED_CALLER=orchestra:dedicated-workspace
 ```
-The caller value must exactly match the configured principal identity. Configure the custom app for the intended access-restricted workspace and ensure the tunnel profile cannot be reached through an unauthenticated alternate path. Do not rely on the control-plane runtime key or audit `authentication` label as proof of the ChatGPT caller. Keep the OMCP config and state paths distinct from the Mac Bridge config and state directory.
+The value must exactly match the configured principal identity. These environment values are not caller authentication; they only bind the process to the configured fixed principal after the operator has verified the access boundary. Do not rely on the control-plane runtime key or audit `authentication` label as proof of a ChatGPT user's identity. Keep the OMCP config and state paths distinct from the Mac Bridge config and state directory. Preserve the existing read-only Bridge tunnel until the dedicated app/workspace access boundary and live lifecycle tests below pass.
 
 Approvals are local human decisions only. The tunnel exposes no `resolve_approval` tool. A human on the Mac runs the interactive approval command above after reviewing the task.
 
