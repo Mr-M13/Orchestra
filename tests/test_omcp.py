@@ -233,6 +233,54 @@ class ConfigTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_runner_passes_only_explicitly_permitted_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            codex = bin_dir / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            prompt = root / "prompt"
+            prompt.write_text("task")
+            spec = root / "spec.json"
+            spec.write_text(json.dumps({
+                "command": ["codex"], "workspace": str(root),
+                "prompt_path": str(prompt), "log_path": str(root / "log"),
+                "result_path": str(root / "result"),
+                "completion_path": str(root / "completion"),
+                "codex_home": "/private/codex-home",
+            }))
+            parent_environment = {
+                "PATH": str(bin_dir), "HOME": "/Users/test",
+                "TMPDIR": "/tmp/test", "LANG": "en_AU.UTF-8",
+                "LC_ALL": "en_AU.UTF-8", "CODEX_HOME": "/parent/codex-home",
+                "CONTROL_PLANE_API_KEY": "tunnel-secret",
+                "OMCP_AUTHENTICATED_CALLER": "chatgpt:principal",
+                "OMCP_TUNNEL_AUTHENTICATED": "1", "OPENAI_API_KEY": "api-secret",
+                "HTTPS_PROXY": "https://proxy.example", "GIT_TERMINAL_PROMPT": "1",
+            }
+            with patch.dict(os.environ, parent_environment, clear=True):
+                with patch("omcp.runner.subprocess.run", return_value=Mock(returncode=0)) as execute:
+                    self.assertEqual(run_worker(spec), 0)
+
+            environment = execute.call_args.kwargs["env"]
+            self.assertEqual(environment, {
+                "PATH": str(bin_dir), "HOME": "/Users/test",
+                "TMPDIR": "/tmp/test", "LANG": "en_AU.UTF-8",
+                "LC_ALL": "en_AU.UTF-8", "CODEX_HOME": "/private/codex-home",
+                "GIT_TERMINAL_PROMPT": "0",
+            })
+
+    def test_runner_uses_codex_home_from_environment_when_not_configured(self):
+        from omcp.runner import worker_environment
+        with patch.dict(os.environ, {"PATH": "/trusted/bin", "CODEX_HOME": "/parent/codex-home",
+                                     "CONTROL_PLANE_API_KEY": "tunnel-secret"}, clear=True):
+            self.assertEqual(worker_environment(None), {
+                "PATH": "/trusted/bin", "CODEX_HOME": "/parent/codex-home",
+                "GIT_TERMINAL_PROMPT": "0",
+            })
+
     def test_runner_writes_completion_record(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -15,6 +15,16 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def worker_environment(codex_home: str | None) -> dict[str, str]:
+    """Build a small environment for Codex without forwarding tunnel credentials."""
+    permitted = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "CODEX_HOME")
+    environment = {key: os.environ[key] for key in permitted if key in os.environ}
+    if codex_home:
+        environment["CODEX_HOME"] = codex_home
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    return environment
+
+
 def atomic_json(path: Path, value: dict[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     data = (json.dumps(value, separators=(",", ":")) + "\n").encode()
@@ -48,9 +58,7 @@ def run(spec_path: Path) -> int:
     command = [executable, "--ask-for-approval", "never", "exec",
                "--sandbox", "workspace-write", "--cd", str(workspace),
                "--output-last-message", str(result_path), "-"]
-    environment = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-    if spec.get("codex_home"):
-        environment["CODEX_HOME"] = spec["codex_home"]
+    environment = worker_environment(spec.get("codex_home"))
     exit_code = 125
     error_type = None
     try:

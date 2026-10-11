@@ -32,6 +32,7 @@ Each principal receives explicit permissions. Missing authority fails closed. At
 Every submitted task requires human approval; the request cannot disable the gate. The remote MCP surface cannot decide approvals. A local operator must run `python3 -m omcp.approval --config <config> --task-id <id> --decision approve|reject` from an interactive Mac terminal and enter a reason. The local approval actor is separate from the tunnel submitter. Task input is untrusted and cannot alter sandbox or approval settings. Workers:
 
 - invoke only the canonical Codex CLI executable, resolved and verified at configuration load and again by the runner; configured CLI arguments and wrappers are rejected;
+- receive only the explicitly permitted `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_ALL` and `CODEX_HOME` variables, plus `GIT_TERMINAL_PROMPT=0`; tunnel credentials, caller markers and proxy variables are not forwarded;
 - run in `workspace-write` with interactive escalation disabled;
 - use a fresh `omcp/task-<id>` Git branch and worktree from the configured base ref;
 - retain prompts, logs, results and worktrees in the private state directory for inspection.
