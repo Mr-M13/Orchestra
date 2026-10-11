@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 from omcp import __version__
 from omcp.controller import AuthorizationError, Config, TaskController
+from omcp.local_control import LocalApprovalServer
 
 
 PROTOCOL_VERSION = "2025-06-18"
@@ -161,6 +162,8 @@ class MCPServer:
             })
 
     def run(self) -> int:
+        local_approval = LocalApprovalServer(self.controller, self.controller_lock)
+        local_approval.start()
         ticker = threading.Thread(target=self._tick_loop, name="omcp-reconciler", daemon=True)
         ticker.start()
         try:
@@ -179,6 +182,7 @@ class MCPServer:
         finally:
             self.stop_event.set()
             ticker.join(timeout=2)
+            local_approval.stop()
 
     def _tick_loop(self) -> None:
         while not self.stop_event.wait(1):

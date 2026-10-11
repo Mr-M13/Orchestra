@@ -7,7 +7,8 @@ import getpass
 import sys
 from pathlib import Path
 
-from omcp.controller import Config, TaskController
+from omcp.controller import Config
+from omcp.local_control import approval_request
 
 
 def format_review(details: dict[str, object], decision: str) -> str:
@@ -35,25 +36,25 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise PermissionError("human approval requires an interactive local terminal")
-    controller = TaskController(Config.load(args.config))
-    try:
-        details = controller.local_approval_details(args.task_id)
-        print(format_review(details, args.decision))
-        expected = f"{args.decision.upper()} {args.task_id}"
-        confirmation = input(f'Type "{expected}" to continue: ').strip()
-        if confirmation != expected:
-            raise PermissionError("approval confirmation did not match")
-        reason = input("Human approval reason: ").strip()
-        if not reason:
-            raise ValueError("a non-empty approval reason is required")
-        result = controller.resolve_approval(
-            args.task_id, args.decision, reason,
-            approver_identity="local:" + getpass.getuser(),
-        )
-        print(f"{result['task_id']}: {result['status']}")
-        return 0
-    finally:
-        controller.close()
+    config = Config.load(args.config)
+    details = approval_request(config.state_dir, {
+        "action": "review", "task_id": args.task_id,
+    })
+    print(format_review(details, args.decision))
+    expected = f"{args.decision.upper()} {args.task_id}"
+    confirmation = input(f'Type "{expected}" to continue: ').strip()
+    if confirmation != expected:
+        raise PermissionError("approval confirmation did not match")
+    reason = input("Human approval reason: ").strip()
+    if not reason:
+        raise ValueError("a non-empty approval reason is required")
+    result = approval_request(config.state_dir, {
+        "action": "resolve", "task_id": args.task_id,
+        "decision": args.decision, "reason": reason,
+        "approver_identity": "local:" + getpass.getuser(),
+    })
+    print(f"{result['task_id']}: {result['status']}")
+    return 0
 
 
 if __name__ == "__main__":

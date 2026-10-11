@@ -3,12 +3,14 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from omcp.approval import format_review
 from omcp.controller import AuthorizationError, Config, Principal, TaskController, Worker
+from omcp.local_control import LocalApprovalServer, approval_request
 from omcp.runner import run as run_worker
 from omcp.server import MCPServer, TOOLS, main as server_main
 
@@ -406,6 +408,59 @@ class ServerTests(unittest.TestCase):
     def test_unknown_method_uses_json_rpc_error(self):
         response = self.server.handle({"jsonrpc": "2.0", "id": 4, "method": "unknown"})
         self.assertEqual(response["error"]["code"], -32601)
+
+
+class LocalApprovalChannelTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name) / "project"
+        self.root.mkdir()
+        self.config = Config(
+            "owner/repo", self.root, Path(self.temp.name) / "state", "origin/main",
+            {"ina": Worker("ina", ("codex",))},
+            Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+        )
+        self.popen = Mock(return_value=FakeProcess())
+        self.controller = TaskController(
+            self.config, popen=self.popen, workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: "11111111-1111-1111-1111-111111111111",
+        )
+        self.channel = LocalApprovalServer(self.controller, threading.RLock())
+        self.channel.start()
+
+    def tearDown(self):
+        self.channel.stop()
+        self.controller.close()
+        self.temp.cleanup()
+
+    def test_review_and_resolution_use_active_coordinator(self):
+        submitted = self.controller.submit_task(
+            "request-1", "Review me", "Read only", "ina", True,
+        )
+        details = approval_request(self.config.state_dir, {
+            "action": "review", "task_id": submitted["task_id"],
+        })
+        self.assertEqual(details["instructions"], "Read only")
+        result = approval_request(self.config.state_dir, {
+            "action": "resolve", "task_id": submitted["task_id"],
+            "decision": "reject", "reason": "Test rejection",
+            "approver_identity": "local:test-operator",
+        })
+        self.assertEqual(result["status"], "rejected")
+        self.popen.assert_not_called()
+
+    def test_channel_files_are_owner_only_and_token_is_required(self):
+        self.assertEqual(self.channel.socket_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.channel.token_path.stat().st_mode & 0o777, 0o600)
+        original = self.channel.token_path.read_text()
+        self.channel.token_path.write_text("wrong\n")
+        os.chmod(self.channel.token_path, 0o600)
+        with self.assertRaisesRegex(RuntimeError, "invalid local approval capability"):
+            approval_request(self.config.state_dir, {
+                "action": "review", "task_id": "11111111-1111-1111-1111-111111111111",
+            })
+        self.channel.token_path.write_text(original)
+        os.chmod(self.channel.token_path, 0o600)
 
 
 class ServerLifecycleTests(unittest.TestCase):
