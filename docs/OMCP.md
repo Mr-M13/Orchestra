@@ -25,7 +25,7 @@ Task states are `accepted`, `approval_required`, `starting`, `running`, `cancel_
 
 OMCP uses local stdio transport. Secure MCP Tunnel is a transport and access boundary, not a per-user identity bridge. OpenAI documents authentication of the tunnel client to the control plane, Platform organization-level Tunnels permissions, and association with ChatGPT workspaces. ChatGPT custom-app access is governed separately by workspace permissions and security restrictions. The tunnel documentation does not promise that an individual ChatGPT caller identity is passed to a local stdio process.
 
-OMCP therefore supports a fixed process principal from an owner-only configuration file; it does not accept identity, credentials or permissions in tool arguments. This principal identifies the dedicated OMCP service/workspace authority, not the human who invoked the app. All callers who can use the app share that authority. This model is acceptable only after an operator verifies that the custom app and its workspace association are restricted to the intended operator(s), and that the associated Platform organization grants tunnel use only to authorized operators. If that access boundary cannot be verified, do not expose OMCP mutating tools. Keep the tunnel on the read-only Bridge server.
+OMCP therefore supports a fixed process principal from an owner-only configuration file; it does not accept identity, credentials or permissions in tool arguments. This principal identifies the dedicated OMCP service/workspace authority, not the human who invoked the app. All callers who can use the app share that authority. OpenAI documents workspace-wide app availability for ChatGPT Business; per-role app access controls are documented for Enterprise/Edu. A fixed principal is acceptable only if the app remains in private development mode and its creator-only access is verified, or if a separately verified access boundary limits use to the intended operator(s). Do not publish a fixed-principal app to a multi-member Business workspace: every member allowed to use that app would share the same OMCP authority. If the app access boundary cannot be verified, do not expose OMCP mutating tools. Keep the tunnel on the read-only Bridge server.
 
 The configured `authentication` value is an audit description only. Environment identity values bind the process to the configured principal; they do not prove the identity of an individual ChatGPT caller. A manually set marker does not make an unauthenticated relay safe.
 
@@ -55,7 +55,7 @@ Use Python 3.11 or newer and a current Codex CLI. Create a state directory outsi
   "base_ref": "origin/main",
   "principal": {
     "identity": "orchestra:dedicated-workspace",
-    "authentication": "authenticated-mcp-tunnel",
+    "authentication": "fixed-principal-behind-secure-mcp-tunnel",
     "permissions": [
       "status:read",
       "tasks:submit",
@@ -87,7 +87,7 @@ cd /Users/ACCOUNT/Projects/Orchestra
 python3 -m omcp.server --config "$HOME/Library/Application Support/Orchestra/omcp.json"
 ```
 
-Only configure a dedicated OMCP profile after verifying and recording the intended ChatGPT workspace membership/app access and Platform organization Tunnels Use access. The user of the app is not individually identified to the stdio server; all invocations run as the fixed principal. Then launch a dedicated server process with the repository as its working directory and these environment values set by the local operator-controlled launcher:
+Only configure a dedicated OMCP profile after verifying and recording the intended ChatGPT workspace membership/app access and Platform organization Tunnels Use access. The user of the app is not individually identified to the stdio server; all invocations run as the fixed principal. In ChatGPT Business, do not publish the app to the multi-member workspace unless every member should have the same submit/read/cancel authority. Then launch a dedicated server process with the repository as its working directory and these environment values set by the local operator-controlled launcher:
 ```sh
 OMCP_TUNNEL_AUTHENTICATED=1
 OMCP_AUTHENTICATED_CALLER=orchestra:dedicated-workspace
