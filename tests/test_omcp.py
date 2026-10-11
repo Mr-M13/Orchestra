@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from omcp.approval import format_review
-from omcp.controller import AuthorizationError, Config, Principal, TaskController, Worker
+from omcp.controller import AuthorizationError, Config, Principal, RepositoryProfile, TaskController, Worker
 from omcp.local_control import LocalApprovalServer, approval_request
 from omcp.runner import run as run_worker
 from omcp.server import MCPServer, TOOLS, main as server_main
@@ -39,7 +39,7 @@ class ControllerTests(unittest.TestCase):
         self.popen = Mock(return_value=FakeProcess())
         self.controller = TaskController(
             self.config, popen=self.popen,
-            workspace_preparer=lambda _task_id, _branch: self.root,
+            workspace_preparer=lambda *_: self.root,
             id_factory=lambda: "11111111-1111-1111-1111-111111111111",
         )
 
@@ -79,6 +79,37 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(persisted["requests"]["request-1"], first["task_id"])
         with self.assertRaisesRegex(ValueError, "different task content"):
             self.controller.submit_task("request-1", "Other", "Other work", "ina")
+
+    def test_profile_is_bound_to_task_approval_and_idempotency(self):
+        archive = Path(self.temp.name) / "archive"
+        archive.mkdir()
+        profiles = {
+            "orchestra": RepositoryProfile("orchestra", "owner/repo", self.root, "origin/main"),
+            "archive": RepositoryProfile("archive", "owner/archive", archive, "origin/release"),
+        }
+        self.controller.close()
+        self.controller = TaskController(
+            Config("owner/repo", self.root, self.state, "origin/main",
+                   {"ina": Worker("ina", ("codex",))},
+                   Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+                   repository_profiles=profiles, default_profile="orchestra"),
+            popen=self.popen, workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: "11111111-1111-1111-1111-111111111111",
+        )
+        submitted = self.controller.submit_task(
+            "profile-request", "Inspect", "Read only", "ina", True, "archive",
+        )
+        self.assertEqual(submitted["repository_profile"], "archive")
+        self.assertEqual(submitted["repository"], "owner/archive")
+        details = self.controller.local_approval_details(submitted["task_id"])
+        self.assertEqual(details["repository_profile"], "archive")
+        with self.assertRaisesRegex(ValueError, "different task content"):
+            self.controller.submit_task("profile-request", "Inspect", "Read only", "ina", True, "orchestra")
+
+    def test_unknown_profile_fails_before_task_is_persisted(self):
+        with self.assertRaisesRegex(ValueError, "unknown repository profile"):
+            self.controller.submit_task("unknown-profile", "Inspect", "Read only", "ina", True, "missing")
+        self.assertEqual(self.controller.state["tasks"], {})
 
     def test_completion_status_result_and_availability(self):
         submitted = self.submit()

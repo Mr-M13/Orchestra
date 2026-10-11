@@ -79,6 +79,16 @@ class Worker:
 
 
 @dataclass(frozen=True)
+class RepositoryProfile:
+    """A server-owned, allowlisted repository execution target."""
+
+    profile_id: str
+    repository: str
+    project_root: Path
+    base_ref: str
+
+
+@dataclass(frozen=True)
 class Principal:
     identity: str
     permissions: frozenset[str]
@@ -96,6 +106,8 @@ class Config:
     max_task_bytes: int = 65_536
     max_result_bytes: int = 65_536
     approval_ttl_seconds: int = 1_800
+    repository_profiles: dict[str, RepositoryProfile] | None = None
+    default_profile: str | None = None
 
     @classmethod
     def load(cls, path: Path) -> "Config":
@@ -145,12 +157,54 @@ class Config:
         approval_ttl_seconds = int(raw.get("approval_ttl_seconds", 1_800))
         if not 60 <= approval_ttl_seconds <= 86_400:
             raise ValueError("approval_ttl_seconds must be between 60 and 86400")
+        profiles_raw = raw.get("repository_profiles")
+        profiles: dict[str, RepositoryProfile] | None = None
+        default_profile: str | None = None
+        if profiles_raw is not None:
+            if not isinstance(profiles_raw, dict) or not profiles_raw:
+                raise ValueError("repository_profiles must be a non-empty object")
+            profiles = {}
+            for profile_id, profile_raw in profiles_raw.items():
+                if not isinstance(profile_id, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", profile_id):
+                    raise ValueError("invalid repository profile id")
+                if not isinstance(profile_raw, dict):
+                    raise ValueError("repository profile must be an object")
+                profile_repository = profile_raw.get("repository")
+                profile_root_raw = profile_raw.get("project_root")
+                profile_base_ref = profile_raw.get("base_ref", "origin/main")
+                if not isinstance(profile_repository, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", profile_repository):
+                    raise ValueError("repository profile repository must be owner/name")
+                if not isinstance(profile_root_raw, str) or not profile_root_raw:
+                    raise ValueError("repository profile project_root must be a directory")
+                profile_root = Path(profile_root_raw).expanduser().resolve(strict=True)
+                if not profile_root.is_dir():
+                    raise ValueError("repository profile project_root must be a directory")
+                if not isinstance(profile_base_ref, str) or not re.fullmatch(r"origin/[A-Za-z0-9._/-]+", profile_base_ref) or ".." in profile_base_ref.split("/"):
+                    raise ValueError("repository profile base_ref must name a safe origin branch")
+                profiles[profile_id] = RepositoryProfile(
+                    profile_id, profile_repository, profile_root, profile_base_ref,
+                )
+            default_profile = raw.get("default_profile")
+            if not isinstance(default_profile, str) or default_profile not in profiles:
+                raise ValueError("default_profile must name a configured repository profile")
         return cls(
             repository, root, state, base_ref, workers, principal,
             max(1_024, min(int(raw.get("max_task_bytes", 65_536)), 1_048_576)),
             max(1_024, min(int(raw.get("max_result_bytes", 65_536)), 1_048_576)),
             approval_ttl_seconds,
+            profiles, default_profile,
         )
+
+    def profile(self, profile_id: str | None) -> RepositoryProfile:
+        """Resolve only configured profile IDs; legacy config keeps one default profile."""
+        if self.repository_profiles is None:
+            if profile_id not in (None, "default"):
+                raise ValueError("unknown repository profile")
+            return RepositoryProfile("default", self.repository, self.project_root, self.base_ref)
+        selected = self.default_profile if profile_id is None else profile_id
+        if not isinstance(selected, str) or selected not in self.repository_profiles:
+            raise ValueError("unknown repository profile")
+        return self.repository_profiles[selected]
 
 
 class AuthorizationError(PermissionError):
@@ -241,13 +295,13 @@ class TaskController:
         keys = (
             "task_id", "request_id", "title", "worker", "status", "created_at",
             "started_at", "finished_at", "exit_code", "branch", "approval",
-            "cancel_reason", "failure",
+            "cancel_reason", "failure", "repository_profile", "repository", "base_ref",
         )
         return {key: task[key] for key in keys if key in task}
 
     def submit_task(
         self, request_id: str, title: str, instructions: str, worker: str,
-        requires_approval: bool = True,
+        requires_approval: bool = True, repository_profile: str | None = None,
     ) -> dict[str, Any]:
         self._authorize("tasks:submit", "task.submit")
         if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id):
@@ -262,10 +316,11 @@ class TaskController:
             raise ValueError("instructions exceed configured task size")
         if not isinstance(worker, str) or worker not in self.config.workers:
             raise ValueError("unknown worker")
+        profile = self.config.profile(repository_profile)
         if requires_approval is not True:
             raise ValueError("human approval is mandatory for every task")
         digest = hashlib.sha256(json.dumps(
-            [title, instructions, worker], separators=(",", ":")
+            [title, instructions, worker, profile.profile_id], separators=(",", ":")
         ).encode()).hexdigest()
         previous_id = self.state["requests"].get(request_id)
         if previous_id:
@@ -281,6 +336,8 @@ class TaskController:
         task = {
             "task_id": task_id, "request_id": request_id, "request_digest": digest,
             "title": title.strip(), "instructions": instructions, "worker": worker,
+            "repository_profile": profile.profile_id, "repository": profile.repository,
+            "base_ref": profile.base_ref,
             "submitted_by": self.config.principal.identity,
             "status": status, "created_at": now,
         }
@@ -294,7 +351,8 @@ class TaskController:
         self.state["requests"][request_id] = task_id
         self._save()
         self._audit("task.submit", task_id, "allowed", {
-            "request_id": request_id, "worker": worker, "requires_approval": True,
+            "request_id": request_id, "worker": worker, "repository_profile": profile.profile_id,
+            "requires_approval": True,
         })
         self.tick()
         return {**self._public(task), "acknowledged": True, "idempotent_replay": False}
@@ -305,8 +363,11 @@ class TaskController:
         counts: dict[str, int] = {}
         for task in self.state["tasks"].values():
             counts[task["status"]] = counts.get(task["status"], 0) + 1
+        default_profile = self.config.profile(None)
         result = {"service": "omcp", "status": "ok", "task_counts": counts,
-                  "repository": self.config.repository}
+                  "repository": default_profile.repository,
+                  "default_profile": default_profile.profile_id,
+                  "repository_profiles": sorted((self.config.repository_profiles or {"default": default_profile}))}
         self._audit("bridge.status", None, "allowed", {})
         return result
 
@@ -438,6 +499,9 @@ class TaskController:
         return {
             "task_id": task["task_id"], "request_id": task["request_id"],
             "submitted_by": task["submitted_by"], "worker": task["worker"],
+            "repository_profile": task.get("repository_profile", self.config.profile(None).profile_id),
+            "repository": task.get("repository", self.config.profile(None).repository),
+            "base_ref": task.get("base_ref", self.config.profile(None).base_ref),
             "title": task["title"], "instructions": task["instructions"],
             "requested_at": task["approval"]["requested_at"],
             "expires_at": task["approval"]["expires_at"],
@@ -518,11 +582,12 @@ class TaskController:
 
     def _start(self, task: dict[str, Any]) -> None:
         task_id = task["task_id"]
+        profile = self.config.profile(task.get("repository_profile"))
         branch = "omcp/task-" + task_id.split("-", 1)[0]
         task.update({"status": "starting", "branch": branch})
         self._save()
         try:
-            workspace = self.workspace_preparer(task_id, branch)
+            workspace = self.workspace_preparer(task_id, branch, profile)
             task_dir = self.config.state_dir / "tasks" / task_id
             task_dir.mkdir(parents=True, mode=0o700)
             os.chmod(task_dir, 0o700)
@@ -548,7 +613,7 @@ class TaskController:
             self._audit("task.start", task_id, "allowed", {"worker": task["worker"], "branch": branch})
             proc = self.popen(
                 [sys.executable, "-m", "omcp.runner", "--spec", str(spec_path)],
-                cwd=self.config.project_root, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                cwd=Path(__file__).resolve().parent.parent, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True, close_fds=True,
             )
@@ -590,21 +655,21 @@ class TaskController:
             raise RuntimeError(f"Git workspace operation failed ({args[0]}), exit {result.returncode}")
         return result.returncode, result.stdout.strip()
 
-    def _prepare_workspace(self, task_id: str, branch: str) -> Path:
-        workspace = self.config.state_dir / "worktrees" / task_id
+    def _prepare_workspace(self, task_id: str, branch: str, profile: RepositoryProfile) -> Path:
+        workspace = self.config.state_dir / "worktrees" / profile.profile_id / task_id
         if workspace.exists():
             raise RuntimeError("task workspace already exists")
-        _, remote = self._git(self.config.project_root, "remote", "get-url", "origin")
+        _, remote = self._git(profile.project_root, "remote", "get-url", "origin")
         parsed = urlparse(remote)
         remote_repo = parsed.path.strip("/").removesuffix(".git").lower()
-        if parsed.scheme != "https" or parsed.hostname != "github.com" or remote_repo != self.config.repository.lower():
+        if parsed.scheme != "https" or parsed.hostname != "github.com" or remote_repo != profile.repository.lower():
             raise RuntimeError("project origin must match configured GitHub repository over HTTPS")
-        self._git(self.config.project_root, "fetch", "--no-tags", "origin", self.config.base_ref.split("/", 1)[1])
-        exists, _ = self._git(self.config.project_root, "show-ref", "--verify", "--quiet",
+        self._git(profile.project_root, "fetch", "--no-tags", "origin", profile.base_ref.split("/", 1)[1])
+        exists, _ = self._git(profile.project_root, "show-ref", "--verify", "--quiet",
                               "refs/heads/" + branch, allow_failure=True)
         if exists != 1:
             raise RuntimeError("task branch is not safely available")
         workspace.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self._git(self.config.project_root, "worktree", "add", "--detach", str(workspace), self.config.base_ref)
+        self._git(profile.project_root, "worktree", "add", "--detach", str(workspace), profile.base_ref)
         self._git(workspace, "switch", "-c", branch)
         return workspace

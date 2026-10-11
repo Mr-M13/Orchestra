@@ -1,6 +1,6 @@
 # Orchestra MCP task control (OMCP) v1
 
-OMCP is a local MCP server that lets an authenticated ChatGPT tunnel submit and observe Orchestra worker tasks directly. It deliberately remains a narrow execution adapter: ChatGPT chooses work and workers; a local human decides approvals. OMCP validates the request, records intent durably, runs one worker at a time and reports evidence.
+OMCP is a local MCP server that lets an authenticated ChatGPT tunnel submit and observe Orchestra worker tasks directly. It deliberately remains a narrow execution adapter: ChatGPT chooses work, an allowlisted repository profile, and workers; a local human decides approvals. OMCP validates the request, records intent durably, runs one worker at a time and reports evidence.
 
 OMCP does not replace Desktop Commander or the GitHub Issue Mac Bridge. Keep both available until the direct path has passed tunnel and target-Mac end-to-end testing.
 
@@ -19,7 +19,7 @@ OMCP does not replace Desktop Commander or the GitHub Issue Mac Bridge. Keep bot
 
 Task states are `accepted`, `approval_required`, `starting`, `running`, `cancel_requested`, `succeeded`, `failed`, `cancelled`, `rejected` or `interrupted`. A successful worker exit is an execution result, not independent verification.
 
-`submit_task` records the task and request-id mapping before starting a worker. Retrying the same request and content returns the existing acknowledgement. Reusing a request ID with different content fails closed.
+`submit_task` records the task and request-id mapping before starting a worker. `repository_profile` is optional only when a default profile is configured; OMCP resolves it from its owner-only configuration and never accepts a path, URL, ref, or executable in a task request. Retrying the same request and content returns the existing acknowledgement. Reusing a request ID with different content, including a different profile, fails closed.
 
 ## Security boundary
 
@@ -40,6 +40,12 @@ Every submitted task requires human approval; the request cannot disable the gat
 - retain prompts, logs, results and worktrees in the private state directory for inspection.
 
 The state directory and its files are owner-only. State updates are atomic. `audit.jsonl` is append-only and fsynced for each event; it records principal, authentication context, action, outcome and safe metadata, but not task instructions or worker output. Result retrieval is size-bounded.
+
+## Repository profiles
+
+V1 configuration remains valid and describes one implicit `default` profile. A multi-repository deployment adds `repository_profiles` and `default_profile`. Every profile binds a stable ID to one GitHub repository, one existing local checkout, and one `origin/<branch>` base ref. OMCP validates the selected ID before persisting a task, records the resolved profile, repository, and ref in task status and local approval review, checks the checkout's HTTPS GitHub origin at worktree creation, and creates the worktree under a profile-specific private state path.
+
+The current global execution limit remains one. Repository profiles prepare task isolation and auditing for independent lanes; they do not enable concurrent execution. Any future lane limit must retain per-task approval, distinct worktrees and branches, durable shared-state admission, cancellation and restart recovery tests before it can increase above one.
 
 An approval is an explicit gate before worker launch. It is not permission to bypass the worker sandbox or an assertion that the completed work is verified. Cancellation of a running worker sends `SIGTERM` to its isolated process group and is reconciled durably when the runner exits.
 

@@ -40,6 +40,7 @@ TOOLS = [
             "title": {"type": "string", "minLength": 1, "maxLength": 200},
             "instructions": {"type": "string", "minLength": 1},
             "worker": {"type": "string", "minLength": 1},
+            "repository_profile": {"type": "string", "minLength": 1, "maxLength": 64},
             "requires_approval": {"type": "boolean", "default": True, "const": True},
         }, ["request_id", "title", "instructions", "worker"]),
     },
@@ -92,7 +93,7 @@ class MCPServer:
             "bridge_status": lambda _: controller.bridge_status(),
             "submit_task": lambda value: controller.submit_task(
                 value.get("request_id"), value.get("title"), value.get("instructions"),
-                value.get("worker"), value.get("requires_approval", True),
+                value.get("worker"), value.get("requires_approval", True), value.get("repository_profile"),
             ),
             "task_status": lambda value: controller.task_status(value.get("task_id")),
             "list_tasks": lambda value: controller.list_tasks(value.get("status"), value.get("limit", 100)),
