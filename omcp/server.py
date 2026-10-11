@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
 import threading
@@ -38,7 +39,7 @@ TOOLS = [
             "title": {"type": "string", "minLength": 1, "maxLength": 200},
             "instructions": {"type": "string", "minLength": 1},
             "worker": {"type": "string", "minLength": 1},
-            "requires_approval": {"type": "boolean", "default": False},
+            "requires_approval": {"type": "boolean", "default": True, "const": True},
         }, ["request_id", "title", "instructions", "worker"]),
     },
     {
@@ -77,15 +78,6 @@ TOOLS = [
         "description": "List tasks currently waiting for an explicit approval decision.",
         "inputSchema": _object({}),
     },
-    {
-        "name": "resolve_approval",
-        "description": "Approve or reject a task that is waiting at the execution gate.",
-        "inputSchema": _object({
-            "task_id": {"type": "string"},
-            "decision": {"type": "string", "enum": ["approve", "reject"]},
-            "reason": {"type": "string", "minLength": 1, "maxLength": 1000},
-        }, ["task_id", "decision", "reason"]),
-    },
 ]
 
 
@@ -99,7 +91,7 @@ class MCPServer:
             "bridge_status": lambda _: controller.bridge_status(),
             "submit_task": lambda value: controller.submit_task(
                 value.get("request_id"), value.get("title"), value.get("instructions"),
-                value.get("worker"), value.get("requires_approval", False),
+                value.get("worker"), value.get("requires_approval", True),
             ),
             "task_status": lambda value: controller.task_status(value.get("task_id")),
             "list_tasks": lambda value: controller.list_tasks(value.get("status"), value.get("limit", 100)),
@@ -107,9 +99,6 @@ class MCPServer:
             "worker_availability": lambda _: controller.worker_availability(),
             "cancel_task": lambda value: controller.cancel_task(value.get("task_id"), value.get("reason")),
             "list_approvals": lambda _: controller.list_approvals(),
-            "resolve_approval": lambda value: controller.resolve_approval(
-                value.get("task_id"), value.get("decision"), value.get("reason"),
-            ),
         }
 
     @staticmethod
@@ -207,7 +196,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Orchestra MCP task-control server")
     parser.add_argument("--config", type=Path, required=True)
     args = parser.parse_args(argv)
-    controller = TaskController(Config.load(args.config))
+    config = Config.load(args.config)
+    if os.environ.get("OMCP_TUNNEL_AUTHENTICATED") != "1":
+        raise PermissionError("an authenticated tunnel is required before OMCP starts")
+    caller = os.environ.get("OMCP_AUTHENTICATED_CALLER")
+    if not caller or caller != config.principal.identity:
+        raise PermissionError("authenticated tunnel caller does not match configured principal")
+    controller = TaskController(config)
     server = MCPServer(controller)
     def stop(*_: Any) -> None:
         server.stopping = True

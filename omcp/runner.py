@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from omcp.controller import canonical_codex_executable
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -39,7 +41,11 @@ def run(spec_path: Path) -> int:
     completion_path = Path(spec["completion_path"])
     result_path = Path(spec["result_path"])
     workspace = Path(spec["workspace"])
-    command = [*spec["command"], "--ask-for-approval", "never", "exec",
+    configured = spec.get("command")
+    if not isinstance(configured, list) or len(configured) != 1:
+        raise ValueError("runner spec must contain exactly one Codex executable")
+    executable = canonical_codex_executable(configured[0])
+    command = [executable, "--ask-for-approval", "never", "exec",
                "--sandbox", "workspace-write", "--cd", str(workspace),
                "--output-last-message", str(result_path), "-"]
     environment = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}

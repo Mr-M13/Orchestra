@@ -9,12 +9,12 @@ from unittest.mock import Mock, patch
 
 from omcp.controller import AuthorizationError, Config, Principal, TaskController, Worker
 from omcp.runner import run as run_worker
-from omcp.server import MCPServer, TOOLS
+from omcp.server import MCPServer, TOOLS, main as server_main
 
 
 ALL_PERMISSIONS = frozenset({
     "status:read", "tasks:submit", "tasks:read", "results:read",
-    "workers:read", "tasks:cancel", "approvals:read", "approvals:decide",
+    "workers:read", "tasks:cancel", "approvals:read",
 })
 
 
@@ -44,10 +44,17 @@ class ControllerTests(unittest.TestCase):
         self.controller.close()
         self.temp.cleanup()
 
-    def submit(self, request_id="request-1", approval=False):
-        return self.controller.submit_task(
+    def submit(self, request_id="request-1", approval=True):
+        submitted = self.controller.submit_task(
             request_id, "Implement feature", "Make the requested change", "ina", approval,
         )
+        if not submitted.get("idempotent_replay"):
+            approved = self.controller.resolve_approval(
+                submitted["task_id"], "approve", "Test operator approved",
+                approver_identity="local:test-operator",
+            )
+            return {**submitted, **approved}
+        return submitted
 
     def complete(self, task_id, exit_code=0, result="finished"):
         task = self.controller.state["tasks"][task_id]
@@ -82,27 +89,39 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(self.controller.worker_availability()["workers"][0]["available"])
 
     def test_approval_gate_can_reject_without_launching(self):
-        submitted = self.submit(approval=True)
+        submitted = self.controller.submit_task(
+            "request-1", "Implement feature", "Make the requested change", "ina", True,
+        )
         self.assertEqual(submitted["status"], "approval_required")
         self.assertEqual(len(self.controller.list_approvals()["approvals"]), 1)
-        result = self.controller.resolve_approval(submitted["task_id"], "reject", "Not authorised")
+        result = self.controller.resolve_approval(
+            submitted["task_id"], "reject", "Not authorised", approver_identity="local:test-operator",
+        )
         self.assertEqual(result["status"], "rejected")
         self.popen.assert_not_called()
 
     def test_approval_gate_launches_only_after_approval(self):
-        submitted = self.submit(approval=True)
-        result = self.controller.resolve_approval(submitted["task_id"], "approve", "Scope reviewed")
+        submitted = self.controller.submit_task(
+            "request-1", "Implement feature", "Make the requested change", "ina", True,
+        )
+        result = self.controller.resolve_approval(
+            submitted["task_id"], "approve", "Scope reviewed", approver_identity="local:test-operator",
+        )
         self.assertEqual(result["status"], "running")
         self.popen.assert_called_once()
 
     def test_pending_task_can_be_cancelled_with_reason(self):
-        submitted = self.submit(approval=True)
+        submitted = self.controller.submit_task(
+            "request-1", "Implement feature", "Make the requested change", "ina", True,
+        )
         result = self.controller.cancel_task(submitted["task_id"], "No longer needed")
         self.assertEqual(result["status"], "cancelled")
         self.assertEqual(result["cancel_reason"], "No longer needed")
 
     def test_list_tasks_filters_and_bounds_results(self):
-        submitted = self.submit(approval=True)
+        submitted = self.controller.submit_task(
+            "request-1", "Implement feature", "Make the requested change", "ina", True,
+        )
         found = self.controller.list_tasks("approval_required", 1)
         self.assertEqual([submitted["task_id"]], [item["task_id"] for item in found["tasks"]])
         with self.assertRaisesRegex(ValueError, "limit"):
@@ -142,7 +161,7 @@ class ControllerTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
-    def test_config_requires_owner_only_file_and_rejects_unsafe_worker(self):
+    def test_config_requires_owner_only_file_and_rejects_cli_arguments(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "project"
             root.mkdir()
@@ -150,16 +169,67 @@ class ConfigTests(unittest.TestCase):
             raw = {
                 "repository": "owner/repo", "project_root": str(root),
                 "state_dir": str(Path(directory) / "state"),
-                "workers": {"ina": {"command": ["codex", "--approve-for-me"]}},
+                "workers": {"ina": {"command": ["codex", "--sandbox", "danger-full-access"]}},
                 "principal": {"identity": "chatgpt", "permissions": ["status:read"]},
             }
             config_path.write_text(json.dumps(raw))
             os.chmod(config_path, 0o600)
-            with self.assertRaisesRegex(ValueError, "bypasses"):
+            with self.assertRaisesRegex(ValueError, "may not contain CLI arguments"):
                 Config.load(config_path)
+            canonical = Path(directory) / "canonical-codex"
+            other = Path(directory) / "other-codex"
+            canonical.write_text("#!/bin/sh\n")
+            other.write_text("#!/bin/sh\n")
+            canonical.chmod(0o755)
+            other.chmod(0o755)
+            raw["workers"]["ina"]["command"] = [str(other)]
+            config_path.write_text(json.dumps(raw))
+            with patch("omcp.controller.shutil.which", return_value=str(canonical)):
+                with self.assertRaisesRegex(ValueError, "canonical Codex executable"):
+                    Config.load(config_path)
             os.chmod(config_path, 0o644)
             with self.assertRaisesRegex(ValueError, "owner-only"):
                 Config.load(config_path)
+
+    def test_submit_cannot_disable_human_approval(self):
+        controller = object.__new__(TaskController)
+        controller.config = Config(
+            "owner/repo", Path("/tmp"), Path("/tmp/state"), "origin/main",
+            {"worker": Worker("worker", ("codex",))},
+            Principal("chatgpt:test", frozenset({"tasks:submit"}), "test-session"),
+        )
+        controller._authorize = Mock()
+        with self.assertRaisesRegex(ValueError, "mandatory"):
+            controller.submit_task("r", "title", "instructions", "worker", False)
+
+    def test_submitter_cannot_self_approve(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            state = Path(directory) / "state"
+            config = Config(
+                "owner/repo", root, state, "origin/main",
+                {"ina": Worker("ina", ("codex",))},
+                Principal("local:submitter", ALL_PERMISSIONS, "test-session"),
+            )
+            controller = TaskController(config, workspace_preparer=lambda *_: root)
+            try:
+                submitted = controller.submit_task(
+                    "request-1", "Title", "Instructions", "ina", True,
+                )
+                with self.assertRaisesRegex(AuthorizationError, "cannot approve"):
+                    controller.resolve_approval(
+                        submitted["task_id"], "approve", "self-approval",
+                        approver_identity="local:submitter",
+                    )
+                self.assertEqual(
+                    controller.task_status(submitted["task_id"])["status"], "approval_required",
+                )
+                audit = (state / "audit.jsonl").read_text()
+                self.assertIn('"outcome":"denied"', audit)
+                self.assertIn("submitter_cannot_approve", audit)
+            finally:
+                controller.close()
 
 
 class RunnerTests(unittest.TestCase):
@@ -179,8 +249,28 @@ class RunnerTests(unittest.TestCase):
             with patch("omcp.runner.subprocess.run", return_value=Mock(returncode=0)) as execute:
                 self.assertEqual(run_worker(spec), 0)
             self.assertEqual(json.loads(completion.read_text())["exit_code"], 0)
-            self.assertIn("--sandbox", execute.call_args.args[0])
-            self.assertIn("workspace-write", execute.call_args.args[0])
+            command = execute.call_args.args[0]
+            self.assertEqual(command.count("--sandbox"), 1)
+            self.assertIn("--ask-for-approval", command)
+            self.assertEqual(command[command.index("--ask-for-approval") + 1], "never")
+            self.assertEqual(command[command.index("--sandbox") + 1], "workspace-write")
+            self.assertEqual(command[-1], "-")
+    def test_runner_rejects_configured_cli_flags_before_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt = root / "prompt"
+            prompt.write_text("task")
+            spec = root / "spec.json"
+            spec.write_text(json.dumps({
+                "command": ["codex", "--sandbox", "danger-full-access"],
+                "workspace": str(root), "prompt_path": str(prompt),
+                "log_path": str(root / "log"), "result_path": str(root / "result"),
+                "completion_path": str(root / "completion"), "codex_home": None,
+            }))
+            with patch("omcp.runner.subprocess.run") as execute:
+                with self.assertRaisesRegex(ValueError, "exactly one Codex executable"):
+                    run_worker(spec)
+                execute.assert_not_called()
 
 
 class ServerTests(unittest.TestCase):
@@ -203,6 +293,25 @@ class ServerTests(unittest.TestCase):
         })
         self.assertFalse(response["result"]["isError"])
         self.assertEqual(response["result"]["structuredContent"], {"status": "ok"})
+
+    def test_mutating_server_startup_requires_authenticated_tunnel_identity(self):
+        config = Mock()
+        with patch("omcp.server.Config.load", return_value=config), \
+             patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(PermissionError, "authenticated tunnel"):
+                server_main(["--config", "/unused/config.json"])
+
+    def test_mutating_server_startup_binds_exact_configured_caller(self):
+        config = Mock()
+        config.principal.identity = "chatgpt:expected"
+        env = {
+            "OMCP_TUNNEL_AUTHENTICATED": "1",
+            "OMCP_AUTHENTICATED_CALLER": "chatgpt:other",
+        }
+        with patch("omcp.server.Config.load", return_value=config), \
+             patch.dict(os.environ, env, clear=True):
+            with self.assertRaisesRegex(PermissionError, "does not match"):
+                server_main(["--config", "/unused/config.json"])
 
     def test_unknown_method_uses_json_rpc_error(self):
         response = self.server.handle({"jsonrpc": "2.0", "id": 4, "method": "unknown"})
@@ -260,15 +369,13 @@ class ServerLifecycleTests(unittest.TestCase):
         })["status"], "cancelled")
         self.assertEqual(self.call("task_result", {"task_id": task_id})["result"], "")
 
+        self.assertNotIn("resolve_approval", {tool.get("name") for tool in TOOLS})
         gated = self.call("submit_task", {
             "request_id": "mcp-request-2", "title": "Approval decision",
             "instructions": "Wait for a decision", "worker": "ina",
             "requires_approval": True,
         })
-        rejected = self.call("resolve_approval", {
-            "task_id": gated["task_id"], "decision": "reject", "reason": "Scope changed",
-        })
-        self.assertEqual(rejected["status"], "rejected")
+        self.assertEqual(gated["status"], "approval_required")
 
 
 class StdioIntegrationTests(unittest.TestCase):
@@ -294,15 +401,20 @@ class StdioIntegrationTests(unittest.TestCase):
                 {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                  "params": {"name": "bridge_status", "arguments": {}}},
             ]) + "\n"
+            environment = {
+                **os.environ,
+                "OMCP_TUNNEL_AUTHENTICATED": "1",
+                "OMCP_AUTHENTICATED_CALLER": "chatgpt:test",
+            }
             completed = subprocess.run(
                 [sys.executable, "-m", "omcp.server", "--config", str(config_path)],
                 input=requests, text=True, capture_output=True, check=False,
-                cwd=Path(__file__).resolve().parents[1], timeout=10,
+                cwd=Path(__file__).resolve().parents[1], timeout=10, env=environment,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             responses = [json.loads(line) for line in completed.stdout.splitlines()]
             self.assertEqual([response["id"] for response in responses], [1, 2, 3])
-            self.assertEqual(len(responses[1]["result"]["tools"]), 9)
+            self.assertEqual(len(responses[1]["result"]["tools"]), 8)
             self.assertEqual(responses[2]["result"]["structuredContent"]["status"], "ok")
 
 

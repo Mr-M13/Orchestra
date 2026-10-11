@@ -6,6 +6,7 @@ import json
 import os
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import uuid
@@ -20,7 +21,7 @@ TERMINAL = {"succeeded", "failed", "cancelled", "rejected", "interrupted"}
 ACTIVE = {"starting", "running", "cancel_requested"}
 PERMISSIONS = {
     "status:read", "tasks:submit", "tasks:read", "results:read",
-    "workers:read", "tasks:cancel", "approvals:read", "approvals:decide",
+    "workers:read", "tasks:cancel", "approvals:read",
 }
 
 
@@ -45,6 +46,29 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
         os.fsync(directory)
     finally:
         os.close(directory)
+
+
+def canonical_codex_executable(value: str) -> str:
+    """Resolve the one permitted worker executable and reject wrappers or arguments."""
+    if not isinstance(value, str) or not value:
+        raise ValueError("worker command must be the canonical Codex executable")
+    discovered = shutil.which("codex")
+    if not discovered:
+        raise ValueError("Codex CLI is not available on the service PATH")
+    expected = Path(discovered).resolve(strict=True)
+    candidate_path = Path(value).expanduser()
+    if "/" not in value and "\\" not in value:
+        if value != "codex":
+            raise ValueError("worker command must be exactly codex")
+        candidate = expected
+    else:
+        try:
+            candidate = candidate_path.resolve(strict=True)
+        except FileNotFoundError:
+            raise ValueError("worker command does not resolve to the canonical Codex executable") from None
+    if candidate != expected or not candidate.is_file() or not os.access(candidate, os.X_OK):
+        raise ValueError("worker command does not resolve to the canonical Codex executable")
+    return str(expected)
 
 
 @dataclass(frozen=True)
@@ -98,12 +122,10 @@ class Config:
         for worker in workers.values():
             if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", worker.name):
                 raise ValueError("invalid worker name")
-            if (not worker.command or Path(worker.command[0]).name != "codex"
-                    or any("\x00" in item for item in worker.command)):
-                raise ValueError(f"{worker.name} must invoke Codex directly")
-            forbidden = {"--approve-for-me", "--dangerously-bypass-approvals-and-sandbox"}
-            if forbidden.intersection(worker.command):
-                raise ValueError(f"{worker.name} bypasses approval or sandbox policy")
+            if len(worker.command) != 1:
+                raise ValueError(f"{worker.name} command may not contain CLI arguments")
+            canonical = canonical_codex_executable(worker.command[0])
+            workers[worker.name] = Worker(worker.name, (canonical,), worker.codex_home)
         principal_raw = raw["principal"]
         if not isinstance(principal_raw.get("permissions"), list):
             raise ValueError("principal permissions must be a list")
@@ -220,7 +242,7 @@ class TaskController:
 
     def submit_task(
         self, request_id: str, title: str, instructions: str, worker: str,
-        requires_approval: bool = False,
+        requires_approval: bool = True,
     ) -> dict[str, Any]:
         self._authorize("tasks:submit", "task.submit")
         if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id):
@@ -235,10 +257,10 @@ class TaskController:
             raise ValueError("instructions exceed configured task size")
         if not isinstance(worker, str) or worker not in self.config.workers:
             raise ValueError("unknown worker")
-        if not isinstance(requires_approval, bool):
-            raise ValueError("requires_approval must be boolean")
+        if requires_approval is not True:
+            raise ValueError("human approval is mandatory for every task")
         digest = hashlib.sha256(json.dumps(
-            [title, instructions, worker, bool(requires_approval)], separators=(",", ":")
+            [title, instructions, worker], separators=(",", ":")
         ).encode()).hexdigest()
         previous_id = self.state["requests"].get(request_id)
         if previous_id:
@@ -250,19 +272,19 @@ class TaskController:
             return {**self._public(previous), "acknowledged": True, "idempotent_replay": True}
         task_id = self.id_factory()
         now = utc_now()
-        status = "approval_required" if requires_approval else "accepted"
+        status = "approval_required"
         task = {
             "task_id": task_id, "request_id": request_id, "request_digest": digest,
             "title": title.strip(), "instructions": instructions, "worker": worker,
+            "submitted_by": self.config.principal.identity,
             "status": status, "created_at": now,
         }
-        if requires_approval:
-            task["approval"] = {"status": "pending", "requested_at": now}
+        task["approval"] = {"status": "pending", "requested_at": now}
         self.state["tasks"][task_id] = task
         self.state["requests"][request_id] = task_id
         self._save()
         self._audit("task.submit", task_id, "allowed", {
-            "request_id": request_id, "worker": worker, "requires_approval": requires_approval,
+            "request_id": request_id, "worker": worker, "requires_approval": True,
         })
         self.tick()
         return {**self._public(task), "acknowledged": True, "idempotent_replay": False}
@@ -359,9 +381,18 @@ class TaskController:
         self._audit("approval.list", None, "allowed", {"count": len(approvals)})
         return {"approvals": approvals}
 
-    def resolve_approval(self, task_id: str, decision: str, reason: str) -> dict[str, Any]:
-        self._authorize("approvals:decide", "approval.resolve", task_id)
+    def resolve_approval(
+        self, task_id: str, decision: str, reason: str, approver_identity: str,
+    ) -> dict[str, Any]:
         task = self._task(task_id)
+        if not isinstance(approver_identity, str) or not approver_identity.startswith("local:"):
+            self._audit("approval.resolve", task_id, "denied", {"reason": "not_local_human"})
+            raise AuthorizationError("approval must come from the local human approval channel")
+        if approver_identity == task.get("submitted_by"):
+            self._audit("approval.resolve", task_id, "denied", {
+                "approver": approver_identity, "reason": "submitter_cannot_approve",
+            })
+            raise AuthorizationError("a task submitter cannot approve their own task")
         if task["status"] != "approval_required":
             raise ValueError("task is not awaiting approval")
         if decision not in {"approve", "reject"}:
@@ -370,14 +401,16 @@ class TaskController:
             raise ValueError("approval reason must be 1-1000 characters")
         now = utc_now()
         task["approval"].update({"status": "approved" if decision == "approve" else "rejected",
-                                 "decided_at": now, "decided_by": self.config.principal.identity,
+                                 "decided_at": now, "decided_by": approver_identity,
                                  "reason": reason.strip()})
         if decision == "approve":
             task["status"] = "accepted"
         else:
             task.update({"status": "rejected", "finished_at": now})
         self._save()
-        self._audit("approval.resolve", task_id, "allowed", {"decision": decision})
+        self._audit("approval.resolve", task_id, "allowed", {
+            "decision": decision, "approver": approver_identity,
+        })
         self.tick()
         return self._public(task)
 
