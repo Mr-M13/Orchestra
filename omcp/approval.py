@@ -10,6 +10,23 @@ from pathlib import Path
 from omcp.controller import Config, TaskController
 
 
+def format_review(details: dict[str, object], decision: str) -> str:
+    return "\n".join([
+        "OMCP LOCAL APPROVAL REVIEW",
+        "==========================",
+        f"Task ID:      {details['task_id']}",
+        f"Request ID:   {details['request_id']}",
+        f"Submitted by: {details['submitted_by']}",
+        f"Worker:       {details['worker']}",
+        f"Requested:    {details['requested_at']}",
+        f"Expires:      {details['expires_at']}",
+        f"Decision:     {decision.upper()}",
+        f"Title:        {details['title']}",
+        "Instructions:",
+        str(details["instructions"]),
+    ])
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Approve or reject an OMCP task locally")
     parser.add_argument("--config", type=Path, required=True)
@@ -18,11 +35,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise PermissionError("human approval requires an interactive local terminal")
-    reason = input("Human approval reason: ").strip()
-    if not reason:
-        raise ValueError("a non-empty approval reason is required")
     controller = TaskController(Config.load(args.config))
     try:
+        details = controller.local_approval_details(args.task_id)
+        print(format_review(details, args.decision))
+        expected = f"{args.decision.upper()} {args.task_id}"
+        confirmation = input(f'Type "{expected}" to continue: ').strip()
+        if confirmation != expected:
+            raise PermissionError("approval confirmation did not match")
+        reason = input("Human approval reason: ").strip()
+        if not reason:
+            raise ValueError("a non-empty approval reason is required")
         result = controller.resolve_approval(
             args.task_id, args.decision, reason,
             approver_identity="local:" + getpass.getuser(),

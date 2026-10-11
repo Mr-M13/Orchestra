@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from omcp.approval import format_review
 from omcp.controller import AuthorizationError, Config, Principal, TaskController, Worker
 from omcp.runner import run as run_worker
 from omcp.server import MCPServer, TOOLS, main as server_main
@@ -109,6 +110,47 @@ class ControllerTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "running")
         self.popen.assert_called_once()
+
+    def test_expired_approval_is_rejected_and_cannot_launch(self):
+        submitted = self.controller.submit_task(
+            "request-1", "Implement feature", "Make the requested change", "ina", True,
+        )
+        task = self.controller.state["tasks"][submitted["task_id"]]
+        task["approval"]["expires_at"] = "2000-01-01T00:00:00+00:00"
+        with self.assertRaisesRegex(ValueError, "expired"):
+            self.controller.resolve_approval(
+                submitted["task_id"], "approve", "Too late",
+                approver_identity="local:test-operator",
+            )
+        self.assertEqual(task["status"], "rejected")
+        self.assertEqual(task["approval"]["status"], "expired")
+        self.popen.assert_not_called()
+        audit = (self.state / "audit.jsonl").read_text()
+        self.assertIn('"action":"approval.expire"', audit)
+
+    def test_invalid_approval_expiry_fails_closed(self):
+        submitted = self.controller.submit_task(
+            "request-1", "Implement feature", "Make the requested change", "ina", True,
+        )
+        task = self.controller.state["tasks"][submitted["task_id"]]
+        task["approval"].pop("expires_at")
+        with self.assertRaisesRegex(ValueError, "expired"):
+            self.controller.local_approval_details(submitted["task_id"])
+        self.assertEqual(task["status"], "rejected")
+        self.popen.assert_not_called()
+
+    def test_local_approval_review_contains_operation_and_arguments(self):
+        submitted = self.controller.submit_task(
+            "request-1", "Implement feature", "Make the requested change", "ina", True,
+        )
+        details = self.controller.local_approval_details(submitted["task_id"])
+        review = format_review(details, "approve")
+        self.assertIn(submitted["task_id"], review)
+        self.assertIn("request-1", review)
+        self.assertIn("Implement feature", review)
+        self.assertIn("Make the requested change", review)
+        self.assertIn("Worker:       ina", review)
+        self.assertIn("Decision:     APPROVE", review)
 
     def test_pending_task_can_be_cancelled_with_reason(self):
         submitted = self.controller.submit_task(

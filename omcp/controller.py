@@ -11,7 +11,7 @@ import subprocess
 import sys
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -95,6 +95,7 @@ class Config:
     principal: Principal
     max_task_bytes: int = 65_536
     max_result_bytes: int = 65_536
+    approval_ttl_seconds: int = 1_800
 
     @classmethod
     def load(cls, path: Path) -> "Config":
@@ -141,10 +142,14 @@ class Config:
             raise ValueError("invalid principal identity")
         if not re.fullmatch(r"[A-Za-z0-9_.:@/-]{1,128}", principal.authentication):
             raise ValueError("invalid authentication description")
+        approval_ttl_seconds = int(raw.get("approval_ttl_seconds", 1_800))
+        if not 60 <= approval_ttl_seconds <= 86_400:
+            raise ValueError("approval_ttl_seconds must be between 60 and 86400")
         return cls(
             repository, root, state, base_ref, workers, principal,
             max(1_024, min(int(raw.get("max_task_bytes", 65_536)), 1_048_576)),
             max(1_024, min(int(raw.get("max_result_bytes", 65_536)), 1_048_576)),
+            approval_ttl_seconds,
         )
 
 
@@ -279,7 +284,12 @@ class TaskController:
             "submitted_by": self.config.principal.identity,
             "status": status, "created_at": now,
         }
-        task["approval"] = {"status": "pending", "requested_at": now}
+        expires_at = (datetime.fromisoformat(now) + timedelta(
+            seconds=self.config.approval_ttl_seconds,
+        )).isoformat()
+        task["approval"] = {
+            "status": "pending", "requested_at": now, "expires_at": expires_at,
+        }
         self.state["tasks"][task_id] = task
         self.state["requests"][request_id] = task_id
         self._save()
@@ -376,6 +386,7 @@ class TaskController:
 
     def list_approvals(self) -> dict[str, Any]:
         self._authorize("approvals:read", "approval.list")
+        self._expire_pending_approvals()
         approvals = [self._public(task) for task in self.state["tasks"].values()
                      if task["status"] == "approval_required"]
         self._audit("approval.list", None, "allowed", {"count": len(approvals)})
@@ -393,6 +404,8 @@ class TaskController:
                 "approver": approver_identity, "reason": "submitter_cannot_approve",
             })
             raise AuthorizationError("a task submitter cannot approve their own task")
+        if self._expire_approval(task):
+            raise ValueError("approval request has expired")
         if task["status"] != "approval_required":
             raise ValueError("task is not awaiting approval")
         if decision not in {"approve", "reject"}:
@@ -414,7 +427,49 @@ class TaskController:
         self.tick()
         return self._public(task)
 
+    def local_approval_details(self, task_id: str) -> dict[str, Any]:
+        """Return the complete request only to the local approval command."""
+        task = self._task(task_id)
+        if self._expire_approval(task):
+            raise ValueError("approval request has expired")
+        if task["status"] != "approval_required":
+            raise ValueError("task is not awaiting approval")
+        self._audit("approval.review", task_id, "allowed", {})
+        return {
+            "task_id": task["task_id"], "request_id": task["request_id"],
+            "submitted_by": task["submitted_by"], "worker": task["worker"],
+            "title": task["title"], "instructions": task["instructions"],
+            "requested_at": task["approval"]["requested_at"],
+            "expires_at": task["approval"]["expires_at"],
+        }
+
+    def _expire_approval(self, task: dict[str, Any]) -> bool:
+        if task.get("status") != "approval_required":
+            return False
+        approval = task.get("approval", {})
+        expires_at = approval.get("expires_at")
+        if not isinstance(expires_at, str):
+            expired = True
+        else:
+            try:
+                expired = datetime.fromisoformat(expires_at) <= datetime.now(timezone.utc)
+            except ValueError:
+                expired = True
+        if not expired:
+            return False
+        now = utc_now()
+        approval.update({"status": "expired", "decided_at": now})
+        task.update({"status": "rejected", "finished_at": now})
+        self._save()
+        self._audit("approval.expire", task["task_id"], "allowed", {})
+        return True
+
+    def _expire_pending_approvals(self) -> None:
+        for task in self.state["tasks"].values():
+            self._expire_approval(task)
+
     def tick(self) -> None:
+        self._expire_pending_approvals()
         self.reconcile()
         if any(task["status"] in ACTIVE for task in self.state["tasks"].values()):
             return
