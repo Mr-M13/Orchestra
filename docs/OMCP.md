@@ -19,7 +19,7 @@ OMCP does not replace Desktop Commander or the GitHub Issue Mac Bridge. Keep bot
 
 Task states are `accepted`, `approval_required`, `starting`, `running`, `cancel_requested`, `succeeded`, `failed`, `cancelled`, `rejected` or `interrupted`. A successful worker exit is an execution result, not independent verification.
 
-`submit_task` records the task and request-id mapping before starting a worker. `repository_profile` is optional only when a default profile is configured; OMCP resolves it from its owner-only configuration and never accepts a path, URL, ref, or executable in a task request. Retrying the same request and content returns the existing acknowledgement. Reusing a request ID with different content, including a different profile, fails closed.
+`submit_task` requires an explicit `repository_profile` in its published MCP schema. OMCP resolves that allowlisted identifier from its owner-only configuration and never accepts a path, URL, ref, or executable in a task request. Multi-repository deployments also reject an omitted profile at runtime before persisting a task, so older or non-validating clients cannot silently select the wrong repository. The controller retains the legacy implicit `default` profile only for direct single-repository callers. Retrying the same request and content returns the existing acknowledgement. Reusing a request ID with different content, including a different profile, fails closed.
 
 ## Security boundary
 

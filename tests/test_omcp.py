@@ -106,6 +106,58 @@ class ControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different task content"):
             self.controller.submit_task("profile-request", "Inspect", "Read only", "ina", True, "orchestra")
 
+    def test_multi_repository_requires_explicit_profile_before_persistence(self):
+        archive = Path(self.temp.name) / "archive"
+        archive.mkdir()
+        self.controller.close()
+        self.controller = TaskController(
+            Config("owner/repo", self.root, self.state, "origin/main",
+                   {"ina": Worker("ina", ("codex",))},
+                   Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+                   repository_profiles={
+                       "orchestra": RepositoryProfile("orchestra", "owner/repo", self.root, "origin/main"),
+                       "archive": RepositoryProfile("archive", "owner/archive", archive, "origin/main"),
+                   },
+                   default_profile="orchestra"),
+            popen=self.popen, workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: "11111111-1111-1111-1111-111111111111",
+        )
+        with self.assertRaisesRegex(ValueError, "repository_profile is required"):
+            self.controller.submit_task("missing-profile", "Inspect", "Read only", "ina")
+        self.assertEqual(self.controller.state["tasks"], {})
+        self.popen.assert_not_called()
+        submitted = self.controller.submit_task(
+            "explicit-profile", "Inspect", "Read only", "ina", True, "archive",
+        )
+        self.assertEqual(submitted["repository_profile"], "archive")
+        self.assertEqual(submitted["repository"], "owner/archive")
+
+    def test_multi_repository_bridge_status_uses_default_profile(self):
+        archive = Path(self.temp.name) / "archive"
+        archive.mkdir()
+        self.controller.close()
+        self.controller = TaskController(
+            Config("owner/repo", self.root, self.state, "origin/main",
+                   {"ina": Worker("ina", ("codex",))},
+                   Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+                   repository_profiles={
+                       "orchestra": RepositoryProfile("orchestra", "owner/repo", self.root, "origin/main"),
+                       "archive": RepositoryProfile("archive", "owner/archive", archive, "origin/main"),
+                   },
+                   default_profile="orchestra"),
+            popen=self.popen, workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: "11111111-1111-1111-1111-111111111111",
+        )
+
+        status = self.controller.bridge_status()
+
+        self.assertEqual(status["status"], "ok")
+        self.assertEqual(status["repository"], "owner/repo")
+        self.assertEqual(status["default_profile"], "orchestra")
+        self.assertEqual(status["repository_profiles"], ["archive", "orchestra"])
+        self.assertEqual(self.controller.state["tasks"], {})
+        self.popen.assert_not_called()
+
     def test_unknown_profile_fails_before_task_is_persisted(self):
         with self.assertRaisesRegex(ValueError, "unknown repository profile"):
             self.controller.submit_task("unknown-profile", "Inspect", "Read only", "ina", True, "missing")
@@ -528,12 +580,63 @@ class ServerLifecycleTests(unittest.TestCase):
         self.assertFalse(response["result"]["isError"], response)
         return response["result"]["structuredContent"]
 
+    def test_submit_task_published_schema_requires_repository_profile(self):
+        submit_task = next(tool for tool in TOOLS if tool["name"] == "submit_task")
+        schema = submit_task["inputSchema"]
+        self.assertIn("repository_profile", schema["required"])
+        self.assertEqual(schema["properties"]["repository_profile"]["type"], "string")
+
+    def test_multi_repository_health_and_submission_scope_through_mcp(self):
+        archive = Path(self.temp.name) / "archive"
+        archive.mkdir()
+        self.controller.close()
+        popen = Mock(return_value=FakeProcess())
+        self.controller = TaskController(
+            Config("owner/repo", self.root, Path(self.temp.name) / "multi-state", "origin/main",
+                   {"ina": Worker("ina", ("codex",))},
+                   Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+                   repository_profiles={
+                       "orchestra": RepositoryProfile("orchestra", "owner/repo", self.root, "origin/main"),
+                       "archive": RepositoryProfile("archive", "owner/archive", archive, "origin/main"),
+                   },
+                   default_profile="orchestra"),
+            popen=popen, workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: "11111111-1111-1111-1111-111111111111",
+        )
+        self.server = MCPServer(self.controller)
+
+        status = self.call("bridge_status")
+        self.assertEqual(status["default_profile"], "orchestra")
+        self.assertEqual(status["repository_profiles"], ["archive", "orchestra"])
+
+        missing_profile = self.server.handle({
+            "jsonrpc": "2.0", "id": 100, "method": "tools/call",
+            "params": {"name": "submit_task", "arguments": {
+                "request_id": "missing-profile", "title": "Controlled task",
+                "instructions": "Perform bounded work", "worker": "ina",
+                "requires_approval": True,
+            }},
+        })
+        self.assertTrue(missing_profile["result"]["isError"])
+        self.assertIn("repository_profile is required", missing_profile["result"]["content"][0]["text"])
+        self.assertEqual(self.controller.state["tasks"], {})
+
+        submitted = self.call("submit_task", {
+            "request_id": "explicit-profile", "title": "Controlled task",
+            "instructions": "Perform bounded work", "worker": "ina",
+            "repository_profile": "archive", "requires_approval": True,
+        })
+        self.assertEqual(submitted["repository_profile"], "archive")
+        self.assertEqual(submitted["repository"], "owner/archive")
+        self.assertEqual(submitted["status"], "approval_required")
+        popen.assert_not_called()
+
     def test_every_task_control_tool_through_mcp_boundary(self):
         self.assertEqual(self.call("bridge_status")["status"], "ok")
         submitted = self.call("submit_task", {
             "request_id": "mcp-request-1", "title": "Controlled task",
             "instructions": "Perform bounded work", "worker": "ina",
-            "requires_approval": True,
+            "repository_profile": "default", "requires_approval": True,
         })
         task_id = submitted["task_id"]
         self.assertEqual(self.call("task_status", {"task_id": task_id})["status"], "approval_required")
@@ -549,7 +652,7 @@ class ServerLifecycleTests(unittest.TestCase):
         gated = self.call("submit_task", {
             "request_id": "mcp-request-2", "title": "Approval decision",
             "instructions": "Wait for a decision", "worker": "ina",
-            "requires_approval": True,
+            "repository_profile": "default", "requires_approval": True,
         })
         self.assertEqual(gated["status"], "approval_required")
 

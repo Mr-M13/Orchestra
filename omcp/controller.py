@@ -316,6 +316,12 @@ class TaskController:
             raise ValueError("instructions exceed configured task size")
         if not isinstance(worker, str) or worker not in self.config.workers:
             raise ValueError("unknown worker")
+        # Task submission must bind an explicit target when more than one repository
+        # is configured. Global/read-only callers may still resolve the configured
+        # default profile for service metadata.
+        if (repository_profile is None and self.config.repository_profiles is not None
+                and len(self.config.repository_profiles) > 1):
+            raise ValueError("repository_profile is required when multiple repositories are configured")
         profile = self.config.profile(repository_profile)
         if requires_approval is not True:
             raise ValueError("human approval is mandatory for every task")
@@ -495,13 +501,14 @@ class TaskController:
             raise ValueError("approval request has expired")
         if task["status"] != "approval_required":
             raise ValueError("task is not awaiting approval")
+        profile = self.config.profile(task.get("repository_profile"))
         self._audit("approval.review", task_id, "allowed", {})
         return {
             "task_id": task["task_id"], "request_id": task["request_id"],
             "submitted_by": task["submitted_by"], "worker": task["worker"],
-            "repository_profile": task.get("repository_profile", self.config.profile(None).profile_id),
-            "repository": task.get("repository", self.config.profile(None).repository),
-            "base_ref": task.get("base_ref", self.config.profile(None).base_ref),
+            "repository_profile": task.get("repository_profile", profile.profile_id),
+            "repository": task.get("repository", profile.repository),
+            "base_ref": task.get("base_ref", profile.base_ref),
             "title": task["title"], "instructions": task["instructions"],
             "requested_at": task["approval"]["requested_at"],
             "expires_at": task["approval"]["expires_at"],
