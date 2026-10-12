@@ -29,7 +29,7 @@ The initial foundation set is recorded before runtime implementation:
 - design Learning Mode so important technical decisions can be understood, not merely executed;
 - record consequential architectural choices as Architecture Decision Records (ADRs).
 
-The first runtime component is the opt-in Mac Bridge v1. Its implementation and operating boundary are recorded in [ADR-001](docs/decisions/ADR-001-mac-bridge-v1.md). It is a narrow instrument, not the complete Orchestra coordinator or authoritative workflow engine.
+The first runtime component is the opt-in Mac Bridge v1. Its implementation and operating boundary are recorded in [ADR-001](docs/decisions/ADR-001-mac-bridge-v1.md). The proposed [OMCP task-control adapter](docs/OMCP.md) adds a direct, authenticated MCP path for task submission and control while keeping ChatGPT responsible for orchestration. Both are narrow instruments, not the complete Orchestra coordinator or authoritative workflow engine.
 
 ### Foundation documents
 
@@ -43,6 +43,8 @@ The first runtime component is the opt-in Mac Bridge v1. Its implementation and 
 - [Learning Mode v1](docs/foundation/LEARNING-MODE.md) — lets understanding grow through real project work using adaptive, evidence-grounded explanations while keeping teaching separate from authority, verification and orchestration.
 - [Mac Bridge v1](docs/MAC-BRIDGE-V1.md) — a local outbound-only GitHub issue dispatcher for scoped worker execution.
 - [ADR-001: Local outbound worker bridge](docs/decisions/ADR-001-mac-bridge-v1.md) — records the queue, trust boundary, credential, and recovery decisions for the first runtime component.
+- [OMCP task control v1](docs/OMCP.md) — direct MCP tools for durable submission, status, results, availability, cancellation and approvals.
+- [ADR-002: Local MCP task-control adapter](docs/decisions/ADR-002-omcp-task-control.md) — records the direct-control transport, authority and recovery boundary.
 
 The lessons audit remains open to new evidence throughout development; completing the initial audit does not freeze what Orchestra can learn.
 
