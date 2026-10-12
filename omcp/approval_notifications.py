@@ -25,6 +25,7 @@ class NotificationSpec:
     body: str
     portal_base_url: str
     portal_token_path: str
+    receipt_path: str
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -86,9 +87,35 @@ class ApprovalNotificationAgent:
         return value
 
     def _run_notifier(self, command: list[str]) -> None:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=20, check=False)
+        executable = Path(command[0]).resolve()
+        try:
+            app_bundle = executable.parents[2]
+        except IndexError:
+            raise RuntimeError("notification helper is not inside an app bundle") from None
+        if app_bundle.suffix != ".app":
+            raise RuntimeError("notification helper is not inside an app bundle")
+        receipt_path: Path | None = None
+        expected_receipt = None
+        if len(command) == 3 and command[1] == "--notify":
+            spec = json.loads(Path(command[2]).read_text())
+            receipt_path = Path(spec["receipt_path"])
+            expected_receipt = spec["notification_id"]
+            receipt_path.unlink(missing_ok=True)
+        result = subprocess.run(
+            ["/usr/bin/open", "-W", "-n", "-a", str(app_bundle), "--args", *command[1:]],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
         if result.returncode:
             raise RuntimeError(f"notification helper failed with exit {result.returncode}")
+        if receipt_path is not None:
+            try:
+                receipt = receipt_path.read_text().strip()
+            except FileNotFoundError:
+                raise RuntimeError("notification helper did not confirm delivery") from None
+            finally:
+                receipt_path.unlink(missing_ok=True)
+            if receipt != expected_receipt:
+                raise RuntimeError("notification helper returned an invalid delivery receipt")
 
     def _remove_notification(self, notification_id: str) -> None:
         self._run_notifier([
@@ -108,6 +135,7 @@ class ApprovalNotificationAgent:
             body=f"{repository} · {worker} · {task_id}",
             portal_base_url=self.portal_base_url,
             portal_token_path=str(self.portal_token_path),
+            receipt_path=str(self.spec_dir / f"{notification_id}.delivered"),
         )
 
     def scan_once(self) -> dict[str, int]:
