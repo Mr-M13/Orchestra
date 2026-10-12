@@ -3,7 +3,6 @@ set -eu
 
 source_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 service_root=${ORCHESTRA_OMCP_SERVICE_ROOT:-"$HOME/Library/Application Support/Orchestra/omcp-service"}
-config_path=${ORCHESTRA_OMCP_CONFIG:-"$service_root/omcp.json"}
 state_dir=${ORCHESTRA_OMCP_STATE_DIR:-"$service_root/state"}
 approval_root="$service_root/approval"
 app="$approval_root/Orchestra Approval.app"
@@ -38,7 +37,7 @@ info_plist="$app/Contents/Info.plist"
 portal_plist="$launch_agents/$portal_label.plist"
 /usr/bin/plutil -create xml1 "$portal_plist"
 /usr/bin/plutil -insert Label -string "$portal_label" "$portal_plist"
-/usr/bin/plutil -insert ProgramArguments -xml "<array><string>/usr/bin/python3</string><string>-m</string><string>omcp.approval_portal</string><string>--config</string><string>$config_path</string><string>--listen-host</string><string>127.0.0.1</string><string>--listen-port</string><string>8767</string><string>--token-path</string><string>$portal_token</string></array>" "$portal_plist"
+/usr/bin/plutil -insert ProgramArguments -xml "<array><string>/usr/bin/python3</string><string>-m</string><string>omcp.approval_portal</string><string>--state-dir</string><string>$state_dir</string><string>--listen-host</string><string>127.0.0.1</string><string>--listen-port</string><string>8767</string><string>--token-path</string><string>$portal_token</string></array>" "$portal_plist"
 /usr/bin/plutil -insert WorkingDirectory -string "$source_root" "$portal_plist"
 /usr/bin/plutil -insert RunAtLoad -bool true "$portal_plist"
 /usr/bin/plutil -insert KeepAlive -bool true "$portal_plist"
