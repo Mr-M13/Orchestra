@@ -554,12 +554,18 @@ class ServerLifecycleTests(unittest.TestCase):
         self.assertFalse(response["result"]["isError"], response)
         return response["result"]["structuredContent"]
 
+    def test_submit_task_published_schema_requires_repository_profile(self):
+        submit_task = next(tool for tool in TOOLS if tool["name"] == "submit_task")
+        schema = submit_task["inputSchema"]
+        self.assertIn("repository_profile", schema["required"])
+        self.assertEqual(schema["properties"]["repository_profile"]["type"], "string")
+
     def test_every_task_control_tool_through_mcp_boundary(self):
         self.assertEqual(self.call("bridge_status")["status"], "ok")
         submitted = self.call("submit_task", {
             "request_id": "mcp-request-1", "title": "Controlled task",
             "instructions": "Perform bounded work", "worker": "ina",
-            "requires_approval": True,
+            "repository_profile": "default", "requires_approval": True,
         })
         task_id = submitted["task_id"]
         self.assertEqual(self.call("task_status", {"task_id": task_id})["status"], "approval_required")
@@ -575,7 +581,7 @@ class ServerLifecycleTests(unittest.TestCase):
         gated = self.call("submit_task", {
             "request_id": "mcp-request-2", "title": "Approval decision",
             "instructions": "Wait for a decision", "worker": "ina",
-            "requires_approval": True,
+            "repository_profile": "default", "requires_approval": True,
         })
         self.assertEqual(gated["status"], "approval_required")
 

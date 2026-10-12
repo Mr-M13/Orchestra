@@ -34,7 +34,7 @@ TOOLS = [
     },
     {
         "name": "submit_task",
-        "description": "Durably submit a worker task. request_id makes retries idempotent.",
+        "description": "Durably submit a worker task for an explicit repository profile. request_id makes retries idempotent.",
         "inputSchema": _object({
             "request_id": {"type": "string", "minLength": 1, "maxLength": 128},
             "title": {"type": "string", "minLength": 1, "maxLength": 200},
@@ -42,7 +42,7 @@ TOOLS = [
             "worker": {"type": "string", "minLength": 1},
             "repository_profile": {"type": "string", "minLength": 1, "maxLength": 64},
             "requires_approval": {"type": "boolean", "default": True, "const": True},
-        }, ["request_id", "title", "instructions", "worker"]),
+        }, ["request_id", "title", "instructions", "worker", "repository_profile"]),
     },
     {
         "name": "task_status",

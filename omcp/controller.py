@@ -499,13 +499,14 @@ class TaskController:
             raise ValueError("approval request has expired")
         if task["status"] != "approval_required":
             raise ValueError("task is not awaiting approval")
+        profile = self.config.profile(task.get("repository_profile"))
         self._audit("approval.review", task_id, "allowed", {})
         return {
             "task_id": task["task_id"], "request_id": task["request_id"],
             "submitted_by": task["submitted_by"], "worker": task["worker"],
-            "repository_profile": task.get("repository_profile", self.config.profile(None).profile_id),
-            "repository": task.get("repository", self.config.profile(None).repository),
-            "base_ref": task.get("base_ref", self.config.profile(None).base_ref),
+            "repository_profile": task.get("repository_profile", profile.profile_id),
+            "repository": task.get("repository", profile.repository),
+            "base_ref": task.get("base_ref", profile.base_ref),
             "title": task["title"], "instructions": task["instructions"],
             "requested_at": task["approval"]["requested_at"],
             "expires_at": task["approval"]["expires_at"],
