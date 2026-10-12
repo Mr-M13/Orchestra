@@ -23,6 +23,11 @@ PERMISSIONS = {
     "status:read", "tasks:submit", "tasks:read", "results:read",
     "workers:read", "tasks:cancel", "approvals:read",
 }
+CONSEQUENCE_CLASSES = {
+    "routine_development", "production_deployment", "destructive_operation",
+    "security_change", "unclassified",
+}
+STANDING_AUTHORIZABLE_CLASSES = {"routine_development"}
 
 
 def utc_now() -> str:
@@ -89,6 +94,16 @@ class RepositoryProfile:
 
 
 @dataclass(frozen=True)
+class StandingAuthorization:
+    """Owner-configured authority for a bounded class of worker tasks."""
+
+    authorization_id: str
+    consequence_class: str
+    repository_profiles: frozenset[str]
+    workers: frozenset[str]
+
+
+@dataclass(frozen=True)
 class Principal:
     identity: str
     permissions: frozenset[str]
@@ -108,6 +123,7 @@ class Config:
     approval_ttl_seconds: int = 1_800
     repository_profiles: dict[str, RepositoryProfile] | None = None
     default_profile: str | None = None
+    standing_authorizations: tuple[StandingAuthorization, ...] = ()
 
     @classmethod
     def load(cls, path: Path) -> "Config":
@@ -187,12 +203,47 @@ class Config:
             default_profile = raw.get("default_profile")
             if not isinstance(default_profile, str) or default_profile not in profiles:
                 raise ValueError("default_profile must name a configured repository profile")
+        known_profiles = set(profiles or {"default": None})
+        authorizations_raw = raw.get("standing_authorizations", [])
+        if not isinstance(authorizations_raw, list):
+            raise ValueError("standing_authorizations must be a list")
+        standing_authorizations: list[StandingAuthorization] = []
+        seen_authorization_ids: set[str] = set()
+        for authorization_raw in authorizations_raw:
+            if not isinstance(authorization_raw, dict):
+                raise ValueError("standing authorization must be an object")
+            authorization_id = authorization_raw.get("id")
+            if (not isinstance(authorization_id, str)
+                    or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", authorization_id)):
+                raise ValueError("invalid standing authorization id")
+            if authorization_id in seen_authorization_ids:
+                raise ValueError("duplicate standing authorization id")
+            seen_authorization_ids.add(authorization_id)
+            consequence_class = authorization_raw.get("consequence_class")
+            if consequence_class not in STANDING_AUTHORIZABLE_CLASSES:
+                raise ValueError("standing authorization may only grant routine_development")
+            profile_ids = authorization_raw.get("repository_profiles")
+            worker_names = authorization_raw.get("workers")
+            if (not isinstance(profile_ids, list) or not profile_ids
+                    or not all(isinstance(value, str) for value in profile_ids)):
+                raise ValueError("standing authorization repository_profiles must be a non-empty list")
+            if (not isinstance(worker_names, list) or not worker_names
+                    or not all(isinstance(value, str) for value in worker_names)):
+                raise ValueError("standing authorization workers must be a non-empty list")
+            if set(profile_ids) - known_profiles:
+                raise ValueError("standing authorization names an unknown repository profile")
+            if set(worker_names) - set(workers):
+                raise ValueError("standing authorization names an unknown worker")
+            standing_authorizations.append(StandingAuthorization(
+                authorization_id, consequence_class,
+                frozenset(profile_ids), frozenset(worker_names),
+            ))
         return cls(
             repository, root, state, base_ref, workers, principal,
             max(1_024, min(int(raw.get("max_task_bytes", 65_536)), 1_048_576)),
             max(1_024, min(int(raw.get("max_result_bytes", 65_536)), 1_048_576)),
             approval_ttl_seconds,
-            profiles, default_profile,
+            profiles, default_profile, tuple(standing_authorizations),
         )
 
     def profile(self, profile_id: str | None) -> RepositoryProfile:
@@ -205,6 +256,17 @@ class Config:
         if not isinstance(selected, str) or selected not in self.repository_profiles:
             raise ValueError("unknown repository profile")
         return self.repository_profiles[selected]
+
+    def standing_authorization(
+        self, consequence_class: str, profile_id: str, worker: str,
+    ) -> StandingAuthorization | None:
+        """Resolve only explicitly configured low-consequence standing authority."""
+        if consequence_class not in STANDING_AUTHORIZABLE_CLASSES:
+            return None
+        return next((authorization for authorization in self.standing_authorizations
+                     if authorization.consequence_class == consequence_class
+                     and profile_id in authorization.repository_profiles
+                     and worker in authorization.workers), None)
 
 
 class AuthorizationError(PermissionError):
@@ -296,12 +358,14 @@ class TaskController:
             "task_id", "request_id", "title", "worker", "status", "created_at",
             "started_at", "finished_at", "exit_code", "branch", "approval",
             "cancel_reason", "failure", "repository_profile", "repository", "base_ref",
+            "consequence_class", "authorization",
         )
         return {key: task[key] for key in keys if key in task}
 
     def submit_task(
         self, request_id: str, title: str, instructions: str, worker: str,
         requires_approval: bool = True, repository_profile: str | None = None,
+        consequence_class: str = "unclassified",
     ) -> dict[str, Any]:
         self._authorize("tasks:submit", "task.submit")
         if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id):
@@ -324,9 +388,15 @@ class TaskController:
             raise ValueError("repository_profile is required when multiple repositories are configured")
         profile = self.config.profile(repository_profile)
         if requires_approval is not True:
-            raise ValueError("human approval is mandatory for every task")
+            raise ValueError("the server approval policy is mandatory and cannot be disabled by the caller")
+        if consequence_class not in CONSEQUENCE_CLASSES:
+            raise ValueError("unknown consequence_class")
+        standing_authorization = self.config.standing_authorization(
+            consequence_class, profile.profile_id, worker,
+        )
         digest = hashlib.sha256(json.dumps(
-            [title, instructions, worker, profile.profile_id], separators=(",", ":")
+            [title, instructions, worker, profile.profile_id, consequence_class],
+            separators=(",", ":")
         ).encode()).hexdigest()
         previous_id = self.state["requests"].get(request_id)
         if previous_id:
@@ -338,27 +408,40 @@ class TaskController:
             return {**self._public(previous), "acknowledged": True, "idempotent_replay": True}
         task_id = self.id_factory()
         now = utc_now()
-        status = "approval_required"
+        status = "accepted" if standing_authorization else "approval_required"
         task = {
             "task_id": task_id, "request_id": request_id, "request_digest": digest,
             "title": title.strip(), "instructions": instructions, "worker": worker,
             "repository_profile": profile.profile_id, "repository": profile.repository,
             "base_ref": profile.base_ref,
+            "consequence_class": consequence_class,
             "submitted_by": self.config.principal.identity,
             "status": status, "created_at": now,
         }
-        expires_at = (datetime.fromisoformat(now) + timedelta(
-            seconds=self.config.approval_ttl_seconds,
-        )).isoformat()
-        task["approval"] = {
-            "status": "pending", "requested_at": now, "expires_at": expires_at,
-        }
+        if standing_authorization:
+            task["authorization"] = {
+                "mode": "standing", "authorization_id": standing_authorization.authorization_id,
+            }
+            task["approval"] = {
+                "status": "standing_authorized", "decided_at": now,
+                "decided_by": "policy:" + standing_authorization.authorization_id,
+            }
+        else:
+            expires_at = (datetime.fromisoformat(now) + timedelta(
+                seconds=self.config.approval_ttl_seconds,
+            )).isoformat()
+            task["authorization"] = {"mode": "explicit"}
+            task["approval"] = {
+                "status": "pending", "requested_at": now, "expires_at": expires_at,
+            }
         self.state["tasks"][task_id] = task
         self.state["requests"][request_id] = task_id
         self._save()
         self._audit("task.submit", task_id, "allowed", {
             "request_id": request_id, "worker": worker, "repository_profile": profile.profile_id,
-            "requires_approval": True,
+            "consequence_class": consequence_class,
+            "authorization_mode": task["authorization"]["mode"],
+            "authorization_id": task["authorization"].get("authorization_id"),
         })
         self.tick()
         return {**self._public(task), "acknowledged": True, "idempotent_replay": False}
@@ -509,6 +592,7 @@ class TaskController:
             "repository_profile": task.get("repository_profile", profile.profile_id),
             "repository": task.get("repository", profile.repository),
             "base_ref": task.get("base_ref", profile.base_ref),
+            "consequence_class": task.get("consequence_class", "unclassified"),
             "title": task["title"], "instructions": task["instructions"],
             "requested_at": task["approval"]["requested_at"],
             "expires_at": task["approval"]["expires_at"],

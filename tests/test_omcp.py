@@ -9,7 +9,10 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from omcp.approval import format_review
-from omcp.controller import AuthorizationError, Config, Principal, RepositoryProfile, TaskController, Worker
+from omcp.controller import (
+    AuthorizationError, Config, Principal, RepositoryProfile, StandingAuthorization,
+    TaskController, Worker,
+)
 from omcp.local_control import LocalApprovalServer, approval_request
 from omcp.runner import run as run_worker
 from omcp.server import MCPServer, TOOLS, main as server_main
@@ -158,6 +161,114 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.controller.state["tasks"], {})
         self.popen.assert_not_called()
 
+    def test_bounded_routine_development_uses_standing_authorization(self):
+        self.controller.close()
+        self.controller = TaskController(
+            Config(
+                "owner/repo", self.root, self.state, "origin/main",
+                {"ina": Worker("ina", ("codex",))},
+                Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+                standing_authorizations=(StandingAuthorization(
+                    "routine-local-development", "routine_development",
+                    frozenset({"default"}), frozenset({"ina"}),
+                ),),
+            ),
+            popen=self.popen, workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: "11111111-1111-1111-1111-111111111111",
+        )
+
+        submitted = self.controller.submit_task(
+            "routine-1", "Implement tests", "Change local code and run tests", "ina",
+            True, "default", "routine_development",
+        )
+
+        self.assertEqual(submitted["status"], "running")
+        self.assertEqual(submitted["consequence_class"], "routine_development")
+        self.assertEqual(submitted["authorization"], {
+            "mode": "standing", "authorization_id": "routine-local-development",
+        })
+        self.assertEqual(submitted["approval"]["status"], "standing_authorized")
+        self.assertEqual(self.controller.list_approvals()["approvals"], [])
+        self.popen.assert_called_once()
+        audit = (self.state / "audit.jsonl").read_text()
+        self.assertIn('"authorization_mode":"standing"', audit)
+        self.assertNotIn("Change local code and run tests", audit)
+
+    def test_protected_and_unclassified_work_still_requires_explicit_approval(self):
+        self.controller.close()
+        ids = iter([
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+            "33333333-3333-3333-3333-333333333333",
+            "44444444-4444-4444-4444-444444444444",
+        ])
+        self.controller = TaskController(
+            Config(
+                "owner/repo", self.root, self.state, "origin/main",
+                {"ina": Worker("ina", ("codex",))},
+                Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+                standing_authorizations=(StandingAuthorization(
+                    "routine-local-development", "routine_development",
+                    frozenset({"default"}), frozenset({"ina"}),
+                ),),
+            ),
+            popen=self.popen, workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: next(ids),
+        )
+
+        for index, consequence_class in enumerate((
+            "production_deployment", "destructive_operation", "security_change", "unclassified",
+        )):
+            submitted = self.controller.submit_task(
+                f"protected-{index}", "Consequential work", "Do consequential work", "ina",
+                True, "default", consequence_class,
+            )
+            self.assertEqual(submitted["status"], "approval_required")
+            self.assertEqual(submitted["authorization"], {"mode": "explicit"})
+            self.assertEqual(submitted["approval"]["status"], "pending")
+        self.assertEqual(len(self.controller.list_approvals()["approvals"]), 4)
+        self.popen.assert_not_called()
+
+    def test_routine_work_outside_granted_worker_scope_requires_explicit_approval(self):
+        self.controller.close()
+        self.controller = TaskController(
+            Config(
+                "owner/repo", self.root, self.state, "origin/main",
+                {
+                    "ina": Worker("ina", ("codex",)),
+                    "codex": Worker("codex", ("codex",)),
+                },
+                Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+                standing_authorizations=(StandingAuthorization(
+                    "ina-routine-only", "routine_development",
+                    frozenset({"default"}), frozenset({"ina"}),
+                ),),
+            ),
+            popen=self.popen, workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: "11111111-1111-1111-1111-111111111111",
+        )
+
+        submitted = self.controller.submit_task(
+            "wrong-worker", "Routine work", "Change local code", "codex",
+            True, "default", "routine_development",
+        )
+
+        self.assertEqual(submitted["status"], "approval_required")
+        self.assertEqual(submitted["authorization"], {"mode": "explicit"})
+        self.popen.assert_not_called()
+
+    def test_consequence_class_is_bound_to_idempotency(self):
+        first = self.controller.submit_task(
+            "classified", "Implement", "Change code", "ina", True, None,
+            "routine_development",
+        )
+        self.assertEqual(first["status"], "approval_required")
+        with self.assertRaisesRegex(ValueError, "different task content"):
+            self.controller.submit_task(
+                "classified", "Implement", "Change code", "ina", True, None,
+                "security_change",
+            )
+
     def test_unknown_profile_fails_before_task_is_persisted(self):
         with self.assertRaisesRegex(ValueError, "unknown repository profile"):
             self.controller.submit_task("unknown-profile", "Inspect", "Read only", "ina", True, "missing")
@@ -288,6 +399,32 @@ class ControllerTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_config_loads_bounded_routine_standing_authorization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            codex = Path(directory) / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            config_path = Path(directory) / "omcp.json"
+            config_path.write_text(json.dumps({
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(Path(directory) / "state"),
+                "workers": {"ina": {"command": [str(codex)]}},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+                "standing_authorizations": [{
+                    "id": "routine", "consequence_class": "routine_development",
+                    "repository_profiles": ["default"], "workers": ["ina"],
+                }],
+            }))
+            os.chmod(config_path, 0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                config = Config.load(config_path)
+            self.assertEqual(config.standing_authorizations, (StandingAuthorization(
+                "routine", "routine_development", frozenset({"default"}),
+                frozenset({"ina"}),
+            ),))
+
     def test_config_requires_owner_only_file_and_rejects_cli_arguments(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "project"
@@ -328,6 +465,29 @@ class ConfigTests(unittest.TestCase):
         controller._authorize = Mock()
         with self.assertRaisesRegex(ValueError, "mandatory"):
             controller.submit_task("r", "title", "instructions", "worker", False)
+
+    def test_config_rejects_standing_authorization_for_protected_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            codex = Path(directory) / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            config_path = Path(directory) / "omcp.json"
+            config_path.write_text(json.dumps({
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(Path(directory) / "state"),
+                "workers": {"ina": {"command": [str(codex)]}},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+                "standing_authorizations": [{
+                    "id": "unsafe", "consequence_class": "security_change",
+                    "repository_profiles": ["default"], "workers": ["ina"],
+                }],
+            }))
+            os.chmod(config_path, 0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                with self.assertRaisesRegex(ValueError, "only grant routine_development"):
+                    Config.load(config_path)
 
     def test_submitter_cannot_self_approve(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -585,6 +745,11 @@ class ServerLifecycleTests(unittest.TestCase):
         schema = submit_task["inputSchema"]
         self.assertIn("repository_profile", schema["required"])
         self.assertEqual(schema["properties"]["repository_profile"]["type"], "string")
+        self.assertEqual(schema["properties"]["consequence_class"]["default"], "unclassified")
+        self.assertEqual(set(schema["properties"]["consequence_class"]["enum"]), {
+            "routine_development", "production_deployment", "destructive_operation",
+            "security_change", "unclassified",
+        })
 
     def test_multi_repository_health_and_submission_scope_through_mcp(self):
         archive = Path(self.temp.name) / "archive"

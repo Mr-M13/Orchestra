@@ -41,6 +41,15 @@ TOOLS = [
             "instructions": {"type": "string", "minLength": 1},
             "worker": {"type": "string", "minLength": 1},
             "repository_profile": {"type": "string", "minLength": 1, "maxLength": 64},
+            "consequence_class": {
+                "type": "string",
+                "enum": [
+                    "routine_development", "production_deployment", "destructive_operation",
+                    "security_change", "unclassified",
+                ],
+                "default": "unclassified",
+                "description": "Declared consequence class. Only owner-configured routine_development scopes may use standing authorization; all other classes require local approval.",
+            },
             "requires_approval": {"type": "boolean", "default": True, "const": True},
         }, ["request_id", "title", "instructions", "worker", "repository_profile"]),
     },
@@ -94,6 +103,7 @@ class MCPServer:
             "submit_task": lambda value: controller.submit_task(
                 value.get("request_id"), value.get("title"), value.get("instructions"),
                 value.get("worker"), value.get("requires_approval", True), value.get("repository_profile"),
+                value.get("consequence_class", "unclassified"),
             ),
             "task_status": lambda value: controller.task_status(value.get("task_id")),
             "list_tasks": lambda value: controller.list_tasks(value.get("status"), value.get("limit", 100)),
