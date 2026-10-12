@@ -16,6 +16,7 @@ private struct NotificationSpec: Codable {
     let body: String
     let portal_base_url: String
     let portal_token_path: String
+    let receipt_path: String
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
@@ -80,7 +81,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                         fputs("notification delivery failed\n", stderr)
                         self.terminate(4)
                     } else {
-                        self.terminate(0)
+                        do {
+                            try (spec.notification_id + "\n").write(
+                                toFile: spec.receipt_path, atomically: true, encoding: .utf8
+                            )
+                            try FileManager.default.setAttributes(
+                                [.posixPermissions: 0o600], ofItemAtPath: spec.receipt_path
+                            )
+                            self.terminate(0)
+                        } catch {
+                            fputs("notification receipt failed\n", stderr)
+                            self.terminate(6)
+                        }
                     }
                 }
             }

@@ -10,6 +10,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from omcp.approval_notifications import ApprovalNotificationAgent
 from omcp.approval_portal import PortalAuth, ensure_owner_secret, make_handler, owner_state_dir
@@ -71,6 +72,7 @@ class ApprovalNotificationAgentTests(unittest.TestCase):
         self.assertEqual(spec["task_id"], TASK_ID)
         self.assertEqual(spec["repository"], "Mr-M13/Orchestra")
         self.assertEqual(spec["worker"], "codex")
+        self.assertTrue(spec["receipt_path"].endswith(".delivered"))
 
         self.assertEqual(first.scan_once()["unchanged"], 1)
         restarted = self.agent()
@@ -118,6 +120,35 @@ class ApprovalNotificationAgentTests(unittest.TestCase):
         self.assertEqual(self.commands, [])
         ledger = json.loads((self.state / "approval-notifications.json").read_text())
         self.assertEqual(next(iter(ledger["approvals"].values()))["terminal_status"], "expired")
+
+    def test_native_helper_requires_matching_delivery_receipt(self):
+        executable = self.state / "Approval.app" / "Contents" / "MacOS" / "Notifier"
+        executable.parent.mkdir(parents=True)
+        executable.touch()
+        receipt = self.state / "delivered.receipt"
+        spec = self.state / "spec.json"
+        spec.write_text(json.dumps({
+            "notification_id": "notification-1", "receipt_path": str(receipt),
+        }))
+        agent = ApprovalNotificationAgent(
+            self.state, executable, "http://127.0.0.1:8767",
+            self.state / "approval-portal.token",
+        )
+
+        def deliver(command, **_kwargs):
+            self.assertEqual(command[:6], [
+                "/usr/bin/open", "-W", "-n", "-a", str(executable.resolve().parents[2]), "--args",
+            ])
+            receipt.write_text("notification-1\n")
+            return Mock(returncode=0)
+
+        with patch("omcp.approval_notifications.subprocess.run", side_effect=deliver):
+            agent._run_notifier([str(executable), "--notify", str(spec)])
+        self.assertFalse(receipt.exists())
+
+        with patch("omcp.approval_notifications.subprocess.run", return_value=Mock(returncode=0)):
+            with self.assertRaisesRegex(RuntimeError, "did not confirm delivery"):
+                agent._run_notifier([str(executable), "--notify", str(spec)])
 
 
 class PortalAuthTests(unittest.TestCase):

@@ -33,6 +33,7 @@ info_plist="$app/Contents/Info.plist"
 /usr/bin/plutil -insert CFBundleVersion -string '1' "$info_plist"
 /usr/bin/plutil -insert LSUIElement -bool true "$info_plist"
 /bin/chmod 600 "$info_plist"
+/usr/bin/codesign --force --deep --sign - "$app"
 
 portal_plist="$launch_agents/$portal_label.plist"
 /usr/bin/plutil -create xml1 "$portal_plist"
