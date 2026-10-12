@@ -53,7 +53,9 @@ The current global execution limit remains one. Repository profiles prepare task
 
 Standing authorization is an owner-configured execution grant, not a caller-supplied approval. A grant has a stable ID and is bound to the fixed principal process, one consequence class, named repository profiles, and named workers. The initial policy permits grants only for `routine_development`. Configuration loading rejects attempts to grant standing authority for production deployment, destructive operations, security changes, or unclassified work.
 
-The fixed workspace principal is responsible for accurate consequence classification. Deliberately labelling consequential work as routine is an authorization violation; OMCP does not pretend that keyword matching can reliably classify arbitrary natural-language instructions. Standing-authorized workers remain confined to isolated worktrees, cannot use interactive escalation, and do not receive merge or deployment authority. Completed changes still require independent review before integration.
+The caller's consequence label is not the security boundary. A matching grant selects a server-owned `routine_development_v1` capability profile. That profile denies reads outside the worktree except for Codex's minimal runtime paths, denies command network access, keeps Git metadata read-only, ignores user configuration and repository rules, and permits writes only below the grant's explicit `writable_paths`. Arbitrary instructions therefore cannot acquire deployment, push, merge, credential, security-configuration, or machine-wide destructive capabilities merely by claiming to be routine. OMCP does not use keyword classification as an authority check.
+
+`writable_paths` are owner-reviewed relative directory roots, not task-supplied paths. Absolute paths, parent traversal, `.git`, `.codex`, duplicate paths, and punctuation that could change the permission-profile structure are rejected at configuration load. A read-only routine grant uses an empty list. Keep security policy, deployment, infrastructure, credential, release, and production configuration outside every standing grant. If a repository cannot be divided into non-sensitive write roots, do not configure a standing grant for edits; use explicit approval instead. Git metadata remains read-only in routine mode, so the worker produces commit-ready changes but cannot create, merge, update, or push refs. Integration remains an independently reviewed action.
 
 When no exact standing grant matches, the task remains `approval_required`. The task record and audit event distinguish `standing` from `explicit` authorization and bind the consequence class into the idempotency digest.
 
@@ -100,7 +102,8 @@ Use Python 3.11 or newer and a current Codex CLI. Create a state directory outsi
       "id": "routine-development-v1",
       "consequence_class": "routine_development",
       "repository_profiles": ["orchestra"],
-      "workers": ["codex"]
+      "workers": ["codex"],
+      "writable_paths": ["docs", "tests"]
     }
   ]
 }
@@ -119,7 +122,28 @@ OMCP_AUTHENTICATED_CALLER=orchestra:dedicated-workspace
 ```
 The value must exactly match the configured principal identity. These environment values are not caller authentication; they only bind the process to the configured fixed principal after the operator has verified the access boundary. Do not rely on the control-plane runtime key or audit `authentication` label as proof of a ChatGPT user's identity. Keep the OMCP config and state paths distinct from the Mac Bridge config and state directory. Preserve the existing read-only Bridge tunnel until the dedicated app/workspace access boundary and live lifecycle tests below pass.
 
-Approvals are local human decisions only. The tunnel exposes no `resolve_approval` tool. A human on the Mac runs the interactive approval command above after reviewing the task.
+Approvals are local human decisions only. The tunnel exposes no `resolve_approval` tool. A human may use the interactive approval command above or the authenticated local approval interface described below.
+
+## Approval notifications and interface
+
+`macos/install-approval-services.sh` installs two small per-user LaunchAgents: a loopback-only approval portal and a notification projector. The projector observes the coordinator's durable state, records a separate owner-only delivery ledger, and submits one native notification per `(task_id, requested_at)` identifier. It records delivery intent before invoking the helper, retries failures with the same deterministic identifier, and removes delivered notifications when a request is approved, rejected, cancelled, removed, or expires. Reusing the identifier makes a crash between delivery and acknowledgement replace the existing notification rather than create a second one.
+
+The native notification names the task, repository, and worker. Approve, Reject, and View details all open the local portal; no notification action itself possesses approval authority. The portal shows the complete instructions, repository/ref, worker, consequence class, expiry, and a risk summary. A decision requires a reason, a valid short-lived signed session, and a CSRF token. The portal sends the decision through the existing owner-only Unix socket and capability file. It never calls an MCP approval tool because none exists.
+
+Install after deploying the exact reviewed source tree:
+
+```sh
+cd /path/to/deployed/Orchestra
+./macos/install-approval-services.sh
+```
+
+The installer compiles an accessory macOS app, binds the portal to `127.0.0.1:8767`, and starts both agents. macOS may ask the signed-in user to allow notifications the first time. Logs are owner-only under `~/Library/Application Support/Orchestra/omcp-service/approval/`. The approval token, state, specs, socket, and audit remain owner-only under the configured state directory. Notification payloads contain no task instructions or bearer token; the helper reads the token file only after the user acts.
+
+### Future PixelBox and Tailscale placement
+
+The portal already fails closed for non-loopback bindings. Remote mode requires all of: an explicit non-wildcard interface address, `--allow-remote`, a server certificate/key, a client CA, TLS 1.3, and a valid client certificate. Authentication, session validation, CSRF, task lookup, and authorization remain server-side. The local approval socket is never bound, proxied, or exposed to the network; only the portal process may use it.
+
+Remote mode is deliberately not installed or enabled by the Mac installer. Before moving this component to PixelBox, provision device-bound client identities, terminate TLS in the approval component itself or a comparably trusted local boundary, verify Tailscale ACLs as defense in depth, test revocation and expiry, and define how the remote component sends an authenticated decision to the Mac coordinator without forwarding the socket. Until that protocol is implemented and reviewed, PixelBox/iPhone approval is design-ready but unavailable.
 
 ## Verification
 
@@ -139,8 +163,9 @@ Then verify through the configured tunnel, not only by calling the Python classe
 4. Review the task and approve it from the local interactive Mac terminal, observe `running`, then retrieve its terminal result.
 5. Replay the original submission and confirm `idempotent_replay: true` with the same task ID.
 6. Submit another harmless task and cancel it; confirm a terminal `cancelled` state.
-7. In a non-production test configuration, add one exact `routine_development` standing grant. Confirm a matching task starts without entering `list_approvals`, while profile/worker mismatches and every protected consequence class remain `approval_required`.
+7. In a non-production test configuration, add one exact `routine_development` standing grant with narrow `writable_paths`. Confirm the effective permission profile denies home-directory reads, network, Git metadata changes, and writes outside those roots. Confirm a matching task starts without entering `list_approvals`, while profile/worker mismatches and every protected consequence class remain `approval_required`.
 8. Inspect the private audit log and worktree locally. Confirm the authorization mode, grant ID, and consequence class are recorded, while task instructions and worker output are absent.
+9. Submit a harmless explicit-approval task. Confirm exactly one macOS notification appears, clicking each action opens the matching full-detail page, reject one request, approve another, and retrieve its terminal result through OMCP. Restart the coordinator and both approval agents with a pending request and confirm it remains visible without duplicate delivery or execution.
 
 Do not disable the Bridge or Desktop Commander on the strength of unit tests alone. The final replacement gate requires the authenticated ChatGPT tunnel, target Mac, real Codex profile, Git worktree creation, completion/result retrieval and cancellation path to pass end to end.
 

@@ -170,7 +170,7 @@ class ControllerTests(unittest.TestCase):
                 Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
                 standing_authorizations=(StandingAuthorization(
                     "routine-local-development", "routine_development",
-                    frozenset({"default"}), frozenset({"ina"}),
+                    frozenset({"default"}), frozenset({"ina"}), ("src", "tests"),
                 ),),
             ),
             popen=self.popen, workspace_preparer=lambda *_: self.root,
@@ -188,6 +188,10 @@ class ControllerTests(unittest.TestCase):
             "mode": "standing", "authorization_id": "routine-local-development",
         })
         self.assertEqual(submitted["approval"]["status"], "standing_authorized")
+        self.assertEqual(submitted["execution_capabilities"], {
+            "profile": "routine_development_v1", "writable_paths": ["src", "tests"],
+            "network": False, "external_credentials": False, "git_metadata": "read_only",
+        })
         self.assertEqual(self.controller.list_approvals()["approvals"], [])
         self.popen.assert_called_once()
         audit = (self.state / "audit.jsonl").read_text()
@@ -209,7 +213,7 @@ class ControllerTests(unittest.TestCase):
                 Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
                 standing_authorizations=(StandingAuthorization(
                     "routine-local-development", "routine_development",
-                    frozenset({"default"}), frozenset({"ina"}),
+                    frozenset({"default"}), frozenset({"ina"}), (),
                 ),),
             ),
             popen=self.popen, workspace_preparer=lambda *_: self.root,
@@ -241,7 +245,7 @@ class ControllerTests(unittest.TestCase):
                 Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
                 standing_authorizations=(StandingAuthorization(
                     "ina-routine-only", "routine_development",
-                    frozenset({"default"}), frozenset({"ina"}),
+                    frozenset({"default"}), frozenset({"ina"}), (),
                 ),),
             ),
             popen=self.popen, workspace_preparer=lambda *_: self.root,
@@ -348,6 +352,21 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("Worker:       ina", review)
         self.assertIn("Decision:     APPROVE", review)
 
+    def test_local_details_and_history_include_terminal_approval_state(self):
+        submitted = self.controller.submit_task(
+            "request-1", "Inspect", "Read the implementation", "ina", True,
+        )
+        self.controller.resolve_approval(
+            submitted["task_id"], "reject", "Out of scope", "local:test-operator",
+        )
+        details = self.controller.local_task_details(submitted["task_id"])
+        self.assertEqual(details["instructions"], "Read the implementation")
+        self.assertEqual(details["status"], "rejected")
+        self.assertEqual(details["approval"]["status"], "rejected")
+        history = self.controller.local_approval_history()
+        self.assertEqual(history["approvals"][0]["task_id"], submitted["task_id"])
+        self.assertNotIn("instructions", history["approvals"][0])
+
     def test_pending_task_can_be_cancelled_with_reason(self):
         submitted = self.controller.submit_task(
             "request-1", "Implement feature", "Make the requested change", "ina", True,
@@ -415,6 +434,7 @@ class ConfigTests(unittest.TestCase):
                 "standing_authorizations": [{
                     "id": "routine", "consequence_class": "routine_development",
                     "repository_profiles": ["default"], "workers": ["ina"],
+                    "writable_paths": ["src", "tests"],
                 }],
             }))
             os.chmod(config_path, 0o600)
@@ -422,8 +442,33 @@ class ConfigTests(unittest.TestCase):
                 config = Config.load(config_path)
             self.assertEqual(config.standing_authorizations, (StandingAuthorization(
                 "routine", "routine_development", frozenset({"default"}),
-                frozenset({"ina"}),
+                frozenset({"ina"}), ("src", "tests"),
             ),))
+
+    def test_config_rejects_routine_write_access_to_control_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            codex = Path(directory) / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            config_path = Path(directory) / "omcp.json"
+            raw = {
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(Path(directory) / "state"),
+                "workers": {"ina": {"command": [str(codex)]}},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+                "standing_authorizations": [{
+                    "id": "routine", "consequence_class": "routine_development",
+                    "repository_profiles": ["default"], "workers": ["ina"],
+                    "writable_paths": [".git/hooks"],
+                }],
+            }
+            config_path.write_text(json.dumps(raw))
+            os.chmod(config_path, 0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                with self.assertRaisesRegex(ValueError, "safe relative paths"):
+                    Config.load(config_path)
 
     def test_config_requires_owner_only_file_and_rejects_cli_arguments(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -590,6 +635,39 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(command[command.index("--ask-for-approval") + 1], "never")
             self.assertEqual(command[command.index("--sandbox") + 1], "workspace-write")
             self.assertEqual(command[-1], "-")
+
+    def test_standing_runner_uses_restricted_permission_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt = root / "prompt"
+            prompt.write_text("task")
+            spec = root / "spec.json"
+            spec.write_text(json.dumps({
+                "command": ["codex"], "workspace": str(root),
+                "prompt_path": str(prompt), "log_path": str(root / "log"),
+                "result_path": str(root / "result"),
+                "completion_path": str(root / "completion"), "codex_home": None,
+                "execution_capabilities": {
+                    "profile": "routine_development_v1", "writable_paths": ["src"],
+                    "network": False, "external_credentials": False,
+                    "git_metadata": "read_only",
+                },
+            }))
+            with patch("omcp.runner.subprocess.run", return_value=Mock(returncode=0)) as execute:
+                self.assertEqual(run_worker(spec), 0)
+            command = execute.call_args.args[0]
+            self.assertNotIn("--sandbox", command)
+            self.assertIn("--ignore-user-config", command)
+            self.assertIn("--ignore-rules", command)
+            self.assertIn("--ephemeral", command)
+            self.assertIn("permissions.orchestra-routine.network.enabled=false", command)
+            self.assertIn(
+                'permissions.orchestra-routine.filesystem.:workspace_roots={"."="read",".orchestra-tmp"="write","src"="write"}',
+                command,
+            )
+            self.assertIn('".orchestra-tmp"="write"', " ".join(command))
+            self.assertFalse((root / ".orchestra-tmp").exists())
+            self.assertEqual(execute.call_args.kwargs["env"]["TMPDIR"], str(root / ".orchestra-tmp"))
     def test_runner_rejects_configured_cli_flags_before_execution(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -691,6 +769,19 @@ class LocalApprovalChannelTests(unittest.TestCase):
         })
         self.assertEqual(result["status"], "rejected")
         self.popen.assert_not_called()
+
+    def test_details_and_history_use_active_coordinator(self):
+        submitted = self.controller.submit_task(
+            "request-2", "Review details", "Complete instructions", "ina", True,
+        )
+        details = approval_request(self.config.state_dir, {
+            "action": "details", "task_id": submitted["task_id"],
+        })
+        self.assertEqual(details["instructions"], "Complete instructions")
+        history = approval_request(self.config.state_dir, {
+            "action": "history", "limit": 10,
+        })
+        self.assertEqual(history["approvals"][0]["task_id"], submitted["task_id"])
 
     def test_channel_files_are_owner_only_and_token_is_required(self):
         self.assertEqual(self.channel.socket_path.stat().st_mode & 0o777, 0o600)

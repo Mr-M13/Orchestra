@@ -101,6 +101,7 @@ class StandingAuthorization:
     consequence_class: str
     repository_profiles: frozenset[str]
     workers: frozenset[str]
+    writable_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -224,6 +225,7 @@ class Config:
                 raise ValueError("standing authorization may only grant routine_development")
             profile_ids = authorization_raw.get("repository_profiles")
             worker_names = authorization_raw.get("workers")
+            writable_paths = authorization_raw.get("writable_paths")
             if (not isinstance(profile_ids, list) or not profile_ids
                     or not all(isinstance(value, str) for value in profile_ids)):
                 raise ValueError("standing authorization repository_profiles must be a non-empty list")
@@ -234,9 +236,27 @@ class Config:
                 raise ValueError("standing authorization names an unknown repository profile")
             if set(worker_names) - set(workers):
                 raise ValueError("standing authorization names an unknown worker")
+            if not isinstance(writable_paths, list) or not all(
+                isinstance(value, str) and value and value == value.strip()
+                for value in writable_paths
+            ):
+                raise ValueError("standing authorization writable_paths must be a list")
+            normalized_paths: list[str] = []
+            for value in writable_paths:
+                candidate = Path(value)
+                if (candidate.is_absolute() or ".." in candidate.parts
+                        or value in {".", ".git", ".codex"}
+                        or candidate.parts[0] in {".git", ".codex"}
+                        or not all(re.fullmatch(r"[A-Za-z0-9_-]+", part)
+                                   for part in candidate.parts)):
+                    raise ValueError("standing authorization writable_paths must be safe relative paths")
+                normalized = candidate.as_posix().rstrip("/")
+                if normalized in normalized_paths:
+                    raise ValueError("standing authorization writable_paths contains duplicates")
+                normalized_paths.append(normalized)
             standing_authorizations.append(StandingAuthorization(
                 authorization_id, consequence_class,
-                frozenset(profile_ids), frozenset(worker_names),
+                frozenset(profile_ids), frozenset(worker_names), tuple(normalized_paths),
             ))
         return cls(
             repository, root, state, base_ref, workers, principal,
@@ -359,6 +379,7 @@ class TaskController:
             "started_at", "finished_at", "exit_code", "branch", "approval",
             "cancel_reason", "failure", "repository_profile", "repository", "base_ref",
             "consequence_class", "authorization",
+            "execution_capabilities",
         )
         return {key: task[key] for key in keys if key in task}
 
@@ -421,6 +442,13 @@ class TaskController:
         if standing_authorization:
             task["authorization"] = {
                 "mode": "standing", "authorization_id": standing_authorization.authorization_id,
+            }
+            task["execution_capabilities"] = {
+                "profile": "routine_development_v1",
+                "writable_paths": list(standing_authorization.writable_paths),
+                "network": False,
+                "external_credentials": False,
+                "git_metadata": "read_only",
             }
             task["approval"] = {
                 "status": "standing_authorized", "decided_at": now,
@@ -598,6 +626,37 @@ class TaskController:
             "expires_at": task["approval"]["expires_at"],
         }
 
+    def local_task_details(self, task_id: str) -> dict[str, Any]:
+        """Return complete task context only through the owner-only local channel."""
+        task = self._task(task_id)
+        self._expire_approval(task)
+        profile = self.config.profile(task.get("repository_profile"))
+        self._audit("approval.details", task_id, "allowed", {})
+        return {
+            **self._public(task),
+            "submitted_by": task.get("submitted_by"),
+            "repository_profile": task.get("repository_profile", profile.profile_id),
+            "repository": task.get("repository", profile.repository),
+            "base_ref": task.get("base_ref", profile.base_ref),
+            "consequence_class": task.get("consequence_class", "unclassified"),
+            "instructions": task["instructions"],
+        }
+
+    def local_approval_history(self, limit: int = 100) -> dict[str, Any]:
+        """Return bounded approval history only through the owner-only local channel."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 500:
+            raise ValueError("limit must be an integer from 1 to 500")
+        self._expire_pending_approvals()
+        tasks = sorted(
+            self.state["tasks"].values(), key=lambda item: item["created_at"], reverse=True,
+        )
+        approvals = [{
+            **self._public(task),
+            "submitted_by": task.get("submitted_by"),
+        } for task in tasks[:limit] if task.get("approval")]
+        self._audit("approval.history", None, "allowed", {"count": len(approvals)})
+        return {"approvals": approvals}
+
     def _expire_approval(self, task: dict[str, Any]) -> bool:
         if task.get("status") != "approval_required":
             return False
@@ -700,6 +759,7 @@ class TaskController:
                 "workspace": str(workspace), "prompt_path": str(prompt_path),
                 "log_path": str(log_path), "result_path": str(result_path),
                 "completion_path": str(completion_path),
+                "execution_capabilities": task.get("execution_capabilities"),
             })
             self._audit("task.start", task_id, "allowed", {"worker": task["worker"], "branch": branch})
             proc = self.popen(

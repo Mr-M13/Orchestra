@@ -123,6 +123,10 @@ class LocalApprovalServer:
         with self.controller_lock:
             if action == "review":
                 return self.controller.local_approval_details(request.get("task_id"))
+            if action == "details":
+                return self.controller.local_task_details(request.get("task_id"))
+            if action == "history":
+                return self.controller.local_approval_history(request.get("limit", 100))
             if action == "resolve":
                 return self.controller.resolve_approval(
                     request.get("task_id"), request.get("decision"),
