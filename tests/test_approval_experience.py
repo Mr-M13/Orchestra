@@ -12,7 +12,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 from omcp.approval_notifications import ApprovalNotificationAgent
-from omcp.approval_portal import PortalAuth, ensure_owner_secret, make_handler
+from omcp.approval_portal import PortalAuth, ensure_owner_secret, make_handler, owner_state_dir
 
 
 TASK_ID = "11111111-1111-1111-1111-111111111111"
@@ -138,6 +138,15 @@ class PortalAuthTests(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_portal_requires_owner_only_state_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            self.assertEqual(owner_state_dir(state), state.resolve())
+            state.chmod(0o755)
+            with self.assertRaisesRegex(PermissionError, "owner-only"):
+                owner_state_dir(state)
 
 
 class ApprovalPortalHTTPTests(unittest.TestCase):

@@ -18,11 +18,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
-from omcp.controller import Config
 from omcp.local_control import approval_request
 
 
 SESSION_TTL_SECONDS = 15 * 60
+
+
+def owner_state_dir(path: Path) -> Path:
+    resolved = path.expanduser().resolve(strict=True)
+    if not resolved.is_dir() or resolved.stat().st_mode & 0o077:
+        raise PermissionError("approval state directory must be owner-only")
+    return resolved
 
 
 def ensure_owner_secret(path: Path) -> str:
@@ -262,7 +268,7 @@ def make_handler(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Serve the authenticated OMCP approval interface")
-    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--listen-host", default="127.0.0.1")
     parser.add_argument("--listen-port", type=int, default=8767)
     parser.add_argument("--token-path", type=Path)
@@ -271,8 +277,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tls-key", type=Path)
     parser.add_argument("--client-ca", type=Path)
     args = parser.parse_args(argv)
-    config = Config.load(args.config)
-    token_path = args.token_path or (config.state_dir / "approval-portal.token")
+    state_dir = owner_state_dir(args.state_dir)
+    token_path = args.token_path or (state_dir / "approval-portal.token")
     token = ensure_owner_secret(token_path)
     address = ipaddress.ip_address(args.listen_host)
     is_loopback = address.is_loopback
@@ -283,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
             raise PermissionError("remote approval binding requires TLS and a client CA")
         if args.listen_host in {"0.0.0.0", "::"}:
             raise PermissionError("remote approval must bind one explicit interface address")
-    handler = make_handler(config.state_dir, token, PortalAuth(token), secure_cookie=not is_loopback)
+    handler = make_handler(state_dir, token, PortalAuth(token), secure_cookie=not is_loopback)
     server = ThreadingHTTPServer((args.listen_host, args.listen_port), handler)
     if not is_loopback:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
