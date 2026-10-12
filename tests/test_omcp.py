@@ -106,6 +106,32 @@ class ControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different task content"):
             self.controller.submit_task("profile-request", "Inspect", "Read only", "ina", True, "orchestra")
 
+    def test_multi_repository_requires_explicit_profile_before_persistence(self):
+        archive = Path(self.temp.name) / "archive"
+        archive.mkdir()
+        self.controller.close()
+        self.controller = TaskController(
+            Config("owner/repo", self.root, self.state, "origin/main",
+                   {"ina": Worker("ina", ("codex",))},
+                   Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+                   repository_profiles={
+                       "orchestra": RepositoryProfile("orchestra", "owner/repo", self.root, "origin/main"),
+                       "archive": RepositoryProfile("archive", "owner/archive", archive, "origin/main"),
+                   },
+                   default_profile="orchestra"),
+            popen=self.popen, workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: "11111111-1111-1111-1111-111111111111",
+        )
+        with self.assertRaisesRegex(ValueError, "repository_profile is required"):
+            self.controller.submit_task("missing-profile", "Inspect", "Read only", "ina")
+        self.assertEqual(self.controller.state["tasks"], {})
+        self.popen.assert_not_called()
+        submitted = self.controller.submit_task(
+            "explicit-profile", "Inspect", "Read only", "ina", True, "archive",
+        )
+        self.assertEqual(submitted["repository_profile"], "archive")
+        self.assertEqual(submitted["repository"], "owner/archive")
+
     def test_unknown_profile_fails_before_task_is_persisted(self):
         with self.assertRaisesRegex(ValueError, "unknown repository profile"):
             self.controller.submit_task("unknown-profile", "Inspect", "Read only", "ina", True, "missing")
