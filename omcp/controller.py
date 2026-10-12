@@ -201,10 +201,6 @@ class Config:
             if profile_id not in (None, "default"):
                 raise ValueError("unknown repository profile")
             return RepositoryProfile("default", self.repository, self.project_root, self.base_ref)
-        # Multiple configured targets must never silently fall back to a different repository.
-        # Single-profile deployments retain the legacy implicit-default behaviour.
-        if profile_id is None and len(self.repository_profiles) > 1:
-            raise ValueError("repository_profile is required when multiple repositories are configured")
         selected = self.default_profile if profile_id is None else profile_id
         if not isinstance(selected, str) or selected not in self.repository_profiles:
             raise ValueError("unknown repository profile")
@@ -320,6 +316,12 @@ class TaskController:
             raise ValueError("instructions exceed configured task size")
         if not isinstance(worker, str) or worker not in self.config.workers:
             raise ValueError("unknown worker")
+        # Task submission must bind an explicit target when more than one repository
+        # is configured. Global/read-only callers may still resolve the configured
+        # default profile for service metadata.
+        if (repository_profile is None and self.config.repository_profiles is not None
+                and len(self.config.repository_profiles) > 1):
+            raise ValueError("repository_profile is required when multiple repositories are configured")
         profile = self.config.profile(repository_profile)
         if requires_approval is not True:
             raise ValueError("human approval is mandatory for every task")
