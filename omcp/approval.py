@@ -22,6 +22,7 @@ def format_review(details: dict[str, object], decision: str) -> str:
         f"Profile:      {details['repository_profile']}",
         f"Repository:   {details['repository']}",
         f"Base ref:     {details['base_ref']}",
+        f"Consequence:  {details['consequence_class']}",
         f"Requested:    {details['requested_at']}",
         f"Expires:      {details['expires_at']}",
         f"Decision:     {decision.upper()}",

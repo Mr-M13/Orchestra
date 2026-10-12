@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +45,40 @@ def atomic_json(path: Path, value: dict[str, Any]) -> None:
         os.close(directory)
 
 
+def routine_command(executable: str, workspace: Path, result_path: Path,
+                    writable_paths: list[str]) -> list[str]:
+    """Build a fail-closed Codex permission profile for standing-authorized work."""
+    if not all(
+        isinstance(value, str) and value
+        and all(part and part.replace("_", "").replace("-", "").isalnum()
+                for part in Path(value).parts)
+        for value in writable_paths
+    ):
+        raise ValueError("invalid routine writable paths")
+    workspace_rules = ','.join([
+        '"."="read"',
+        '".orchestra-tmp"="write"',
+        *(f'"{value}"="write"' for value in writable_paths),
+    ])
+    command = [
+        executable, "--ask-for-approval", "never", "exec",
+        "--ignore-user-config", "--ignore-rules", "--ephemeral",
+        "--config", 'default_permissions="orchestra-routine"',
+        "--config", 'permissions.orchestra-routine.filesystem.:root="deny"',
+        "--config", 'permissions.orchestra-routine.filesystem.:minimal="read"',
+        "--config", 'permissions.orchestra-routine.filesystem.:tmpdir="deny"',
+        "--config", 'permissions.orchestra-routine.filesystem.:slash_tmp="deny"',
+        "--config", (
+            "permissions.orchestra-routine.filesystem.:workspace_roots={"
+            + workspace_rules + "}"
+        ),
+        "--config", "permissions.orchestra-routine.network.enabled=false",
+    ]
+    return command + [
+        "--cd", str(workspace), "--output-last-message", str(result_path), "-",
+    ]
+
+
 def run(spec_path: Path) -> int:
     spec = json.loads(spec_path.read_text())
     prompt_path = Path(spec["prompt_path"])
@@ -55,10 +90,27 @@ def run(spec_path: Path) -> int:
     if not isinstance(configured, list) or len(configured) != 1:
         raise ValueError("runner spec must contain exactly one Codex executable")
     executable = canonical_codex_executable(configured[0])
-    command = [executable, "--ask-for-approval", "never", "exec",
-               "--sandbox", "workspace-write", "--cd", str(workspace),
-               "--output-last-message", str(result_path), "-"]
+    capabilities = spec.get("execution_capabilities")
+    routine_tmp: Path | None = None
+    if capabilities is None:
+        command = [executable, "--ask-for-approval", "never", "exec",
+                   "--sandbox", "workspace-write", "--cd", str(workspace),
+                   "--output-last-message", str(result_path), "-"]
+    else:
+        if (not isinstance(capabilities, dict)
+                or capabilities.get("profile") != "routine_development_v1"
+                or capabilities.get("network") is not False
+                or capabilities.get("external_credentials") is not False
+                or capabilities.get("git_metadata") != "read_only"
+                or not isinstance(capabilities.get("writable_paths"), list)):
+            raise ValueError("invalid routine execution capabilities")
+        writable_paths = capabilities["writable_paths"]
+        command = routine_command(executable, workspace, result_path, writable_paths)
     environment = worker_environment(spec.get("codex_home"))
+    if capabilities is not None:
+        routine_tmp = workspace / ".orchestra-tmp"
+        routine_tmp.mkdir(mode=0o700)
+        environment["TMPDIR"] = str(routine_tmp)
     exit_code = 125
     error_type = None
     try:
@@ -71,6 +123,11 @@ def run(spec_path: Path) -> int:
         error_type = type(exc).__name__
         raise
     finally:
+        if routine_tmp is not None:
+            shutil.rmtree(routine_tmp, ignore_errors=True)
+            if routine_tmp.exists():
+                exit_code = 125
+                error_type = "RoutineTemporaryDirectoryCleanupError"
         atomic_json(completion_path, {
             "exit_code": exit_code,
             "finished_at": utc_now(),
