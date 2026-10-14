@@ -1,5 +1,6 @@
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -288,6 +289,17 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(result["result"], "verified result")
         self.assertFalse(result["truncated"])
         self.assertTrue(self.controller.worker_availability()["workers"][0]["available"])
+
+    def test_cancelled_reaped_runner_without_completion_is_terminal(self):
+        submitted = self.submit()
+        task_id = submitted["task_id"]
+        self.controller.state["tasks"][task_id]["status"] = "cancel_requested"
+        with patch("omcp.controller.os.waitpid", return_value=(FakeProcess.pid, signal.SIGTERM)):
+            self.controller.reconcile()
+        reconciled = self.controller.state["tasks"][task_id]
+        self.assertEqual(reconciled["status"], "cancelled")
+        self.assertEqual(reconciled["exit_code"], -signal.SIGTERM)
+        self.assertIsNotNone(reconciled["finished_at"])
 
     def test_approval_gate_can_reject_without_launching(self):
         submitted = self.controller.submit_task(
@@ -635,6 +647,29 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(command[command.index("--ask-for-approval") + 1], "never")
             self.assertEqual(command[command.index("--sandbox") + 1], "workspace-write")
             self.assertEqual(command[-1], "-")
+
+    def test_runner_writes_completion_record_when_terminated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            completion = root / "completion.json"
+            prompt = root / "prompt"
+            prompt.write_text("stop")
+            spec = root / "spec.json"
+            spec.write_text(json.dumps({
+                "command": ["codex"], "workspace": str(root),
+                "prompt_path": str(prompt), "log_path": str(root / "log"),
+                "result_path": str(root / "result"), "completion_path": str(completion),
+            }))
+
+            def terminate_runner(*_args, **_kwargs):
+                os.kill(os.getpid(), signal.SIGTERM)
+
+            with patch("omcp.runner.canonical_codex_executable", return_value="/codex"), \
+                    patch("omcp.runner.subprocess.run", side_effect=terminate_runner):
+                self.assertEqual(run_worker(spec), 128 + signal.SIGTERM)
+            record = json.loads(completion.read_text())
+            self.assertEqual(record["exit_code"], 128 + signal.SIGTERM)
+            self.assertEqual(record["runner_error"], "RunnerTerminated")
 
     def test_standing_runner_uses_restricted_permission_profile(self):
         with tempfile.TemporaryDirectory() as directory:
