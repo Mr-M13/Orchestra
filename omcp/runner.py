@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -10,6 +11,14 @@ from pathlib import Path
 from typing import Any
 
 from omcp.controller import canonical_codex_executable
+
+
+class RunnerTerminated(BaseException):
+    """Translate process termination into a durable completion record."""
+
+    def __init__(self, signum: int):
+        super().__init__(signum)
+        self.signum = signum
 
 
 def utc_now() -> str:
@@ -113,16 +122,26 @@ def run(spec_path: Path) -> int:
         environment["TMPDIR"] = str(routine_tmp)
     exit_code = 125
     error_type = None
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def terminate(signum: int, _frame: Any) -> None:
+        raise RunnerTerminated(signum)
+
+    signal.signal(signal.SIGTERM, terminate)
     try:
         with prompt_path.open("rb") as prompt, log_path.open("ab") as log:
             exit_code = subprocess.run(
                 command, cwd=workspace, env=environment, stdin=prompt,
                 stdout=log, stderr=subprocess.STDOUT, check=False,
             ).returncode
+    except RunnerTerminated as exc:
+        exit_code = 128 + exc.signum
+        error_type = type(exc).__name__
     except BaseException as exc:
         error_type = type(exc).__name__
         raise
     finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
         if routine_tmp is not None:
             shutil.rmtree(routine_tmp, ignore_errors=True)
             if routine_tmp.exists():

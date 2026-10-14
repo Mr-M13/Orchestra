@@ -716,6 +716,21 @@ class TaskController:
                              "failure": {"type": "startup_interrupted"}})
                 changed = True
             elif pid:
+                wait_status = self._reap_child(pid)
+                if wait_status is not None:
+                    cancelled = task["status"] == "cancel_requested"
+                    task.update({
+                        "status": "cancelled" if cancelled else "interrupted",
+                        "exit_code": os.waitstatus_to_exitcode(wait_status),
+                        "finished_at": utc_now(),
+                    })
+                    if not cancelled:
+                        task["failure"] = {"type": "runner_exited_without_completion"}
+                    changed = True
+                    self._audit("task.reconcile", task["task_id"], "allowed", {
+                        "status": task["status"], "reason": "runner_reaped_without_completion",
+                    })
+                    continue
                 try:
                     os.kill(int(pid), 0)
                 except ProcessLookupError:
@@ -788,13 +803,14 @@ class TaskController:
             self._audit("task.start", task_id, "failed", {"error_type": type(exc).__name__})
 
     @staticmethod
-    def _reap_child(pid: int | None) -> None:
+    def _reap_child(pid: int | None) -> int | None:
         if not pid:
-            return
+            return None
         try:
-            os.waitpid(int(pid), os.WNOHANG)
+            waited_pid, wait_status = os.waitpid(int(pid), os.WNOHANG)
         except ChildProcessError:
-            pass
+            return None
+        return wait_status if waited_pid == int(pid) else None
 
     def _git(self, directory: Path, *args: str, allow_failure: bool = False) -> tuple[int, str]:
         result = subprocess.run(
