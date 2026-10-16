@@ -12,7 +12,7 @@ from omcp.local_control import approval_request
 
 
 def format_review(details: dict[str, object], decision: str) -> str:
-    return "\n".join([
+    lines = [
         "OMCP LOCAL APPROVAL REVIEW",
         "==========================",
         f"Task ID:      {details['task_id']}",
@@ -27,9 +27,15 @@ def format_review(details: dict[str, object], decision: str) -> str:
         f"Expires:      {details['expires_at']}",
         f"Decision:     {decision.upper()}",
         f"Title:        {details['title']}",
-        "Instructions:",
-        str(details["instructions"]),
-    ])
+    ]
+    if details.get("kind") == "host_operation":
+        lines.extend([
+            f"Operation:    {details.get('operation_id')}",
+            f"Harness SHA:  {details.get('harness_commit')}",
+            f"Target SHA:   {details.get('target_commit')}",
+        ])
+    lines.extend(["Instructions:", str(details["instructions"])])
+    return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
