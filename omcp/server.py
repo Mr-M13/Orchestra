@@ -48,9 +48,12 @@ TOOLS = [
                     "security_change", "unclassified",
                 ],
                 "default": "unclassified",
-                "description": "Declared consequence class. Only owner-configured routine_development scopes may use standing authorization; all other classes require local approval.",
+                "description": "Declared consequence class. In required mode only owner-configured routine_development scopes may use standing authorization; disabled mode automatically authorizes all valid classes.",
             },
-            "requires_approval": {"type": "boolean", "default": True, "const": True},
+            "requires_approval": {
+                "type": "boolean", "default": True,
+                "description": "Compatibility marker. Owner-only server configuration decides whether task approval is required.",
+            },
         }, ["request_id", "title", "instructions", "worker", "repository_profile"]),
     },
     {
