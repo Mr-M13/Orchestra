@@ -812,6 +812,10 @@ class HostOperationRunnerTests(unittest.TestCase):
             root = Path(directory)
             state = root / "state"
             state.mkdir()
+            approved = root / "workspace"
+            approved.mkdir()
+            mount_stage = state / "staged-mounts"
+            mount_stage.mkdir()
             candidate = state / "candidate"
             candidate.mkdir()
             environment = {
@@ -822,6 +826,8 @@ class HostOperationRunnerTests(unittest.TestCase):
                 "OMCP_DOCKER_OVERRIDE": str(root / "override.yaml"),
                 "OMCP_DOCKER_RUNTIME_STATE": str(state),
                 "OMCP_DOCKER_NETWORK": "omcp-dzn-test_runtime",
+                "OMCP_DOCKER_APPROVED_SOURCE": str(approved),
+                "OMCP_DOCKER_MOUNT_STAGE": str(mount_stage),
             }
             compose = [
                 "compose", "--project-directory", environment["OMCP_DOCKER_PROJECT_DIR"],
@@ -844,6 +850,52 @@ class HostOperationRunnerTests(unittest.TestCase):
                     "run", "--rm", "--pull=never", "-v", "/:/host",
                     "--entrypoint", "php", "wordpress:cli-php8.3", "-v",
                 ], environment)
+
+    def test_docker_gate_stages_only_approved_read_only_external_mounts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir()
+            stage = state / "staged-mounts"
+            stage.mkdir()
+            approved = root / "workspace"
+            source = approved / "platform"
+            fixture = source / "tests/schema30.php"
+            fixture.parent.mkdir(parents=True)
+            fixture.write_text("<?php echo 'schema30';\n")
+            schema30_source = state / "schema30-source"
+            schema30_source.symlink_to(source, target_is_directory=True)
+            outside = root / "outside.php"
+            outside.write_text("secret\n")
+            environment = {
+                "OMCP_DOCKER_REAL": "/bin/echo",
+                "OMCP_DOCKER_PROJECT_DIR": str(approved / "platform/runtime"),
+                "OMCP_DOCKER_PROJECT": "omcp-dzn-test",
+                "OMCP_DOCKER_COMPOSE_FILE": str(approved / "platform/runtime/compose.yaml"),
+                "OMCP_DOCKER_OVERRIDE": str(root / "override.yaml"),
+                "OMCP_DOCKER_RUNTIME_STATE": str(state),
+                "OMCP_DOCKER_NETWORK": "omcp-dzn-test_runtime",
+                "OMCP_DOCKER_APPROVED_SOURCE": str(approved),
+                "OMCP_DOCKER_MOUNT_STAGE": str(stage),
+            }
+            gated = gated_command([
+                "run", "--rm", "--pull=never", "-v", f"{schema30_source}:/plugin:ro",
+                "--entrypoint", "php", "wordpress:cli-php8.3", "/plugin/tests/schema30.php",
+            ], environment)
+            staged_volume = gated[gated.index("-v") + 1]
+            staged_source = Path(staged_volume.split(":", 1)[0])
+            self.assertTrue(staged_source.is_relative_to(stage.resolve()))
+            self.assertEqual(
+                (staged_source / "tests/schema30.php").read_text(), fixture.read_text(),
+            )
+            self.assertEqual(staged_volume.split(":", 1)[1], "/plugin:ro")
+
+            for denied in (f"{schema30_source}:/plugin", f"{outside}:/fixture.php:ro"):
+                with self.subTest(denied=denied), self.assertRaises(PermissionError):
+                    gated_command([
+                        "run", "--rm", "--pull=never", "-v", denied,
+                        "--entrypoint", "php", "wordpress:cli-php8.3", "/fixture.php",
+                    ], environment)
 
     def test_host_runner_uses_pinned_scripts_minimal_environment_and_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -882,6 +934,12 @@ class HostOperationRunnerTests(unittest.TestCase):
             self.assertEqual(first_environment["HOME"], str(task_dir.resolve() / "home"))
             self.assertEqual(first_environment["DZN_TARGET_REF"], "1" * 40)
             self.assertEqual(first_environment["DZN_WP_PORT"], "23456")
+            self.assertEqual(first_environment["OMCP_DOCKER_APPROVED_SOURCE"], str(workspace.resolve()))
+            self.assertEqual(
+                first_environment["OMCP_DOCKER_MOUNT_STAGE"],
+                str(task_dir.resolve() / "runtime-state/staged-mounts"),
+            )
+            self.assertFalse((task_dir / "runtime-state/staged-mounts").exists())
             self.assertEqual(
                 (task_dir / "compose.internal.yaml").read_text(),
                 "networks:\n  runtime:\n    internal: true\n",

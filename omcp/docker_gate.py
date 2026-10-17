@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -23,6 +26,7 @@ def _required_environment() -> dict[str, str]:
         "OMCP_DOCKER_REAL", "OMCP_DOCKER_PROJECT_DIR", "OMCP_DOCKER_PROJECT",
         "OMCP_DOCKER_COMPOSE_FILE", "OMCP_DOCKER_OVERRIDE",
         "OMCP_DOCKER_RUNTIME_STATE", "OMCP_DOCKER_NETWORK",
+        "OMCP_DOCKER_APPROVED_SOURCE", "OMCP_DOCKER_MOUNT_STAGE",
     )
     values = {name: os.environ.get(name, "") for name in names}
     if not all(values.values()):
@@ -33,6 +37,45 @@ def _required_environment() -> dict[str, str]:
 def _inside(path: str, root: Path) -> bool:
     candidate = Path(path).resolve(strict=False)
     return candidate != root and candidate.is_relative_to(root)
+
+
+def _stage_read_only_mount(
+    volume: str, environment: dict[str, str], runtime_state: Path,
+) -> str:
+    """Copy an approved source mount into private state and return its bind spec."""
+    parts = volume.split(":", 2)
+    if len(parts) != 3 or parts[2] != "ro" or not parts[0] or not parts[1]:
+        raise PermissionError("external Docker mounts must be explicit and read-only")
+    source = Path(parts[0]).resolve(strict=True)
+    approved_source = Path(environment["OMCP_DOCKER_APPROVED_SOURCE"]).resolve(strict=True)
+    if source != approved_source and not source.is_relative_to(approved_source):
+        raise PermissionError("Docker mount source is outside the approved harness")
+    if not source.is_file() and not source.is_dir():
+        raise PermissionError("Docker mount source must be a regular file or directory")
+
+    stage_root = Path(environment["OMCP_DOCKER_MOUNT_STAGE"])
+    if stage_root.is_symlink():
+        raise PermissionError("Docker mount staging directory must not be a symlink")
+    stage_root = stage_root.resolve(strict=True)
+    if not _inside(str(stage_root), runtime_state):
+        raise PermissionError("Docker mount staging must remain inside operation runtime state")
+    digest = hashlib.sha256(os.fsencode(str(source))).hexdigest()
+    staged = stage_root / digest
+    if staged.exists() or staged.is_symlink():
+        if staged.is_symlink() or not _inside(str(staged), stage_root):
+            raise PermissionError("staged Docker mount escaped its private directory")
+    else:
+        with tempfile.TemporaryDirectory(dir=stage_root) as temporary:
+            candidate = Path(temporary) / "source"
+            if source.is_dir():
+                shutil.copytree(source, candidate, symlinks=True)
+            else:
+                shutil.copy2(source, candidate, follow_symlinks=False)
+            try:
+                os.replace(candidate, staged)
+            except FileExistsError:
+                pass
+    return f"{staged}:{parts[1]}:ro"
 
 
 def gated_command(arguments: list[str], environment: dict[str, str]) -> list[str]:
@@ -81,7 +124,9 @@ def gated_command(arguments: list[str], environment: dict[str, str]) -> list[str
         if value in {"-v", "--volume"}:
             source = option_value.split(":", 1)[0]
             if not _inside(source, runtime_state):
-                raise PermissionError("Docker mounts must remain inside operation runtime state")
+                option_value = _stage_read_only_mount(
+                    option_value, environment, runtime_state,
+                )
         elif value == "--network":
             if option_value != environment["OMCP_DOCKER_NETWORK"]:
                 raise PermissionError("Docker run network is outside the operation network")

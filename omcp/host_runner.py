@@ -84,9 +84,11 @@ def run(spec_path: Path) -> int:
         raise RuntimeError("Docker CLI is unavailable")
     real_docker = str(Path(real_docker).resolve(strict=True))
     runtime_state = task_dir / "runtime-state"
+    mount_stage = runtime_state / "staged-mounts"
     gate_bin = task_dir / "docker-gate-bin"
     gate_bin.mkdir(mode=0o700)
     runtime_state.mkdir(mode=0o700)
+    mount_stage.mkdir(mode=0o700)
     _write_docker_wrapper(gate_bin / "docker")
     override = task_dir / "compose.internal.yaml"
     override.write_text("networks:\n  runtime:\n    internal: true\n")
@@ -113,6 +115,8 @@ def run(spec_path: Path) -> int:
         "OMCP_DOCKER_OVERRIDE": str(override),
         "OMCP_DOCKER_RUNTIME_STATE": str(runtime_state),
         "OMCP_DOCKER_NETWORK": project + "_runtime",
+        "OMCP_DOCKER_APPROVED_SOURCE": str(workspace),
+        "OMCP_DOCKER_MOUNT_STAGE": str(mount_stage),
     })
     original_home = os.environ.get("HOME")
     socket_candidates = [Path("/var/run/docker.sock")]
@@ -142,6 +146,12 @@ def run(spec_path: Path) -> int:
                 exit_code = 124
                 error_type = "HostOperationTimeout"
             finally:
+                mount_cleanup_failed = False
+                try:
+                    shutil.rmtree(mount_stage)
+                except OSError as exc:
+                    mount_cleanup_failed = True
+                    print(f"failed to remove Docker mount staging: {exc}", file=log)
                 try:
                     cleanup_code = subprocess.run(
                         ["/bin/bash", str(destroy_script), "YES"], cwd=workspace,
@@ -150,6 +160,8 @@ def run(spec_path: Path) -> int:
                     ).returncode
                 except subprocess.TimeoutExpired:
                     cleanup_code = 124
+                if mount_cleanup_failed and cleanup_code == 0:
+                    cleanup_code = 125
                 if cleanup_code and exit_code == 0:
                     exit_code = 125
                     error_type = "HostOperationCleanupError"
