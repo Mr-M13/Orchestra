@@ -125,6 +125,7 @@ class Config:
     repository_profiles: dict[str, RepositoryProfile] | None = None
     default_profile: str | None = None
     standing_authorizations: tuple[StandingAuthorization, ...] = ()
+    task_approval_mode: str = "required"
 
     @classmethod
     def load(cls, path: Path) -> "Config":
@@ -174,6 +175,9 @@ class Config:
         approval_ttl_seconds = int(raw.get("approval_ttl_seconds", 1_800))
         if not 60 <= approval_ttl_seconds <= 86_400:
             raise ValueError("approval_ttl_seconds must be between 60 and 86400")
+        task_approval_mode = raw.get("task_approval_mode", "required")
+        if task_approval_mode not in {"required", "disabled"}:
+            raise ValueError("task_approval_mode must be required or disabled")
         profiles_raw = raw.get("repository_profiles")
         profiles: dict[str, RepositoryProfile] | None = None
         default_profile: str | None = None
@@ -264,6 +268,7 @@ class Config:
             max(1_024, min(int(raw.get("max_result_bytes", 65_536)), 1_048_576)),
             approval_ttl_seconds,
             profiles, default_profile, tuple(standing_authorizations),
+            task_approval_mode,
         )
 
     def profile(self, profile_id: str | None) -> RepositoryProfile:
@@ -408,7 +413,9 @@ class TaskController:
                 and len(self.config.repository_profiles) > 1):
             raise ValueError("repository_profile is required when multiple repositories are configured")
         profile = self.config.profile(repository_profile)
-        if requires_approval is not True:
+        if not isinstance(requires_approval, bool):
+            raise ValueError("requires_approval must be a boolean")
+        if requires_approval is not True and self.config.task_approval_mode == "required":
             raise ValueError("the server approval policy is mandatory and cannot be disabled by the caller")
         if consequence_class not in CONSEQUENCE_CLASSES:
             raise ValueError("unknown consequence_class")
@@ -429,7 +436,8 @@ class TaskController:
             return {**self._public(previous), "acknowledged": True, "idempotent_replay": True}
         task_id = self.id_factory()
         now = utc_now()
-        status = "accepted" if standing_authorization else "approval_required"
+        approvals_disabled = self.config.task_approval_mode == "disabled"
+        status = "accepted" if standing_authorization or approvals_disabled else "approval_required"
         task = {
             "task_id": task_id, "request_id": request_id, "request_digest": digest,
             "title": title.strip(), "instructions": instructions, "worker": worker,
@@ -453,6 +461,14 @@ class TaskController:
             task["approval"] = {
                 "status": "standing_authorized", "decided_at": now,
                 "decided_by": "policy:" + standing_authorization.authorization_id,
+            }
+        elif approvals_disabled:
+            task["authorization"] = {
+                "mode": "automatic", "policy": "task_approvals_disabled",
+            }
+            task["approval"] = {
+                "status": "not_required", "decided_at": now,
+                "decided_by": "policy:task_approvals_disabled",
             }
         else:
             expires_at = (datetime.fromisoformat(now) + timedelta(
@@ -483,6 +499,7 @@ class TaskController:
         default_profile = self.config.profile(None)
         result = {"service": "omcp", "status": "ok", "task_counts": counts,
                   "repository": default_profile.repository,
+                  "task_approval_mode": self.config.task_approval_mode,
                   "default_profile": default_profile.profile_id,
                   "repository_profiles": sorted((self.config.repository_profiles or {"default": default_profile}))}
         self._audit("bridge.status", None, "allowed", {})
@@ -564,7 +581,7 @@ class TaskController:
 
     def list_approvals(self) -> dict[str, Any]:
         self._authorize("approvals:read", "approval.list")
-        self._expire_pending_approvals()
+        self._apply_task_approval_policy()
         approvals = [self._public(task) for task in self.state["tasks"].values()
                      if task["status"] == "approval_required"]
         self._audit("approval.list", None, "allowed", {"count": len(approvals)})
@@ -607,6 +624,8 @@ class TaskController:
 
     def local_approval_details(self, task_id: str) -> dict[str, Any]:
         """Return the complete request only to the local approval command."""
+        if self.config.task_approval_mode == "disabled":
+            self._apply_task_approval_policy()
         task = self._task(task_id)
         if self._expire_approval(task):
             raise ValueError("approval request has expired")
@@ -628,6 +647,8 @@ class TaskController:
 
     def local_task_details(self, task_id: str) -> dict[str, Any]:
         """Return complete task context only through the owner-only local channel."""
+        if self.config.task_approval_mode == "disabled":
+            self._apply_task_approval_policy()
         task = self._task(task_id)
         self._expire_approval(task)
         profile = self.config.profile(task.get("repository_profile"))
@@ -646,7 +667,7 @@ class TaskController:
         """Return bounded approval history only through the owner-only local channel."""
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 500:
             raise ValueError("limit must be an integer from 1 to 500")
-        self._expire_pending_approvals()
+        self._apply_task_approval_policy()
         tasks = sorted(
             self.state["tasks"].values(), key=lambda item: item["created_at"], reverse=True,
         )
@@ -682,8 +703,33 @@ class TaskController:
         for task in self.state["tasks"].values():
             self._expire_approval(task)
 
+    def _apply_task_approval_policy(self) -> None:
+        if self.config.task_approval_mode != "disabled":
+            self._expire_pending_approvals()
+            return
+        now = utc_now()
+        changed_task_ids: list[str] = []
+        for task in self.state["tasks"].values():
+            if task.get("status") != "approval_required":
+                continue
+            task["status"] = "accepted"
+            task["authorization"] = {
+                "mode": "automatic", "policy": "task_approvals_disabled",
+            }
+            task["approval"] = {
+                "status": "not_required", "decided_at": now,
+                "decided_by": "policy:task_approvals_disabled",
+            }
+            changed_task_ids.append(task["task_id"])
+        if changed_task_ids:
+            self._save()
+            for task_id in changed_task_ids:
+                self._audit("approval.bypass", task_id, "allowed", {
+                    "policy": "task_approvals_disabled",
+                })
+
     def tick(self) -> None:
-        self._expire_pending_approvals()
+        self._apply_task_approval_policy()
         self.reconcile()
         if any(task["status"] in ACTIVE for task in self.state["tasks"].values()):
             return
