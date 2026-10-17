@@ -22,6 +22,7 @@ ACTIVE = {"starting", "running", "cancel_requested"}
 PERMISSIONS = {
     "status:read", "tasks:submit", "tasks:read", "results:read",
     "workers:read", "tasks:cancel", "approvals:read",
+    "host_operations:submit",
 }
 CONSEQUENCE_CLASSES = {
     "routine_development", "production_deployment", "destructive_operation",
@@ -94,6 +95,17 @@ class RepositoryProfile:
 
 
 @dataclass(frozen=True)
+class HostOperation:
+    """An owner-enabled, built-in host operation; callers never supply commands."""
+
+    operation_id: str
+    operation_type: str
+    repository_profile: str
+    harness_commit: str
+    timeout_seconds: int
+
+
+@dataclass(frozen=True)
 class StandingAuthorization:
     """Owner-configured authority for a bounded class of worker tasks."""
 
@@ -125,6 +137,7 @@ class Config:
     repository_profiles: dict[str, RepositoryProfile] | None = None
     default_profile: str | None = None
     standing_authorizations: tuple[StandingAuthorization, ...] = ()
+    host_operations: dict[str, HostOperation] | None = None
     task_approval_mode: str = "required"
 
     @classmethod
@@ -262,11 +275,45 @@ class Config:
                 authorization_id, consequence_class,
                 frozenset(profile_ids), frozenset(worker_names), tuple(normalized_paths),
             ))
+        operations_raw = raw.get("host_operations", {})
+        if not isinstance(operations_raw, dict):
+            raise ValueError("host_operations must be an object")
+        host_operations: dict[str, HostOperation] = {}
+        for operation_id, operation_raw in operations_raw.items():
+            if (not isinstance(operation_id, str)
+                    or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", operation_id)):
+                raise ValueError("invalid host operation id")
+            if not isinstance(operation_raw, dict):
+                raise ValueError("host operation must be an object")
+            operation_type = operation_raw.get("type")
+            if operation_type != "delnavazan_mariadb_acceptance_v1":
+                raise ValueError("unknown host operation type")
+            operation_profile = operation_raw.get("repository_profile")
+            if not isinstance(operation_profile, str) or operation_profile not in known_profiles:
+                raise ValueError("host operation names an unknown repository profile")
+            timeout_seconds = operation_raw.get("timeout_seconds", 3600)
+            harness_commit = operation_raw.get("harness_commit")
+            if (not isinstance(harness_commit, str)
+                    or not re.fullmatch(r"[0-9a-f]{40}", harness_commit)):
+                raise ValueError("host operation harness_commit must be a full lowercase Git commit SHA")
+            if (not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool)
+                    or not 60 <= timeout_seconds <= 7200):
+                raise ValueError("host operation timeout_seconds must be between 60 and 7200")
+            unknown_fields = set(operation_raw) - {
+                "type", "repository_profile", "harness_commit", "timeout_seconds",
+            }
+            if unknown_fields:
+                raise ValueError("host operation contains unsupported fields")
+            host_operations[operation_id] = HostOperation(
+                operation_id, operation_type, operation_profile, harness_commit,
+                timeout_seconds,
+            )
         return cls(
             repository, root, state, base_ref, workers, principal,
             max(1_024, min(int(raw.get("max_task_bytes", 65_536)), 1_048_576)),
             max(1_024, min(int(raw.get("max_result_bytes", 65_536)), 1_048_576)),
             approval_ttl_seconds,
+            profiles, default_profile, tuple(standing_authorizations), host_operations,
             profiles, default_profile, tuple(standing_authorizations),
             task_approval_mode,
         )
@@ -304,11 +351,13 @@ class TaskController:
         config: Config,
         popen: Callable[..., Any] = subprocess.Popen,
         workspace_preparer: Callable[[str, str], Path] | None = None,
+        host_workspace_preparer: Callable[[str, RepositoryProfile, str], Path] | None = None,
         id_factory: Callable[[], str] | None = None,
     ):
         self.config = config
         self.popen = popen
         self.workspace_preparer = workspace_preparer or self._prepare_workspace
+        self.host_workspace_preparer = host_workspace_preparer or self._prepare_host_workspace
         self.id_factory = id_factory or (lambda: str(uuid.uuid4()))
         config.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(config.state_dir, 0o700)
@@ -385,6 +434,8 @@ class TaskController:
             "cancel_reason", "failure", "repository_profile", "repository", "base_ref",
             "consequence_class", "authorization",
             "execution_capabilities",
+            "kind", "operation_id", "operation_type", "target_commit",
+            "harness_commit",
         )
         return {key: task[key] for key in keys if key in task}
 
@@ -490,6 +541,73 @@ class TaskController:
         self.tick()
         return {**self._public(task), "acknowledged": True, "idempotent_replay": False}
 
+    def submit_host_operation(
+        self, request_id: str, operation_id: str, target_commit: str,
+    ) -> dict[str, Any]:
+        """Queue one built-in host operation; no command or arguments cross the MCP boundary."""
+        self._authorize("host_operations:submit", "host_operation.submit")
+        if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id):
+            raise ValueError("request_id must be 1-128 safe characters")
+        operations = self.config.host_operations or {}
+        if not isinstance(operation_id, str) or operation_id not in operations:
+            raise ValueError("unknown or disabled host operation")
+        if not isinstance(target_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", target_commit):
+            raise ValueError("target_commit must be a full lowercase Git commit SHA")
+        operation = operations[operation_id]
+        profile = self.config.profile(operation.repository_profile)
+        resolved = self._resolve_local_commit(profile, target_commit)
+        harness_commit = self._resolve_local_commit(profile, operation.harness_commit)
+        digest = hashlib.sha256(json.dumps(
+            [operation_id, resolved, harness_commit], separators=(",", ":"),
+        ).encode()).hexdigest()
+        previous_id = self.state["requests"].get(request_id)
+        if previous_id:
+            previous = self.state["tasks"][previous_id]
+            if previous["request_digest"] != digest:
+                self._audit("host_operation.submit", previous_id, "conflict", {
+                    "request_id": request_id,
+                })
+                raise ValueError("request_id was already used with different task content")
+            self._audit("host_operation.submit", previous_id, "replayed", {
+                "request_id": request_id,
+            })
+            return {**self._public(previous), "acknowledged": True, "idempotent_replay": True}
+        task_id = self.id_factory()
+        now = utc_now()
+        expires_at = (datetime.fromisoformat(now) + timedelta(
+            seconds=self.config.approval_ttl_seconds,
+        )).isoformat()
+        task = {
+            "task_id": task_id, "request_id": request_id, "request_digest": digest,
+            "kind": "host_operation", "operation_id": operation.operation_id,
+            "operation_type": operation.operation_type,
+            "target_commit": resolved, "harness_commit": harness_commit,
+            "title": "Run Delnavazan MariaDB acceptance",
+            "instructions": (
+                "Run the offline, disposable Delnavazan WordPress/MariaDB acceptance "
+                f"harness against exact commit {resolved}."
+            ),
+            "worker": "host:" + operation.operation_id,
+            "repository_profile": profile.profile_id, "repository": profile.repository,
+            "base_ref": profile.base_ref, "consequence_class": "host_operation",
+            "submitted_by": self.config.principal.identity,
+            "status": "approval_required", "created_at": now,
+            "authorization": {"mode": "explicit"},
+            "approval": {
+                "status": "pending", "requested_at": now, "expires_at": expires_at,
+            },
+        }
+        self.state["tasks"][task_id] = task
+        self.state["requests"][request_id] = task_id
+        self._save()
+        self._audit("host_operation.submit", task_id, "allowed", {
+            "request_id": request_id, "operation_id": operation.operation_id,
+            "repository_profile": profile.profile_id, "target_commit": resolved,
+            "harness_commit": harness_commit,
+            "authorization_mode": "explicit",
+        })
+        return {**self._public(task), "acknowledged": True, "idempotent_replay": False}
+
     def bridge_status(self) -> dict[str, Any]:
         self._authorize("status:read", "bridge.status")
         self.tick()
@@ -549,7 +667,7 @@ class TaskController:
         active = next((task for task in self.state["tasks"].values() if task["status"] in ACTIVE), None)
         workers = []
         for name in sorted(self.config.workers):
-            busy = bool(active and active["worker"] == name)
+            busy = bool(active and active.get("worker") == name)
             workers.append({"worker": name, "available": active is None,
                             "current_task_id": active["task_id"] if busy else None})
         self._audit("worker.availability", None, "allowed", {})
@@ -641,6 +759,10 @@ class TaskController:
             "base_ref": task.get("base_ref", profile.base_ref),
             "consequence_class": task.get("consequence_class", "unclassified"),
             "title": task["title"], "instructions": task["instructions"],
+            "kind": task.get("kind", "worker_task"),
+            "operation_id": task.get("operation_id"),
+            "target_commit": task.get("target_commit"),
+            "harness_commit": task.get("harness_commit"),
             "requested_at": task["approval"]["requested_at"],
             "expires_at": task["approval"]["expires_at"],
         }
@@ -792,6 +914,9 @@ class TaskController:
             self._save()
 
     def _start(self, task: dict[str, Any]) -> None:
+        if task.get("kind") == "host_operation":
+            self._start_host_operation(task)
+            return
         task_id = task["task_id"]
         profile = self.config.profile(task.get("repository_profile"))
         branch = "omcp/task-" + task_id.split("-", 1)[0]
@@ -848,6 +973,74 @@ class TaskController:
             self._save()
             self._audit("task.start", task_id, "failed", {"error_type": type(exc).__name__})
 
+    def _start_host_operation(self, task: dict[str, Any]) -> None:
+        task_id = task["task_id"]
+        operations = self.config.host_operations or {}
+        operation = operations.get(task.get("operation_id"))
+        task.update({"status": "starting"})
+        self._save()
+        try:
+            if operation is None or operation.operation_type != task.get("operation_type"):
+                raise RuntimeError("host operation is no longer enabled by owner configuration")
+            profile = self.config.profile(task.get("repository_profile"))
+            if profile.profile_id != operation.repository_profile:
+                raise RuntimeError("host operation repository profile changed")
+            target_commit = self._resolve_local_commit(profile, task.get("target_commit"))
+            harness_commit = self._resolve_local_commit(profile, operation.harness_commit)
+            if harness_commit != task.get("harness_commit"):
+                raise RuntimeError("host operation harness commit changed after approval")
+            workspace = self.host_workspace_preparer(task_id, profile, harness_commit)
+            task_dir = self.config.state_dir / "tasks" / task_id
+            task_dir.mkdir(parents=True, mode=0o700)
+            os.chmod(task_dir, 0o700)
+            log_path = task_dir / "host-operation.log"
+            result_path = task_dir / "result.txt"
+            completion_path = task_dir / "completion.json"
+            spec_path = task_dir / "host-operation.json"
+            _atomic_json(spec_path, {
+                "operation_id": operation.operation_id,
+                "operation_type": operation.operation_type,
+                "target_commit": target_commit,
+                "harness_commit": harness_commit,
+                "timeout_seconds": operation.timeout_seconds,
+                "workspace": str(workspace), "task_dir": str(task_dir),
+                "log_path": str(log_path), "result_path": str(result_path),
+                "completion_path": str(completion_path),
+            })
+            self._audit("host_operation.start", task_id, "allowed", {
+                "operation_id": operation.operation_id,
+                "repository_profile": profile.profile_id,
+                "target_commit": target_commit,
+                "harness_commit": harness_commit,
+            })
+            proc = self.popen(
+                [sys.executable, "-m", "omcp.host_runner", "--spec", str(spec_path)],
+                cwd=Path(__file__).resolve().parent.parent,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
+            )
+            task.update({
+                "status": "running", "runner_pid": proc.pid, "started_at": utc_now(),
+                "workspace": str(workspace), "result_path": str(result_path),
+                "completion_path": str(completion_path), "log_path": str(log_path),
+            })
+            try:
+                self._save()
+            except Exception:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                raise
+        except Exception as exc:
+            task.update({"status": "failed", "finished_at": utc_now(),
+                         "failure": {"type": type(exc).__name__, "stage": "startup"}})
+            self._save()
+            self._audit("host_operation.start", task_id, "failed", {
+                "error_type": type(exc).__name__,
+            })
+
     @staticmethod
     def _reap_child(pid: int | None) -> int | None:
         if not pid:
@@ -868,15 +1061,31 @@ class TaskController:
             raise RuntimeError(f"Git workspace operation failed ({args[0]}), exit {result.returncode}")
         return result.returncode, result.stdout.strip()
 
+    def _verify_profile_origin(self, profile: RepositoryProfile) -> None:
+        _, remote = self._git(profile.project_root, "remote", "get-url", "origin")
+        parsed = urlparse(remote)
+        remote_repo = parsed.path.strip("/").removesuffix(".git").lower()
+        if (parsed.scheme != "https" or parsed.hostname != "github.com"
+                or remote_repo != profile.repository.lower()):
+            raise RuntimeError("project origin must match configured GitHub repository over HTTPS")
+
+    def _resolve_local_commit(self, profile: RepositoryProfile, target_commit: str) -> str:
+        if not isinstance(target_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", target_commit):
+            raise ValueError("target_commit must be a full lowercase Git commit SHA")
+        self._verify_profile_origin(profile)
+        code, resolved = self._git(
+            profile.project_root, "rev-parse", "--verify", target_commit + "^{commit}",
+            allow_failure=True,
+        )
+        if code != 0 or resolved != target_commit:
+            raise ValueError("target_commit is not an exact local commit in the configured repository")
+        return resolved
+
     def _prepare_workspace(self, task_id: str, branch: str, profile: RepositoryProfile) -> Path:
         workspace = self.config.state_dir / "worktrees" / profile.profile_id / task_id
         if workspace.exists():
             raise RuntimeError("task workspace already exists")
-        _, remote = self._git(profile.project_root, "remote", "get-url", "origin")
-        parsed = urlparse(remote)
-        remote_repo = parsed.path.strip("/").removesuffix(".git").lower()
-        if parsed.scheme != "https" or parsed.hostname != "github.com" or remote_repo != profile.repository.lower():
-            raise RuntimeError("project origin must match configured GitHub repository over HTTPS")
+        self._verify_profile_origin(profile)
         self._git(profile.project_root, "fetch", "--no-tags", "origin", profile.base_ref.split("/", 1)[1])
         exists, _ = self._git(profile.project_root, "show-ref", "--verify", "--quiet",
                               "refs/heads/" + branch, allow_failure=True)
@@ -885,4 +1094,19 @@ class TaskController:
         workspace.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._git(profile.project_root, "worktree", "add", "--detach", str(workspace), profile.base_ref)
         self._git(workspace, "switch", "-c", branch)
+        return workspace
+
+    def _prepare_host_workspace(
+        self, task_id: str, profile: RepositoryProfile, target_commit: str,
+    ) -> Path:
+        """Create a detached, exact-commit worktree without fetching or updating refs."""
+        workspace = self.config.state_dir / "host-worktrees" / profile.profile_id / task_id
+        if workspace.exists():
+            raise RuntimeError("host operation workspace already exists")
+        resolved = self._resolve_local_commit(profile, target_commit)
+        workspace.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._git(profile.project_root, "worktree", "add", "--detach", str(workspace), resolved)
+        _, actual = self._git(workspace, "rev-parse", "HEAD")
+        if actual != resolved:
+            raise RuntimeError("host operation worktree did not resolve to the approved commit")
         return workspace

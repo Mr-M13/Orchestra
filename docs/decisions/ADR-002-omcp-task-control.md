@@ -18,6 +18,9 @@ Add `omcp`, a standard-library Python MCP server using local stdio behind the au
 - Submission requires a caller-generated idempotency key and is persisted before execution.
 - A single execution slot launches direct Codex CLI commands in fresh Git worktrees with `workspace-write` and no interactive escalation.
 - A detached runner writes a completion record so server restarts can reconcile outcomes.
+- Every submitted task waits for approval. The remote MCP caller cannot approve it; an interactive local Mac operator reviews and decides with a separate local approval command.
+- Host-side acceptance is a separate, explicitly permissioned task type. The caller may select only an owner-enabled built-in operation and an exact local commit; it cannot supply commands, arguments, paths, images, environment, credentials or network policy. Host operations never receive standing authorization.
+- The initial Delnavazan MariaDB operation runs a separately pinned harness commit, tests an exact target commit, gates Docker to cached images and exact disposable commands, forces internal or no-network container paths, forwards no service credentials, and always attempts bounded teardown. It does not expose Docker or GitHub to workers.
 - Approval policy is server-owned. The default `required` mode makes every non-standing-authorized task wait for a separate local decision. An owner may explicitly set `task_approval_mode` to `disabled`; valid tasks are then automatically authorized and audited without a per-task approval request. A remote MCP request cannot change this mode.
 - Security-relevant actions produce append-only audit events without task bodies or worker output.
 - ChatGPT remains responsible for decomposition, scheduling choices, approval decisions and interpretation of results.
@@ -25,4 +28,4 @@ Add `omcp`, a standard-library Python MCP server using local stdio behind the au
 
 ## Consequences
 
-Direct tasks no longer require GitHub Issue dispatch, while the existing Bridge remains independently usable. Local state is authoritative for OMCP attempts, so its private directory must be backed up and protected. A successful worker exit is not promoted to independent verification. V1 does not coordinate multiple OMCP hosts, automatically retry unknown outcomes, merge branches or make deployment decisions.
+Direct tasks no longer require GitHub Issue dispatch, while the existing Bridge remains independently usable. Local state is authoritative for OMCP attempts, so its private directory must be backed up and protected. A successful worker or host-operation exit is bounded evidence, not independent verification. V1 does not coordinate multiple OMCP hosts, automatically retry unknown outcomes, merge branches or make deployment decisions. Adding a generic host shell is explicitly outside this decision.

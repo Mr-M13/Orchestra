@@ -57,6 +57,21 @@ TOOLS = [
         }, ["request_id", "title", "instructions", "worker", "repository_profile"]),
     },
     {
+        "name": "submit_host_operation",
+        "description": (
+            "Request one owner-enabled, built-in host operation against an exact local commit. "
+            "The caller cannot provide a command or arguments; every request requires local approval."
+        ),
+        "inputSchema": _object({
+            "request_id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "operation_id": {"type": "string", "minLength": 1, "maxLength": 64},
+            "target_commit": {
+                "type": "string", "pattern": "^[0-9a-f]{40}$",
+                "description": "Full immutable commit SHA already present in the configured repository.",
+            },
+        }, ["request_id", "operation_id", "target_commit"]),
+    },
+    {
         "name": "task_status",
         "description": "Get the current durable status of one task.",
         "inputSchema": _object({"task_id": {"type": "string"}}, ["task_id"]),
@@ -107,6 +122,9 @@ class MCPServer:
                 value.get("request_id"), value.get("title"), value.get("instructions"),
                 value.get("worker"), value.get("requires_approval", True), value.get("repository_profile"),
                 value.get("consequence_class", "unclassified"),
+            ),
+            "submit_host_operation": lambda value: controller.submit_host_operation(
+                value.get("request_id"), value.get("operation_id"), value.get("target_commit"),
             ),
             "task_status": lambda value: controller.task_status(value.get("task_id")),
             "list_tasks": lambda value: controller.list_tasks(value.get("status"), value.get("limit", 100)),

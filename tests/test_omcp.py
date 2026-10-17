@@ -11,9 +11,11 @@ from unittest.mock import Mock, patch
 
 from omcp.approval import format_review
 from omcp.controller import (
-    AuthorizationError, Config, Principal, RepositoryProfile, StandingAuthorization,
+    AuthorizationError, Config, HostOperation, Principal, RepositoryProfile, StandingAuthorization,
     TaskController, Worker,
 )
+from omcp.docker_gate import gated_command
+from omcp.host_runner import run as run_host_operation
 from omcp.local_control import LocalApprovalServer, approval_request
 from omcp.runner import run as run_worker
 from omcp.server import MCPServer, TOOLS, main as server_main
@@ -22,6 +24,7 @@ from omcp.server import MCPServer, TOOLS, main as server_main
 ALL_PERMISSIONS = frozenset({
     "status:read", "tasks:submit", "tasks:read", "results:read",
     "workers:read", "tasks:cancel", "approvals:read",
+    "host_operations:submit",
 })
 
 
@@ -490,8 +493,53 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(result["truncated"])
         self.assertEqual(len(result["result"]), 1024)
 
+    def test_host_operation_is_exact_commit_local_approval_only(self):
+        target = "1" * 40
+        harness = "2" * 40
+        self.controller.config = Config(
+            self.config.repository, self.config.project_root, self.config.state_dir,
+            self.config.base_ref, self.config.workers, self.config.principal,
+            host_operations={
+                "delnavazan-mariadb": HostOperation(
+                    "delnavazan-mariadb", "delnavazan_mariadb_acceptance_v1",
+                    "default", harness, 1800,
+                ),
+            },
+        )
+        self.controller.host_workspace_preparer = lambda *_: self.root
+        with patch.object(self.controller, "_resolve_local_commit", side_effect=lambda _p, value: value):
+            submitted = self.controller.submit_host_operation(
+                "host-request-1", "delnavazan-mariadb", target,
+            )
+            self.assertEqual(submitted["status"], "approval_required")
+            self.assertEqual(submitted["target_commit"], target)
+            self.assertEqual(submitted["harness_commit"], harness)
+            self.popen.assert_not_called()
+            details = self.controller.local_approval_details(submitted["task_id"])
+            review = format_review(details, "approve")
+            self.assertIn("Operation:    delnavazan-mariadb", review)
+            self.assertIn("Harness SHA:  " + harness, review)
+            self.assertIn("Target SHA:   " + target, review)
+            approved = self.controller.resolve_approval(
+                submitted["task_id"], "approve", "Exact bounded harness approved",
+                "local:test-operator",
+            )
+        self.assertEqual(approved["status"], "running")
+        command = self.popen.call_args.args[0]
+        self.assertIn("omcp.host_runner", command)
+        spec = json.loads((self.state / "tasks" / submitted["task_id"] / "host-operation.json").read_text())
+        self.assertEqual(spec["target_commit"], target)
+        self.assertEqual(spec["harness_commit"], harness)
+        self.assertNotIn("command", spec)
+
+    def test_host_operation_rejects_caller_commands_and_unknown_ids(self):
+        with self.assertRaisesRegex(ValueError, "unknown or disabled"):
+            self.controller.submit_host_operation("host-request", "arbitrary-shell", "1" * 40)
+        self.assertEqual(self.controller.state["tasks"], {})
+
 
 class ConfigTests(unittest.TestCase):
+    def test_config_loads_only_built_in_pinned_host_operation(self):
     def test_config_loads_and_validates_task_approval_mode(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "project"
@@ -500,6 +548,34 @@ class ConfigTests(unittest.TestCase):
             codex.write_text("#!/bin/sh\nexit 0\n")
             codex.chmod(0o700)
             config_path = Path(directory) / "omcp.json"
+            value = {
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(Path(directory) / "state"),
+                "workers": {"ina": {"command": [str(codex)]}},
+                "principal": {
+                    "identity": "chatgpt:test",
+                    "permissions": ["host_operations:submit"],
+                },
+                "host_operations": {
+                    "delnavazan-mariadb": {
+                        "type": "delnavazan_mariadb_acceptance_v1",
+                        "repository_profile": "default",
+                        "harness_commit": "2" * 40,
+                        "timeout_seconds": 1800,
+                    },
+                },
+            }
+            config_path.write_text(json.dumps(value))
+            os.chmod(config_path, 0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                loaded = Config.load(config_path)
+            operation = loaded.host_operations["delnavazan-mariadb"]
+            self.assertEqual(operation.harness_commit, "2" * 40)
+            self.assertEqual(operation.timeout_seconds, 1800)
+            value["host_operations"]["delnavazan-mariadb"]["command"] = ["/bin/sh"]
+            config_path.write_text(json.dumps(value))
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                with self.assertRaisesRegex(ValueError, "unsupported fields"):
             raw = {
                 "repository": "owner/repo", "project_root": str(root),
                 "state_dir": str(Path(directory) / "state"),
@@ -807,6 +883,147 @@ class RunnerTests(unittest.TestCase):
                 execute.assert_not_called()
 
 
+class HostOperationRunnerTests(unittest.TestCase):
+    def test_docker_gate_allows_only_cached_disposable_internal_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir()
+            approved = root / "workspace"
+            approved.mkdir()
+            mount_stage = state / "staged-mounts"
+            mount_stage.mkdir()
+            candidate = state / "candidate"
+            candidate.mkdir()
+            environment = {
+                "OMCP_DOCKER_REAL": "/bin/echo",
+                "OMCP_DOCKER_PROJECT_DIR": str(root / "runtime"),
+                "OMCP_DOCKER_PROJECT": "omcp-dzn-test",
+                "OMCP_DOCKER_COMPOSE_FILE": str(root / "runtime/compose.yaml"),
+                "OMCP_DOCKER_OVERRIDE": str(root / "override.yaml"),
+                "OMCP_DOCKER_RUNTIME_STATE": str(state),
+                "OMCP_DOCKER_NETWORK": "omcp-dzn-test_runtime",
+                "OMCP_DOCKER_APPROVED_SOURCE": str(approved),
+                "OMCP_DOCKER_MOUNT_STAGE": str(mount_stage),
+            }
+            compose = [
+                "compose", "--project-directory", environment["OMCP_DOCKER_PROJECT_DIR"],
+                "--project-name", "omcp-dzn-test", "-f",
+                environment["OMCP_DOCKER_COMPOSE_FILE"],
+                "up", "--pull", "never", "-d", "--wait", "db",
+            ]
+            gated = gated_command(compose, environment)
+            self.assertIn(environment["OMCP_DOCKER_OVERRIDE"], gated)
+            run = gated_command([
+                "run", "--rm", "--pull=never", "-v",
+                f"{candidate}:{candidate}:ro", "--entrypoint", "php",
+                "wordpress:cli-php8.3", str(candidate / "tests/static.php"),
+            ], environment)
+            self.assertIn("none", run)
+            with self.assertRaisesRegex(PermissionError, "outside"):
+                gated_command(["pull", "wordpress:latest"], environment)
+            with self.assertRaisesRegex(PermissionError, "mounts"):
+                gated_command([
+                    "run", "--rm", "--pull=never", "-v", "/:/host",
+                    "--entrypoint", "php", "wordpress:cli-php8.3", "-v",
+                ], environment)
+
+    def test_docker_gate_stages_only_approved_read_only_external_mounts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir()
+            stage = state / "staged-mounts"
+            stage.mkdir()
+            approved = root / "workspace"
+            source = approved / "platform"
+            fixture = source / "tests/schema30.php"
+            fixture.parent.mkdir(parents=True)
+            fixture.write_text("<?php echo 'schema30';\n")
+            schema30_source = state / "schema30-source"
+            schema30_source.symlink_to(source, target_is_directory=True)
+            outside = root / "outside.php"
+            outside.write_text("secret\n")
+            environment = {
+                "OMCP_DOCKER_REAL": "/bin/echo",
+                "OMCP_DOCKER_PROJECT_DIR": str(approved / "platform/runtime"),
+                "OMCP_DOCKER_PROJECT": "omcp-dzn-test",
+                "OMCP_DOCKER_COMPOSE_FILE": str(approved / "platform/runtime/compose.yaml"),
+                "OMCP_DOCKER_OVERRIDE": str(root / "override.yaml"),
+                "OMCP_DOCKER_RUNTIME_STATE": str(state),
+                "OMCP_DOCKER_NETWORK": "omcp-dzn-test_runtime",
+                "OMCP_DOCKER_APPROVED_SOURCE": str(approved),
+                "OMCP_DOCKER_MOUNT_STAGE": str(stage),
+            }
+            gated = gated_command([
+                "run", "--rm", "--pull=never", "-v", f"{schema30_source}:/plugin:ro",
+                "--entrypoint", "php", "wordpress:cli-php8.3", "/plugin/tests/schema30.php",
+            ], environment)
+            staged_volume = gated[gated.index("-v") + 1]
+            staged_source = Path(staged_volume.split(":", 1)[0])
+            self.assertTrue(staged_source.is_relative_to(stage.resolve()))
+            self.assertEqual(
+                (staged_source / "tests/schema30.php").read_text(), fixture.read_text(),
+            )
+            self.assertEqual(staged_volume.split(":", 1)[1], "/plugin:ro")
+
+            for denied in (f"{schema30_source}:/plugin", f"{outside}:/fixture.php:ro"):
+                with self.subTest(denied=denied), self.assertRaises(PermissionError):
+                    gated_command([
+                        "run", "--rm", "--pull=never", "-v", denied,
+                        "--entrypoint", "php", "wordpress:cli-php8.3", "/fixture.php",
+                    ], environment)
+
+    def test_host_runner_uses_pinned_scripts_minimal_environment_and_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            runtime = workspace / "platform/runtime"
+            scripts = runtime / "bin"
+            scripts.mkdir(parents=True)
+            (runtime / "compose.yaml").write_text("services: {}\n")
+            (scripts / "run-all.sh").write_text("#!/bin/bash\nexit 0\n")
+            (scripts / "destroy.sh").write_text("#!/bin/bash\nexit 0\n")
+            task_dir = root / "task"
+            task_dir.mkdir()
+            spec = task_dir / "host-operation.json"
+            completion = task_dir / "completion.json"
+            spec.write_text(json.dumps({
+                "operation_id": "delnavazan-mariadb",
+                "operation_type": "delnavazan_mariadb_acceptance_v1",
+                "target_commit": "1" * 40, "harness_commit": "2" * 40,
+                "timeout_seconds": 600, "workspace": str(workspace),
+                "task_dir": str(task_dir), "log_path": str(task_dir / "operation.log"),
+                "result_path": str(task_dir / "result.txt"),
+                "completion_path": str(completion),
+            }))
+            parent = {"HOME": "/Users/test", "OPENAI_API_KEY": "must-not-pass"}
+            with patch.dict(os.environ, parent, clear=True), \
+                    patch("omcp.host_runner.shutil.which", return_value="/bin/echo"), \
+                    patch("omcp.host_runner._free_loopback_port", return_value=23456), \
+                    patch("omcp.host_runner.subprocess.run", side_effect=[
+                        Mock(returncode=0), Mock(returncode=0),
+                    ]) as execute:
+                self.assertEqual(run_host_operation(spec), 0)
+            self.assertEqual(len(execute.call_args_list), 2)
+            first_environment = execute.call_args_list[0].kwargs["env"]
+            self.assertNotIn("OPENAI_API_KEY", first_environment)
+            self.assertEqual(first_environment["HOME"], str(task_dir.resolve() / "home"))
+            self.assertEqual(first_environment["DZN_TARGET_REF"], "1" * 40)
+            self.assertEqual(first_environment["DZN_WP_PORT"], "23456")
+            self.assertEqual(first_environment["OMCP_DOCKER_APPROVED_SOURCE"], str(workspace.resolve()))
+            self.assertEqual(
+                first_environment["OMCP_DOCKER_MOUNT_STAGE"],
+                str(task_dir.resolve() / "runtime-state/staged-mounts"),
+            )
+            self.assertFalse((task_dir / "runtime-state/staged-mounts").exists())
+            self.assertEqual(
+                (task_dir / "compose.internal.yaml").read_text(),
+                "networks:\n  runtime:\n    internal: true\n",
+            )
+            self.assertEqual(json.loads(completion.read_text())["exit_code"], 0)
+
+
 class ServerTests(unittest.TestCase):
     def setUp(self):
         self.controller = Mock()
@@ -962,6 +1179,13 @@ class ServerLifecycleTests(unittest.TestCase):
             "routine_development", "production_deployment", "destructive_operation",
             "security_change", "unclassified",
         })
+        host_operation = next(tool for tool in TOOLS if tool["name"] == "submit_host_operation")
+        host_schema = host_operation["inputSchema"]
+        self.assertEqual(
+            set(host_schema["required"]), {"request_id", "operation_id", "target_commit"},
+        )
+        self.assertNotIn("command", host_schema["properties"])
+        self.assertNotIn("arguments", host_schema["properties"])
         self.assertNotIn("const", schema["properties"]["requires_approval"])
 
     def test_multi_repository_health_and_submission_scope_through_mcp(self):
@@ -1071,7 +1295,7 @@ class StdioIntegrationTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             responses = [json.loads(line) for line in completed.stdout.splitlines()]
             self.assertEqual([response["id"] for response in responses], [1, 2, 3])
-            self.assertEqual(len(responses[1]["result"]["tools"]), 8)
+            self.assertEqual(len(responses[1]["result"]["tools"]), 9)
             self.assertEqual(responses[2]["result"]["structuredContent"]["status"], "ok")
 
 
