@@ -237,6 +237,68 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(len(self.controller.list_approvals()["approvals"]), 4)
         self.popen.assert_not_called()
 
+    def test_disabled_approval_policy_runs_protected_and_unclassified_without_request(self):
+        self.controller.close()
+        ids = iter([
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        ])
+        self.controller = TaskController(
+            Config(
+                "owner/repo", self.root, self.state, "origin/main",
+                {"ina": Worker("ina", ("codex",))},
+                Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+                task_approval_mode="disabled",
+            ),
+            popen=self.popen, workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: next(ids),
+        )
+
+        first = self.controller.submit_task(
+            "automatic-security", "Security work", "Perform bounded security work", "ina",
+            True, "default", "security_change",
+        )
+        self.assertEqual(first["status"], "running")
+        self.assertEqual(first["authorization"], {
+            "mode": "automatic", "policy": "task_approvals_disabled",
+        })
+        self.assertEqual(first["approval"]["status"], "not_required")
+        self.assertEqual(self.controller.list_approvals()["approvals"], [])
+
+        self.complete(first["task_id"])
+        second = self.controller.submit_task(
+            "automatic-unclassified", "Unclassified work", "Perform bounded work", "ina",
+            False, "default", "unclassified",
+        )
+        self.assertEqual(second["status"], "running")
+        self.assertEqual(self.popen.call_count, 2)
+        audit = (self.state / "audit.jsonl").read_text()
+        self.assertIn('"authorization_mode":"automatic"', audit)
+
+    def test_disabled_approval_policy_releases_existing_pending_request(self):
+        submitted = self.controller.submit_task(
+            "pending-before-policy-change", "Queued work", "Perform bounded work", "ina",
+        )
+        self.assertEqual(submitted["status"], "approval_required")
+        self.controller.close()
+        self.controller = TaskController(
+            Config(
+                "owner/repo", self.root, self.state, "origin/main",
+                {"ina": Worker("ina", ("codex",))},
+                Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+                task_approval_mode="disabled",
+            ),
+            popen=self.popen, workspace_preparer=lambda *_: self.root,
+        )
+
+        self.controller.tick()
+
+        task = self.controller.task_status(submitted["task_id"])
+        self.assertEqual(task["status"], "running")
+        self.assertEqual(task["approval"]["status"], "not_required")
+        self.assertEqual(task["authorization"]["mode"], "automatic")
+        self.assertIn('"action":"approval.bypass"', (self.state / "audit.jsonl").read_text())
+
     def test_routine_work_outside_granted_worker_scope_requires_explicit_approval(self):
         self.controller.close()
         self.controller = TaskController(
@@ -478,6 +540,7 @@ class ControllerTests(unittest.TestCase):
 
 class ConfigTests(unittest.TestCase):
     def test_config_loads_only_built_in_pinned_host_operation(self):
+    def test_config_loads_and_validates_task_approval_mode(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "project"
             root.mkdir()
@@ -513,6 +576,20 @@ class ConfigTests(unittest.TestCase):
             config_path.write_text(json.dumps(value))
             with patch("omcp.controller.shutil.which", return_value=str(codex)):
                 with self.assertRaisesRegex(ValueError, "unsupported fields"):
+            raw = {
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(Path(directory) / "state"),
+                "workers": {"ina": {"command": [str(codex)]}},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+                "task_approval_mode": "disabled",
+            }
+            config_path.write_text(json.dumps(raw))
+            os.chmod(config_path, 0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                self.assertEqual(Config.load(config_path).task_approval_mode, "disabled")
+                raw["task_approval_mode"] = "sometimes"
+                config_path.write_text(json.dumps(raw))
+                with self.assertRaisesRegex(ValueError, "must be required or disabled"):
                     Config.load(config_path)
 
     def test_config_loads_bounded_routine_standing_authorization(self):
@@ -1109,6 +1186,7 @@ class ServerLifecycleTests(unittest.TestCase):
         )
         self.assertNotIn("command", host_schema["properties"])
         self.assertNotIn("arguments", host_schema["properties"])
+        self.assertNotIn("const", schema["properties"]["requires_approval"])
 
     def test_multi_repository_health_and_submission_scope_through_mcp(self):
         archive = Path(self.temp.name) / "archive"

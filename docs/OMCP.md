@@ -20,7 +20,7 @@ OMCP does not replace Desktop Commander or the GitHub Issue Mac Bridge. Keep bot
 
 Task states are `accepted`, `approval_required`, `starting`, `running`, `cancel_requested`, `succeeded`, `failed`, `cancelled`, `rejected` or `interrupted`. A successful worker exit is an execution result, not independent verification.
 
-`submit_task` requires an explicit `repository_profile` in its published MCP schema. OMCP resolves that allowlisted identifier from its owner-only configuration and never accepts a path, URL, ref, or executable in a task request. Multi-repository deployments also reject an omitted profile at runtime before persisting a task, so older or non-validating clients cannot silently select the wrong repository. The controller retains the legacy implicit `default` profile only for direct single-repository callers. Each request declares a `consequence_class`; omission defaults to `unclassified` and therefore requires explicit approval. Retrying the same request and content returns the existing acknowledgement. Reusing a request ID with different content, profile, or consequence class fails closed.
+`submit_task` requires an explicit `repository_profile` in its published MCP schema. OMCP resolves that allowlisted identifier from its owner-only configuration and never accepts a path, URL, ref, or executable in a task request. Multi-repository deployments also reject an omitted profile at runtime before persisting a task, so older or non-validating clients cannot silently select the wrong repository. The controller retains the legacy implicit `default` profile only for direct single-repository callers. Each request declares a `consequence_class`; omission defaults to `unclassified`. When `task_approval_mode` is `required` (the default), unclassified work requires explicit approval. When the owner-only configuration sets the mode to `disabled`, valid tasks enter the single-worker queue automatically. Retrying the same request and content returns the existing acknowledgement. Reusing a request ID with different content, profile, or consequence class fails closed.
 
 `submit_host_operation` is a separate authority boundary. Its request contains only an idempotency key, an owner-configured operation ID, and a full 40-character commit SHA already present in the operation's configured repository. It cannot name an executable, script, path, environment variable, Docker image, Docker argument, Git ref, URL, or credential. Every host operation is persisted as `approval_required`; standing authorization never applies.
 
@@ -34,7 +34,9 @@ The configured `authentication` value is an audit description only. Environment 
 
 Each principal receives explicit permissions. Missing authority fails closed. At startup, OMCP requires both `OMCP_TUNNEL_AUTHENTICATED=1` and an `OMCP_AUTHENTICATED_CALLER` value equal to the owner-only configured principal identity. These values are a local operator assertion that the dedicated tunnel/app boundary was verified; Secure MCP Tunnel does not supply or attest them. A launcher must not set them merely because the tunnel client has a valid runtime key or because a request arrived over the tunnel. Record the access-control evidence and review it whenever app or workspace membership changes. This implementation supports one fixed principal per dedicated tunnel process, not individual per-request user identities. See the [Secure MCP Tunnel permissions and association model](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels#permissions-and-access) and [workspace association guidance](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels#associate-tunnels-with-the-right-organizations-and-workspaces).
 
-Every submitted task is evaluated by server-owned approval policy; the request cannot disable that policy. Only `routine_development` may match a standing authorization, and only for the exact repository profiles and workers named in the owner-only configuration. `production_deployment`, `destructive_operation`, `security_change`, and `unclassified` are never standing-authorizable. They always require a fresh explicit decision.
+Every submitted task is evaluated by server-owned approval policy; the request cannot change that policy. `task_approval_mode` defaults to `required`. In required mode, only `routine_development` may match a standing authorization, and only for the exact repository profiles and workers named in the owner-only configuration. `production_deployment`, `destructive_operation`, `security_change`, and `unclassified` require a fresh explicit decision. Setting the owner-only configuration to `"task_approval_mode": "disabled"` disables all per-task approval requests; every otherwise-valid task is automatically authorized and audited before it enters the existing single-worker queue.
+
+Disabling task approvals does not disable principal permissions, repository/profile allowlists, origin verification, fresh worktrees, worker sandboxing, the global execution limit, cancellation, result bounds, or audit logging. It does remove the human decision gate for production, destructive, security, and unclassified tasks. Treat access to the fixed-principal app and owner-only configuration as authority to execute any task allowed by those remaining controls.
 
 The remote MCP surface cannot decide explicit approvals. A local operator must run `python3 -m omcp.approval --config <config> --task-id <id> --decision approve|reject` from an interactive Mac terminal while the OMCP service is running. The command communicates with the active coordinator through an owner-only Unix socket and a per-process owner-only capability file in `state_dir`; neither is exposed as an MCP tool or passed to workers. It displays the task ID, request ID, fixed principal, worker, repository, consequence class, title, complete instructions, request time, expiry time and intended decision. The operator must type the exact decision plus task ID and enter a reason. Pending requests expire after `approval_ttl_seconds` (30 minutes by default); expired requests are rejected, audited and cannot start a worker. The local approval actor is separate from the tunnel submitter. Task input is untrusted and cannot alter sandbox or approval settings. Workers:
 
@@ -50,7 +52,7 @@ The state directory and its files are owner-only. State updates are atomic. `aud
 
 V1 configuration remains valid and describes one implicit `default` profile. A multi-repository deployment adds `repository_profiles` and `default_profile`. Every profile binds a stable ID to one GitHub repository, one existing local checkout, and one `origin/<branch>` base ref. OMCP validates the selected ID before persisting a task, records the resolved profile, repository, and ref in task status and local approval review, checks the checkout's HTTPS GitHub origin at worktree creation, and creates the worktree under a profile-specific private state path.
 
-The current global execution limit remains one. Repository profiles prepare task isolation and auditing for independent lanes; they do not enable concurrent execution. Any future lane limit must retain per-task approval, distinct worktrees and branches, durable shared-state admission, cancellation and restart recovery tests before it can increase above one.
+The current global execution limit remains one. Repository profiles prepare task isolation and auditing for independent lanes; they do not enable concurrent execution. Any future lane limit must retain the configured approval policy, distinct worktrees and branches, durable shared-state admission, cancellation and restart recovery tests before it can increase above one.
 
 ## Standing authorization
 
@@ -60,7 +62,7 @@ The caller's consequence label is not the security boundary. A matching grant se
 
 `writable_paths` are owner-reviewed relative directory roots, not task-supplied paths. Absolute paths, parent traversal, `.git`, `.codex`, duplicate paths, and punctuation that could change the permission-profile structure are rejected at configuration load. A read-only routine grant uses an empty list. Keep security policy, deployment, infrastructure, credential, release, and production configuration outside every standing grant. If a repository cannot be divided into non-sensitive write roots, do not configure a standing grant for edits; use explicit approval instead. Git metadata remains read-only in routine mode, so the worker produces commit-ready changes but cannot create, merge, update, or push refs. Integration remains an independently reviewed action.
 
-When no exact standing grant matches, the task remains `approval_required`. The task record and audit event distinguish `standing` from `explicit` authorization and bind the consequence class into the idempotency digest.
+In required mode, when no exact standing grant matches, the task remains `approval_required`. In disabled mode, a non-matching task is accepted with authorization mode `automatic`, policy `task_approvals_disabled`, and approval status `not_required`. Existing pending approval requests are converted to the same automatic authorization on the next policy tick. Task records and audit events distinguish `standing`, `automatic`, and `explicit` authorization and bind the consequence class into the idempotency digest.
 
 An approval is an explicit gate before worker launch. It is not permission to bypass the worker sandbox or an assertion that the completed work is verified. Cancellation of a running worker sends `SIGTERM` to its isolated process group and is reconciled durably when the runner exits.
 
@@ -111,6 +113,7 @@ Use Python 3.11 or newer and a current Codex CLI. Create a state directory outsi
   "max_task_bytes": 65536,
   "max_result_bytes": 65536,
   "approval_ttl_seconds": 1800,
+  "task_approval_mode": "required",
   "standing_authorizations": [
     {
       "id": "routine-development-v1",
@@ -153,7 +156,7 @@ OMCP_AUTHENTICATED_CALLER=orchestra:dedicated-workspace
 ```
 The value must exactly match the configured principal identity. These environment values are not caller authentication; they only bind the process to the configured fixed principal after the operator has verified the access boundary. Do not rely on the control-plane runtime key or audit `authentication` label as proof of a ChatGPT user's identity. Keep the OMCP config and state paths distinct from the Mac Bridge config and state directory. Preserve the existing read-only Bridge tunnel until the dedicated app/workspace access boundary and live lifecycle tests below pass.
 
-Approvals are local human decisions only. The tunnel exposes no `resolve_approval` tool. A human may use the interactive approval command above or the authenticated local approval interface described below.
+When `task_approval_mode` is `required`, approvals are local human decisions only. The tunnel exposes no `resolve_approval` tool. A human may use the interactive approval command above or the authenticated local approval interface described below. When the mode is `disabled`, these interfaces remain available for historical records but new tasks do not create approval requests.
 
 ## Approval notifications and interface
 
@@ -190,7 +193,7 @@ Then verify through the configured tunnel, not only by calling the Python classe
 
 1. Discover tools and confirm all nine names above are present.
 2. Call `bridge_status` and `worker_availability`.
-3. Submit an `unclassified` harmless task with a unique `request_id`; confirm it remains `approval_required` and no worker starts, even if the caller sends `requires_approval: false`.
+3. With `task_approval_mode` set to `required`, submit an `unclassified` harmless task with a unique `request_id`; confirm it remains `approval_required` and no worker starts, even if the caller sends `requires_approval: false`.
 4. Review the task and approve it from the local interactive Mac terminal, observe `running`, then retrieve its terminal result.
 5. Replay the original submission and confirm `idempotent_replay: true` with the same task ID.
 6. Submit another harmless task and cancel it; confirm a terminal `cancelled` state.
@@ -198,6 +201,7 @@ Then verify through the configured tunnel, not only by calling the Python classe
 8. Inspect the private audit log and worktree locally. Confirm the authorization mode, grant ID, and consequence class are recorded, while task instructions and worker output are absent.
 9. Submit a harmless explicit-approval task. Confirm exactly one macOS notification appears, clicking each action opens the matching full-detail page, reject one request, approve another, and retrieve its terminal result through OMCP. Restart the coordinator and both approval agents with a pending request and confirm it remains visible without duplicate delivery or execution.
 10. In a non-production configuration, enable the Delnavazan operation with a reviewed harness commit. Confirm unknown operation IDs, abbreviated or missing commits, caller command fields, uncached images, pulls, non-private mounts, host networking, and unapproved requests all fail closed. Approve one exact harmless commit locally; verify the audit binds both SHAs, the Docker network is internal, direct containers use no network, teardown runs, and the result/log contain no credentials. Cancel a second run and confirm terminal reconciliation. Do not use a production checkout or production data.
+10. In a dedicated test configuration, set `task_approval_mode` to `disabled`. Submit harmless tasks for `unclassified` and a protected consequence class. Confirm both enter the queue without appearing in `list_approvals`, each records `authorization.mode=automatic` and `approval.status=not_required`, and `bridge_status` reports `task_approval_mode=disabled`. Restore the intended policy after testing.
 
 Do not disable the Bridge or Desktop Commander on the strength of unit tests alone. The final replacement gate requires the authenticated ChatGPT tunnel, target Mac, real Codex profile, Git worktree creation, completion/result retrieval and cancellation path to pass end to end.
 
@@ -206,6 +210,7 @@ Do not disable the Bridge or Desktop Commander on the strength of unit tests alo
 The detached runner writes a completion record even when the MCP server restarts. On startup OMCP reconciles completion records and live runner PIDs. A disappeared runner without a completion record becomes `interrupted`; OMCP does not retry it automatically.
 
 V1 intentionally has one global execution slot shared by workers and host operations, local-file authoritative state, fixed per-process principal authority and no autonomous scheduling, retry, merge, deployment or outcome-verification decisions. Standing authorization permits only bounded routine worker execution; host operations always require local approval. Those later decisions remain with ChatGPT or a human operator.
+V1 intentionally has one global execution slot, local-file authoritative state, fixed per-process principal authority and no autonomous retry, merge, deployment or outcome-verification decisions. Standing authorization permits only bounded routine worker execution. When task approvals are disabled, scheduling from the accepted queue is automatic, but completion still does not prove correctness, merge, deployment, or end-to-end success.
 
 ### Migration to individual identity and roles
 
