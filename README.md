@@ -44,6 +44,7 @@ The first runtime component is the opt-in Mac Bridge v1. Its implementation and 
 - [Mac Bridge v1](docs/MAC-BRIDGE-V1.md) — a local outbound-only GitHub issue dispatcher for scoped worker execution.
 - [ADR-001: Local outbound worker bridge](docs/decisions/ADR-001-mac-bridge-v1.md) — records the queue, trust boundary, credential, and recovery decisions for the first runtime component.
 - [OMCP task control v1](docs/OMCP.md) — direct MCP tools for durable submission, status, results, availability, cancellation and approvals.
+- [Execution policies and operator runbook](docs/EXECUTION-POLICIES.md) — distinguishes deployed prompt-free worker scheduling from the proposed, not-yet-active automatic merge/deploy policy.
 - [ADR-002: Local MCP task-control adapter](docs/decisions/ADR-002-omcp-task-control.md) — records the direct-control transport, authority and recovery boundary.
 
 The lessons audit remains open to new evidence throughout development; completing the initial audit does not freeze what Orchestra can learn.
