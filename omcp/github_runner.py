@@ -40,12 +40,12 @@ def _bounded_text(value: str, maximum: int) -> str:
     return value.encode("utf-8")[:maximum].decode("utf-8", "ignore")
 
 
-def _apply_patch(workspace: Path, patch: bytes, maximum: int) -> None:
+def _apply_patch(workspace: Path, task_dir: Path, patch: bytes, maximum: int) -> None:
     if not patch.strip():
         return
     if len(patch) > maximum:
         raise RuntimeError("remote patch exceeded the configured result bound")
-    patch_path = workspace.parent / "remote.patch.diff"
+    patch_path = task_dir / "remote.patch.diff"
     write_private_text(patch_path, patch.decode("utf-8", "replace"))
     git = canonical_git_executable()
     check = subprocess.run(
@@ -133,7 +133,7 @@ def run(spec_path: Path) -> int:
                 files = client.download_artifact(run_state.run_id, artifact_name)
                 _write_remote_artifact(task_dir, files)
                 patch = files.get("patch.diff", b"")
-                _apply_patch(workspace, patch, maximum)
+                _apply_patch(workspace, task_dir, patch, maximum)
                 text = files.get("result.txt", b"").decode("utf-8", "replace")
                 if not text:
                     text = "GitHub Actions worker completed; no textual result was returned.\n"
