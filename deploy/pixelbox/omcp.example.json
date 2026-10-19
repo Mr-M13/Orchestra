@@ -1,0 +1,68 @@
+{
+  "repository": "Mr-M13/Orchestra",
+  "project_root": "/home/hamed/orchestra-migration/checkout",
+  "state_dir": "/home/hamed/orchestra-migration/state",
+  "base_ref": "origin/main",
+  "principal": {
+    "identity": "orchestra:dedicated-workspace",
+    "authentication": "fixed-principal-behind-secure-mcp-tunnel",
+    "permissions": [
+      "status:read",
+      "tasks:submit",
+      "tasks:read",
+      "results:read",
+      "workers:read",
+      "tasks:cancel",
+      "approvals:read",
+      "host_operations:submit"
+    ]
+  },
+  "repository_profiles": {
+    "orchestra": {
+      "repository": "Mr-M13/Orchestra",
+      "project_root": "/home/hamed/orchestra-migration/checkout",
+      "base_ref": "origin/main"
+    }
+  },
+  "default_profile": "orchestra",
+  "workers": {
+    "ina": {
+      "command": ["codex"],
+      "codex_home": "/home/hamed/.codex-ina"
+    },
+    "codex": {
+      "command": ["codex"],
+      "codex_home": "/home/hamed/.codex"
+    },
+    "actions-codex": {
+      "adapter": "github_actions",
+      "agent": "codex",
+      "model": "gpt-5-codex",
+      "github_repository": "Mr-M13/Orchestra",
+      "workflow": "orchestra-worker.yml",
+      "workflow_ref": "main",
+      "poll_seconds": 10,
+      "credential_file": "/etc/orchestra/secrets/github-actions.token"
+    },
+    "actions-deepseek": {
+      "adapter": "github_actions",
+      "agent": "deepseek",
+      "model": "deepseek/deepseek-chat",
+      "github_repository": "Mr-M13/Orchestra",
+      "workflow": "orchestra-worker.yml",
+      "workflow_ref": "main",
+      "poll_seconds": 10,
+      "credential_file": "/etc/orchestra/secrets/github-actions.token"
+    }
+  },
+  "max_task_bytes": 65536,
+  "max_result_bytes": 65536,
+  "approval_ttl_seconds": 1800,
+  "max_worker_seconds": 1800,
+  "max_parallel_tasks": 2,
+  "startup_lease_seconds": 30,
+  "heartbeat_seconds": 15,
+  "sandbox_backend": "bubblewrap",
+  "task_approval_mode": "required",
+  "standing_authorizations": []
+}

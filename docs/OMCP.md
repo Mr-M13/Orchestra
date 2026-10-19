@@ -86,6 +86,59 @@ The host runner derives its command internally: pinned `platform/runtime/bin/run
 
 This operation is acceptance evidence only. It does not merge, push, deploy, contact production, use provider credentials, or prove anything beyond the exact target commit and harness run. Do not add a generic command host operation. A new operation type needs code, tests, documentation, a separate permission/risk review, and the same local approval boundary.
 
+## GitHub Actions ephemeral workers
+
+A `github_actions` worker is another owner-configured adapter. It does not accept
+a task-supplied repository, workflow, ref, command, model, container or
+credential. The owner-only worker object binds:
+
+```json
+{
+  "adapter": "github_actions",
+  "agent": "codex",
+  "model": "gpt-5-codex",
+  "github_repository": "Mr-M13/Orchestra",
+  "workflow": "orchestra-worker.yml",
+  "workflow_ref": "main",
+  "poll_seconds": 10,
+  "credential_file": "/etc/orchestra/secrets/github-actions.token"
+}
+```
+
+`agent` is `codex` or `deepseek`. The GitHub token is owner-only and should be a
+fine-grained token for the one repository with Actions read/write, Contents read
+and Metadata read. It is sent only in an HTTPS `Authorization` header. It is not
+written to the task spec, state, audit, logs or a command line.
+
+The coordinator creates the normal fresh worktree, then starts a detached runner
+that dispatches `.github/workflows/orchestra-worker.yml`. The workflow has
+`contents: read` and no persisted checkout credentials; it runs the selected
+agent on an ephemeral `ubuntu-latest` runner and uploads a bounded artifact named
+`omcp-<task_id>`. The coordinator downloads that exact artifact, rejects unsafe
+paths and oversized files, verifies that `patch.diff` applies, and records the
+result. Nothing is pushed or merged by the workflow.
+
+The runner uses the deterministic workflow run name `Orchestra <task_id>` to
+adopt an existing run after a crash instead of dispatching twice. It persists the
+run ID before polling. Cancellation writes a durable request, signals the local
+runner and asks GitHub to cancel the exact run. An orphaned run whose runner has
+disappeared is cancelled during reconciliation when its run ID is known.
+
+The workflow needs an `orchestra-workers` environment containing
+`OPENAI_API_KEY` and/or `DEEPSEEK_API_KEY`; do not add tunnel, approval or GitHub
+tokens there. The pinned Codex CLI runs the `codex` agent. The pinned OpenCode
+CLI runs the `deepseek` agent against the DeepSeek chat API, because current
+Codex releases no longer accept DeepSeek's chat wire protocol. Provider keys and
+OpenCode runtime directories are kept outside the uploaded artifact. This GitHub
+Actions DeepSeek worker is distinct from the direct, response-only DeepSeek
+adapter described above.
+
+Linux uses bubblewrap instead of Seatbelt. Filesystem access remains
+deny-by-default. For a policy that needs provider egress, bubblewrap shares the
+network namespace because it cannot filter destinations by host; add host
+firewall policy if destination filtering is required. Routine Codex work denies
+the network namespace entirely.
+
 ## Configure on the worker Mac
 
 Use Python 3.11 or newer and a current Codex CLI. Create a state directory outside the project checkout and an owner-only configuration outside the repository, for example `~/Library/Application Support/Orchestra/omcp.json`:
@@ -234,7 +287,9 @@ The installer compiles an accessory macOS app, binds the portal to `127.0.0.1:87
 
 The portal already fails closed for non-loopback bindings. Remote mode requires all of: an explicit non-wildcard interface address, `--allow-remote`, a server certificate/key, a client CA, TLS 1.3, and a valid client certificate. Authentication, session validation, CSRF, task lookup, and authorization remain server-side. The local approval socket is never bound, proxied, or exposed to the network; only the portal process may use it.
 
-Remote mode is deliberately not installed or enabled by the Mac installer. Before moving this component to PixelBox, provision device-bound client identities, terminate TLS in the approval component itself or a comparably trusted local boundary, verify Tailscale ACLs as defense in depth, test revocation and expiry, and define how the remote component sends an authenticated decision to the Mac coordinator without forwarding the socket. Until that protocol is implemented and reviewed, PixelBox/iPhone approval is design-ready but unavailable.
+Remote mode is deliberately not installed or enabled by the Mac installer. Before moving this component to PixelBox, provision device-bound client identities, terminate TLS in the approval component itself or a comparably trusted local boundary, verify Tailscale ACLs as defense in depth, test revocation and expiry, and define how the remote component sends an authenticated decision to the coordinator without forwarding the socket. Until that protocol is implemented and reviewed, PixelBox/iPhone approval is design-ready but unavailable.
+
+The PixelBox systemd deployment runs the coordinator as a persistent Unix-socket MCP server and gives the tunnel client only `omcp.mcp_proxy` over stdio. The proxy and socket are owner-only and carry no identity of their own; fixed-principal authentication still comes from the coordinator environment and the verified tunnel/app boundary.
 
 ## Verification
 
