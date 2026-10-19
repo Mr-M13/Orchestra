@@ -1,6 +1,6 @@
 # Orchestra MCP task control (OMCP) v1
 
-OMCP is a local MCP server that lets an authenticated ChatGPT tunnel submit and observe Orchestra worker tasks directly. It deliberately remains a narrow execution adapter: ChatGPT chooses work, a consequence class, an allowlisted repository profile, and workers; server-owned policy decides whether a configured standing authorization applies, otherwise a local human decides approval. OMCP validates the request, records intent durably, runs one worker at a time and reports evidence.
+OMCP is a local MCP server that lets an authenticated ChatGPT tunnel submit and observe Orchestra worker tasks directly. It deliberately remains a narrow execution adapter: ChatGPT chooses work, a consequence class, an allowlisted repository profile, and workers; server-owned policy decides whether a configured standing authorization applies, otherwise a local human decides approval. OMCP validates the request, records intent durably, schedules work within owner-configured capacity and reports evidence.
 
 OMCP does not replace Desktop Commander or the GitHub Issue Mac Bridge. Keep both available until the direct path has passed tunnel and target-Mac end-to-end testing.
 
@@ -14,13 +14,13 @@ OMCP does not replace Desktop Commander or the GitHub Issue Mac Bridge. Keep bot
 | `task_status` | `tasks:read` | Status for one task. |
 | `list_tasks` | `tasks:read` | Recent tasks, optionally filtered by status. |
 | `task_result` | `results:read` | Bounded final worker message for a terminal task. |
-| `worker_availability` | `workers:read` | Configured workers and the single execution slot. |
+| `worker_availability` | `workers:read` | Configured workers, active count and configured execution limit. |
 | `cancel_task` | `tasks:cancel` | Cancel queued work or request termination of a running process group. |
 | `list_approvals` | `approvals:read` | Tasks waiting at the execution gate. |
 
 Task states are `accepted`, `approval_required`, `starting`, `running`, `cancel_requested`, `succeeded`, `failed`, `cancelled`, `rejected` or `interrupted`. A successful worker exit is an execution result, not independent verification.
 
-`submit_task` requires an explicit `repository_profile` in its published MCP schema. OMCP resolves that allowlisted identifier from its owner-only configuration and never accepts a path, URL, ref, or executable in a task request. Multi-repository deployments also reject an omitted profile at runtime before persisting a task, so older or non-validating clients cannot silently select the wrong repository. The controller retains the legacy implicit `default` profile only for direct single-repository callers. Each request declares a `consequence_class`; omission defaults to `unclassified`. When `task_approval_mode` is `required` (the default), unclassified work requires explicit approval. When the owner-only configuration sets the mode to `disabled`, valid tasks enter the single-worker queue automatically. Retrying the same request and content returns the existing acknowledgement. Reusing a request ID with different content, profile, or consequence class fails closed.
+`submit_task` requires an explicit `repository_profile` in its published MCP schema. OMCP resolves that allowlisted identifier from its owner-only configuration and never accepts a path, URL, ref, or executable in a task request. Multi-repository deployments also reject an omitted profile at runtime before persisting a task, so older or non-validating clients cannot silently select the wrong repository. The controller retains the legacy implicit `default` profile only for direct single-repository callers. Each request declares a `consequence_class`; omission defaults to `unclassified`. When `task_approval_mode` is `required` (the default), unclassified work requires explicit approval. When the owner-only configuration sets the mode to `disabled`, valid tasks enter the scheduler queue automatically. Retrying the same request and content returns the existing acknowledgement. Reusing a request ID with different content, profile, or consequence class fails closed.
 
 `submit_host_operation` is a separate authority boundary. Its request contains only an idempotency key, an owner-configured operation ID, and a full 40-character commit SHA already present in the operation's configured repository. It cannot name an executable, script, path, environment variable, Docker image, Docker argument, Git ref, URL, or credential. Every host operation is persisted as `approval_required`; standing authorization never applies.
 
@@ -34,11 +34,11 @@ The configured `authentication` value is an audit description only. Environment 
 
 Each principal receives explicit permissions. Missing authority fails closed. At startup, OMCP requires both `OMCP_TUNNEL_AUTHENTICATED=1` and an `OMCP_AUTHENTICATED_CALLER` value equal to the owner-only configured principal identity. These values are a local operator assertion that the dedicated tunnel/app boundary was verified; Secure MCP Tunnel does not supply or attest them. A launcher must not set them merely because the tunnel client has a valid runtime key or because a request arrived over the tunnel. Record the access-control evidence and review it whenever app or workspace membership changes. This implementation supports one fixed principal per dedicated tunnel process, not individual per-request user identities. See the [Secure MCP Tunnel permissions and association model](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels#permissions-and-access) and [workspace association guidance](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels#associate-tunnels-with-the-right-organizations-and-workspaces).
 
-Every submitted task is evaluated by server-owned approval policy; the request cannot change that policy. `task_approval_mode` defaults to `required`. In required mode, only `routine_development` may match a standing authorization, and only for the exact repository profiles and workers named in the owner-only configuration. `production_deployment`, `destructive_operation`, `security_change`, and `unclassified` require a fresh explicit decision. Setting the owner-only configuration to `"task_approval_mode": "disabled"` disables all per-task approval requests; every otherwise-valid task is automatically authorized and audited before it enters the existing single-worker queue.
+Every submitted task is evaluated by server-owned approval policy; the request cannot change that policy. `task_approval_mode` defaults to `required`. In required mode, only `routine_development` may match a standing authorization, and only for the exact repository profiles and workers named in the owner-only configuration. `production_deployment`, `destructive_operation`, `security_change`, and `unclassified` require a fresh explicit decision. Setting the owner-only configuration to `"task_approval_mode": "disabled"` disables the general per-task approval gate; otherwise-valid Codex, Ina, and OpenCode tasks are automatically authorized and audited before entering the scheduler queue, while direct DeepSeek requests still require a fresh local decision.
 
 Disabling task approvals does not disable principal permissions, repository/profile allowlists, origin verification, fresh worktrees, worker sandboxing, the global execution limit, cancellation, result bounds, or audit logging. It does remove the human decision gate for production, destructive, security, and unclassified tasks. Treat access to the fixed-principal app and owner-only configuration as authority to execute any task allowed by those remaining controls.
 
-The remote MCP surface cannot decide explicit approvals. A local operator must run `python3 -m omcp.approval --config <config> --task-id <id> --decision approve|reject` from an interactive Mac terminal while the OMCP service is running. The command communicates with the active coordinator through an owner-only Unix socket and a per-process owner-only capability file in `state_dir`; neither is exposed as an MCP tool or passed to workers. It displays the task ID, request ID, fixed principal, worker, repository, consequence class, title, complete instructions, request time, expiry time and intended decision. The operator must type the exact decision plus task ID and enter a reason. Pending requests expire after `approval_ttl_seconds` (30 minutes by default); expired requests are rejected, audited and cannot start a worker. The local approval actor is separate from the tunnel submitter. Task input is untrusted and cannot alter sandbox or approval settings. Workers:
+The remote MCP surface cannot decide explicit approvals. A local operator must run `python3 -m omcp.approval --config <config> --task-id <id> --decision approve|reject` from an interactive Mac terminal while the OMCP service is running. The command communicates with the active coordinator through an owner-only Unix socket and a per-process owner-only capability file in `state_dir`; neither is exposed as an MCP tool or passed to workers. It displays the task ID, request ID, fixed principal, worker, repository, consequence class, title, complete instructions, request time, expiry time and intended decision. The operator must type the exact decision plus task ID and enter a reason. Pending requests expire after `approval_ttl_seconds` (30 minutes by default); expired requests are rejected, audited and cannot start a worker. The local approval actor is separate from the tunnel submitter. Task input is untrusted and cannot alter sandbox or approval settings. Codex and Ina workers retain their existing adapter and:
 
 - invoke only the canonical Codex CLI executable, resolved and verified at configuration load and again by the runner; configured CLI arguments and wrappers are rejected;
 - receive only the explicitly permitted `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_ALL` and `CODEX_HOME` variables, plus `GIT_TERMINAL_PROMPT=0`; tunnel credentials, caller markers and proxy variables are not forwarded;
@@ -46,13 +46,23 @@ The remote MCP surface cannot decide explicit approvals. A local operator must r
 - use a fresh `omcp/task-<id>` Git branch and worktree from the configured base ref;
 - retain prompts, logs, results and worktrees in the private state directory for inspection.
 
+DeepSeek is a direct, response-only HTTPS adapter, not an OpenCode alias. It has no configured executable and never launches a model-directed subprocess or shell. Each task still gets the normal fresh worktree, but the adapter cannot edit it. A macOS Seatbelt profile constrains the runner to its private task files, the worktree, the owner-only credential file, and TCP to `api.deepseek.com:443`; its process environment excludes tunnel and provider variables. The adapter sends only to the fixed `/v1/chat/completions` endpoint, has the configured 60–7200 second deadline and result-byte cap, bounds the HTTP body before parsing, retains only sanitized assistant text, and emits a neutral failure result without provider diagnostics. DeepSeek always requires a fresh local approval, even if the general `task_approval_mode` is disabled.
+
+OpenCode is independent. Its only accepted executable is the reviewed absolute OpenCode Desktop CLI, `/Users/hamed/Library/Application Support/ai.opencode.desktop/cli/2.0.32-arm64/opencode-cli`; wrappers, aliases, and configured flags are rejected. The owner selects a provider/model pair from the owner-only `opencode_model_allowlist`; the runner accepts only the supported `openai` or `deepseek` provider endpoints and invokes exactly `opencode-cli run --standalone --format json --model <selected-model> --file <private-prompt> ...`, never `--auto`. It starts with a private home/config, a separate owner-only credential file, a generated deny-by-default policy, and a Seatbelt profile restricted to its selected provider host, worktree, prompt, credential and runtime directories. Shell, external-directory, web, skills and subagents are denied. OpenCode cannot receive standing authorization and provider output is discarded; setup/provider failures fail closed rather than falling back or claiming success.
+
 The state directory and its files are owner-only. State updates are atomic. `audit.jsonl` is append-only and fsynced for each event; it records principal, authentication context, action, outcome and safe metadata, but not task instructions or worker output. Result retrieval is size-bounded.
 
 ## Repository profiles
 
 V1 configuration remains valid and describes one implicit `default` profile. A multi-repository deployment adds `repository_profiles` and `default_profile`. Every profile binds a stable ID to one GitHub repository, one existing local checkout, and one `origin/<branch>` base ref. OMCP validates the selected ID before persisting a task, records the resolved profile, repository, and ref in task status and local approval review, checks the checkout's HTTPS GitHub origin at worktree creation, and creates the worktree under a profile-specific private state path.
 
-The current global execution limit remains one. Repository profiles prepare task isolation and auditing for independent lanes; they do not enable concurrent execution. Any future lane limit must retain the configured approval policy, distinct worktrees and branches, durable shared-state admission, cancellation and restart recovery tests before it can increase above one.
+### Parallel scheduler and reservations
+
+`max_parallel_tasks` is an owner-only operating limit from 1 through 64. Omitting it preserves the previous single-task behavior. The initial voluntary operating policy is `2`; that value is configuration, not a code ceiling, so a reviewed installation can later select 4, 8 or more lanes without changing the scheduler. Each configured worker still runs at most one task at a time.
+
+Admission is durable and server-derived. Before worktree or process side effects, OMCP atomically changes an accepted task to `starting` and records a lane, worker, normalized repository identity, access mode and private startup lease. A writer conflicts with every active task for the same repository, even when different repository profile IDs or checkouts name it. A read-only standing-authorized task may share its repository with other readers; callers cannot declare read-only access themselves. Every task retains a distinct branch and worktree.
+
+Queue order is FIFO within each repository and round-robin across repositories using a durable cursor. A blocked repository head is not bypassed by younger work from that repository. Completion, cancellation, startup failure and interruption release the reservation. A restarted coordinator adopts a runner only when its owner-only lease matches the persisted task and lease IDs. Missing or mismatched startup leases expire fail-closed; a completion record already written during the PID-persistence crash window remains authoritative. The state-directory lock still permits only one local coordinator, so these leases are process-recovery records, not multi-host election authority.
 
 ## Standing authorization
 
@@ -100,6 +110,9 @@ Use Python 3.11 or newer and a current Codex CLI. Create a state directory outsi
       "host_operations:submit"
     ]
   },
+  "opencode_model_allowlist": {
+    "openai": ["openai/gpt-4.1"]
+  },
   "workers": {
     "ina": {
       "command": ["codex"],
@@ -108,11 +121,27 @@ Use Python 3.11 or newer and a current Codex CLI. Create a state directory outsi
     "codex": {
       "command": ["codex"],
       "codex_home": "/Users/ACCOUNT/.codex"
+    },
+    "opencode": {
+      "adapter": "opencode",
+      "command": ["/Users/hamed/Library/Application Support/ai.opencode.desktop/cli/2.0.32-arm64/opencode-cli"],
+      "provider": "openai",
+      "model": "openai/gpt-4.1",
+      "credential_file": "/Users/ACCOUNT/Library/Application Support/Orchestra/credentials/opencode-openai-api-key"
+    },
+    "deepseek": {
+      "adapter": "deepseek",
+      "provider": "deepseek",
+      "model": "deepseek/deepseek-chat",
+      "credential_file": "/Users/ACCOUNT/Library/Application Support/Orchestra/credentials/deepseek-api-key"
     }
   },
   "max_task_bytes": 65536,
   "max_result_bytes": 65536,
   "approval_ttl_seconds": 1800,
+  "max_worker_seconds": 1800,
+  "max_parallel_tasks": 2,
+  "startup_lease_seconds": 30,
   "task_approval_mode": "required",
   "standing_authorizations": [
     {
@@ -125,6 +154,34 @@ Use Python 3.11 or newer and a current Codex CLI. Create a state directory outsi
   ]
 }
 ```
+
+### Add OpenCode and DeepSeek without changing the live service
+
+Do not edit a running `omcp.json`, restart a live tunnel, or activate a new provider before the checks below pass. Build a separate owner-only candidate configuration first, retaining the exact existing principal, profiles, Codex/Ina workers, approval mode, and standing grants. Add the two worker objects above to that candidate only.
+
+Create each provider credential locally without putting it in shell history, a command line, a task prompt, or a log. The two files are distinct, owner-only files:
+
+```sh
+umask 077
+mkdir -p "$HOME/Library/Application Support/Orchestra/credentials"
+read -rs 'DEEPSEEK_API_KEY: ' OMCP_DEEPSEEK_KEY
+printf '%s' "$OMCP_DEEPSEEK_KEY" > "$HOME/Library/Application Support/Orchestra/credentials/deepseek-api-key"
+unset OMCP_DEEPSEEK_KEY
+chmod 600 "$HOME/Library/Application Support/Orchestra/credentials/deepseek-api-key"
+```
+
+Validate the fixed installed CLI and candidate configuration without starting OMCP or a tunnel:
+
+```sh
+OPENCODE_CLI='/Users/hamed/Library/Application Support/ai.opencode.desktop/cli/2.0.32-arm64/opencode-cli'
+"$OPENCODE_CLI" --version
+"$OPENCODE_CLI" run --help
+python3 -c 'from pathlib import Path; from omcp.controller import Config; Config.load(Path("/absolute/path/to/omcp-candidate.json")); print("candidate configuration valid")'
+```
+
+The expected CLI version is `2.0.32`; help must show `run`, `--standalone`, `--format`, and `--file`. Do not issue a provider request against a production worktree as a validation step. In a disposable local clone with separate temporary state, run the unit suite, start a separate candidate server, submit a harmless explicitly approved task to `deepseek`, and confirm that it either completes or reports the provider error. Check that `runner.json`, `state.json`, and `audit.jsonl` contain no credential value; OpenCode stream output is deliberately discarded, so no `worker.log` is created for it. Only after those checks pass may the local operator manually merge the reviewed candidate worker objects into a stopped service configuration and start a new service process. This change does not authorize a deployment, push, live tunnel modification, or production activation.
+
+### Enable the bounded Delnavazan host operation
 
 Enable the Delnavazan operation only in a multi-repository configuration that already has a `delnavazan` profile. Pin `harness_commit` to a reviewed Delnavazan commit containing the trusted runtime harness; updating that pin is an owner configuration change and should follow review. The operation type and fields are fixed—configuration cannot substitute a command or arguments:
 
@@ -201,7 +258,7 @@ Then verify through the configured tunnel, not only by calling the Python classe
 8. Inspect the private audit log and worktree locally. Confirm the authorization mode, grant ID, and consequence class are recorded, while task instructions and worker output are absent.
 9. Submit a harmless explicit-approval task. Confirm exactly one macOS notification appears, clicking each action opens the matching full-detail page, reject one request, approve another, and retrieve its terminal result through OMCP. Restart the coordinator and both approval agents with a pending request and confirm it remains visible without duplicate delivery or execution.
 10. In a non-production configuration, enable the Delnavazan operation with a reviewed harness commit. Confirm unknown operation IDs, abbreviated or missing commits, caller command fields, uncached images, pulls, non-private mounts, host networking, and unapproved requests all fail closed. Approve one exact harmless commit locally; verify the audit binds both SHAs, the Docker network is internal, direct containers use no network, teardown runs, and the result/log contain no credentials. Cancel a second run and confirm terminal reconciliation. Do not use a production checkout or production data.
-10. In a dedicated test configuration, set `task_approval_mode` to `disabled`. Submit harmless tasks for `unclassified` and a protected consequence class. Confirm both enter the queue without appearing in `list_approvals`, each records `authorization.mode=automatic` and `approval.status=not_required`, and `bridge_status` reports `task_approval_mode=disabled`. Restore the intended policy after testing.
+11. In a dedicated test configuration, set `task_approval_mode` to `disabled`. Submit harmless tasks for `unclassified` and a protected consequence class. Confirm both enter the queue without appearing in `list_approvals`, each records `authorization.mode=automatic` and `approval.status=not_required`, and `bridge_status` reports `task_approval_mode=disabled`. Confirm direct DeepSeek tasks and host operations still remain pending for explicit local approval. Restore the intended policy after testing.
 
 Do not disable the Bridge or Desktop Commander on the strength of unit tests alone. The final replacement gate requires the authenticated ChatGPT tunnel, target Mac, real Codex profile, Git worktree creation, completion/result retrieval and cancellation path to pass end to end.
 
@@ -209,8 +266,7 @@ Do not disable the Bridge or Desktop Commander on the strength of unit tests alo
 
 The detached runner writes a completion record even when the MCP server restarts. On startup OMCP reconciles completion records and live runner PIDs. A disappeared runner without a completion record becomes `interrupted`; OMCP does not retry it automatically.
 
-V1 intentionally has one global execution slot shared by workers and host operations, local-file authoritative state, fixed per-process principal authority and no autonomous scheduling, retry, merge, deployment or outcome-verification decisions. Standing authorization permits only bounded routine worker execution; host operations always require local approval. Those later decisions remain with ChatGPT or a human operator.
-V1 intentionally has one global execution slot, local-file authoritative state, fixed per-process principal authority and no autonomous retry, merge, deployment or outcome-verification decisions. Standing authorization permits only bounded routine worker execution. When task approvals are disabled, scheduling from the accepted queue is automatic, but completion still does not prove correctness, merge, deployment, or end-to-end success.
+OMCP has local-file authoritative state, configurable local parallel capacity, fixed per-process principal authority and no autonomous retry, merge, deployment or outcome-verification decisions. Workers and host operations consume scheduler lanes and obey the same repository reservations; host operations always require local approval. Standing authorization permits only bounded routine worker execution. When general task approvals are disabled, scheduling eligible worker tasks from the accepted queue is automatic, but direct DeepSeek tasks and host operations still require explicit local approval. Completion does not prove correctness, merge, deployment or end-to-end success.
 
 ### Migration to individual identity and roles
 

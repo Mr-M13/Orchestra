@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from omcp.runner import RunnerTerminated, atomic_json
+from omcp.runner import RunnerTerminated, atomic_json, write_startup_lease
 
 
 def utc_now() -> str:
@@ -56,6 +56,7 @@ def _safe_path(value: Any, parent: Path | None = None) -> Path:
 def run(spec_path: Path) -> int:
     spec_path = spec_path.resolve(strict=True)
     spec = json.loads(spec_path.read_text())
+    write_startup_lease(spec_path, spec)
     if spec.get("operation_type") != "delnavazan_mariadb_acceptance_v1":
         raise ValueError("unsupported host operation type")
     operation_id = spec.get("operation_id")
