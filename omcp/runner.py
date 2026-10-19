@@ -17,6 +17,7 @@ from omcp.controller import (
     DEEPSEEK_MODEL, DEEPSEEK_PROVIDER, OPENCODE_PROVIDER_ENDPOINTS,
     canonical_codex_executable, canonical_opencode_executable,
 )
+from omcp.platform import SandboxPolicy, sandbox_command
 
 
 class RunnerTerminated(BaseException):
@@ -129,10 +130,6 @@ def routine_command(executable: str, workspace: Path, result_path: Path,
     ]
 
 
-def _seatbelt_string(value: Path | str) -> str:
-    return str(value).replace("\\", "\\\\").replace('"', '\\"')
-
-
 def owner_only_credential(path: Path) -> None:
     try:
         stat = path.stat()
@@ -173,19 +170,18 @@ def opencode_command(executable: str, workspace: Path, prompt_path: Path, creden
     config_dir = runtime_dir / "config" / "opencode"
     config_dir.mkdir(parents=True, mode=0o700)
     atomic_json(config_dir / "opencode.json", opencode_policy(provider, model, credential_file))
-    profile = "\n".join((
-        "(version 1)", "(deny default)", '(import "system.sb")',
-        f'(allow file-read* (subpath "{_seatbelt_string(workspace)}"))',
-        f'(allow file-read* (literal "{_seatbelt_string(prompt_path)}"))',
-        f'(allow file-read* (literal "{_seatbelt_string(credential_file)}"))',
-        f'(allow file-read* (subpath "{_seatbelt_string(runtime_dir)}"))',
-        f'(allow file-write* (subpath "{_seatbelt_string(workspace)}"))',
-        f'(allow file-write* (subpath "{_seatbelt_string(runtime_dir)}"))',
-        f'(allow network-outbound (remote tcp "{_seatbelt_string(endpoint_host)}:443"))',
-    ))
-    return ["/usr/bin/sandbox-exec", "-p", profile, executable, "run", "--standalone", "--format", "json",
-            "--model", model, "--file", str(prompt_path),
-            "Read the attached task instructions and work only in the current workspace."]
+    policy = SandboxPolicy(
+        read_paths=(workspace, runtime_dir, Path(executable).resolve().parent),
+        read_files=(prompt_path, credential_file),
+        write_paths=(workspace, runtime_dir),
+        network_hosts=(endpoint_host,),
+        workdir=workspace,
+    )
+    return sandbox_command(policy, [
+        executable, "run", "--standalone", "--format", "json",
+        "--model", model, "--file", str(prompt_path),
+        "Read the attached task instructions and work only in the current workspace.",
+    ])
 
 
 def sanitize_provider_text(value: object, maximum: int) -> str:
