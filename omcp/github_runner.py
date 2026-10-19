@@ -130,7 +130,19 @@ def run(spec_path: Path) -> int:
                     exit_code = 1
                     error_type = "GitHubActionsConclusion"
                     break
-                files = client.download_artifact(run_state.run_id, artifact_name)
+                files = None
+                for attempt in range(12):
+                    try:
+                        files = client.download_artifact(run_state.run_id, artifact_name)
+                        break
+                    except GitHubActionsError:
+                        # Artifact registration can lag the completed run by a
+                        # few seconds.  Retry the same run identity; never
+                        # dispatch a replacement.
+                        if attempt == 11:
+                            raise
+                        time.sleep(5)
+                assert files is not None
                 _write_remote_artifact(task_dir, files)
                 patch = files.get("patch.diff", b"")
                 _apply_patch(workspace, task_dir, patch, maximum)
