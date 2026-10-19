@@ -14,9 +14,13 @@ from pathlib import Path
 from typing import Any
 
 from omcp.controller import (
-    DEEPSEEK_MODEL, DEEPSEEK_PROVIDER, OPENCODE_PROVIDER_ENDPOINTS,
+    DEEPSEEK_MODEL, DEEPSEEK_PROVIDER, OPENCODE_PROVIDER_BASE_PATHS,
+    OPENCODE_PROVIDER_ENDPOINTS,
     canonical_codex_executable, canonical_opencode_executable,
 )
+
+
+OPENCODE_INTERNAL_GIT = "/usr/bin/git"
 
 
 class RunnerTerminated(BaseException):
@@ -130,10 +134,38 @@ def routine_command(executable: str, workspace: Path, result_path: Path,
 
 
 def _seatbelt_string(value: Path | str) -> str:
-    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+    text = str(value)
+    if any(ord(character) < 0x20 or ord(character) == 0x7f for character in text):
+        raise ValueError("Seatbelt paths may not contain control characters")
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _seatbelt_metadata_rules(*values: Path | str) -> tuple[str, ...]:
+    paths: set[Path] = set()
+    for value in values:
+        path = Path(value)
+        paths.add(path)
+        paths.update(path.parents)
+    return tuple(
+        f'(allow file-read-metadata (literal "{_seatbelt_string(path)}"))'
+        for path in sorted(paths, key=lambda item: (len(item.parts), str(item)))
+    )
+
+
+def _seatbelt_parent_lookup_rules(*values: Path | str) -> tuple[str, ...]:
+    """Permit exact ancestor lookup without opening any ancestor subtree."""
+    parents: set[Path] = set()
+    for value in values:
+        parents.update(Path(value).parents)
+    return tuple(
+        f'(allow file-read* (literal "{_seatbelt_string(path)}"))'
+        for path in sorted(parents, key=lambda item: (len(item.parts), str(item)))
+    )
 
 
 def owner_only_credential(path: Path) -> None:
+    if any(character in str(path) for character in "{}\r\n\x00"):
+        raise ValueError("credential_file path contains unsupported characters")
     try:
         stat = path.stat()
     except FileNotFoundError:
@@ -144,12 +176,14 @@ def owner_only_credential(path: Path) -> None:
 
 def opencode_policy(provider: str, model: str, credential_file: Path) -> dict[str, Any]:
     endpoint = OPENCODE_PROVIDER_ENDPOINTS[provider]
+    base_path = OPENCODE_PROVIDER_BASE_PATHS[provider]
     model_id = model.rsplit("/", 1)[1]
     return {
         "$schema": "https://opencode.ai/config.json", "model": model, "update": "disable",
-        "providers": {provider: {"package": "@opencode/ai/providers/openai-compatible",
-            "settings": {"baseURL": f"https://{endpoint}/v1", "apiKey": "{file:" + str(credential_file) + "}",
-                         "timeout": 1_800_000}, "models": {model_id: {"modelID": model_id}}}},
+        "provider": {provider: {"npm": "@ai-sdk/openai-compatible",
+            "options": {"baseURL": f"https://{endpoint}{base_path}",
+                         "apiKey": "{file:" + str(credential_file) + "}",
+                         "timeout": 1_800_000}, "models": {model_id: {}}}},
         "policies": [{"action": "provider.use", "resource": "*", "effect": "deny"},
                      {"action": "provider.use", "resource": provider, "effect": "allow"},
                      *[{"action": "tool.use", "resource": f"{tool}:*", "effect": "deny"}
@@ -168,20 +202,35 @@ def opencode_command(executable: str, workspace: Path, prompt_path: Path, creden
                      runtime_dir: Path, provider: str, model: str, endpoint_host: str) -> list[str]:
     owner_only_credential(credential_file)
     if (provider not in OPENCODE_PROVIDER_ENDPOINTS or OPENCODE_PROVIDER_ENDPOINTS[provider] != endpoint_host
-            or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.:-]+", model)):
+            or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.:-]+", model)
+            or not model.startswith(provider + "/")):
         raise ValueError("invalid OpenCode provider or model")
     config_dir = runtime_dir / "config" / "opencode"
     config_dir.mkdir(parents=True, mode=0o700)
     atomic_json(config_dir / "opencode.json", opencode_policy(provider, model, credential_file))
     profile = "\n".join((
         "(version 1)", "(deny default)", '(import "system.sb")',
+        *_seatbelt_metadata_rules(
+            executable, workspace, prompt_path, credential_file, runtime_dir,
+        ),
+        *_seatbelt_parent_lookup_rules(
+            executable, workspace, prompt_path, credential_file, runtime_dir,
+        ),
+        "(allow process-fork)",
+        f'(allow process-exec (literal "{_seatbelt_string(executable)}"))',
+        f'(allow process-exec (literal "{OPENCODE_INTERNAL_GIT}"))',
+        f'(allow file-read* (literal "{_seatbelt_string(executable)}"))',
+        f'(allow file-read* (literal "{OPENCODE_INTERNAL_GIT}"))',
         f'(allow file-read* (subpath "{_seatbelt_string(workspace)}"))',
         f'(allow file-read* (literal "{_seatbelt_string(prompt_path)}"))',
         f'(allow file-read* (literal "{_seatbelt_string(credential_file)}"))',
         f'(allow file-read* (subpath "{_seatbelt_string(runtime_dir)}"))',
         f'(allow file-write* (subpath "{_seatbelt_string(workspace)}"))',
         f'(allow file-write* (subpath "{_seatbelt_string(runtime_dir)}"))',
-        f'(allow network-outbound (remote tcp "{_seatbelt_string(endpoint_host)}:443"))',
+        '(allow network-bind (local tcp "*:*"))',
+        '(allow network-inbound (local tcp "*:*"))',
+        '(allow network-outbound (remote tcp "localhost:*"))',
+        '(allow network-outbound (remote tcp "*:443"))',
     ))
     return ["/usr/bin/sandbox-exec", "-p", profile, executable, "run", "--standalone", "--format", "json",
             "--model", model, "--file", str(prompt_path),
