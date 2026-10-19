@@ -15,7 +15,7 @@ from omcp.controller import (
     TaskController, Worker,
 )
 from omcp.local_control import LocalApprovalServer, approval_request
-from omcp.runner import run as run_worker
+from omcp.runner import opencode_command, opencode_environment, run as run_worker
 from omcp.server import MCPServer, TOOLS, main as server_main
 
 
@@ -198,6 +198,64 @@ class ControllerTests(unittest.TestCase):
         audit = (self.state / "audit.jsonl").read_text()
         self.assertIn('"authorization_mode":"standing"', audit)
         self.assertNotIn("Change local code and run tests", audit)
+
+    def test_deepseek_worker_preserves_approval_idempotency_and_emits_no_credential_value(self):
+        credential = Path(self.temp.name) / "deepseek.key"
+        credential.write_text("never-log-this")
+        credential.chmod(0o600)
+        self.controller.close()
+        self.controller = TaskController(
+            Config(
+                "owner/repo", self.root, self.state, "origin/main",
+                {"deepseek": Worker(
+                    "deepseek", (), adapter="deepseek",
+                    provider="deepseek", model="deepseek/deepseek-chat",
+                    credential_file=str(credential),
+                )},
+                Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+                max_worker_seconds=600,
+            ),
+            popen=self.popen, workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: "11111111-1111-1111-1111-111111111111",
+        )
+        submitted = self.controller.submit_task(
+            "deepseek-request", "Inspect code", "Make no network changes", "deepseek", True,
+        )
+        self.assertEqual(submitted["status"], "approval_required")
+        replay = self.controller.submit_task(
+            "deepseek-request", "Inspect code", "Make no network changes", "deepseek", True,
+        )
+        self.assertTrue(replay["idempotent_replay"])
+        self.controller.resolve_approval(
+            submitted["task_id"], "approve", "Local operator approved",
+            approver_identity="local:test-operator",
+        )
+        spec = json.loads((self.state / "tasks" / submitted["task_id"] / "runner.json").read_text())
+        self.assertEqual(spec["adapter"], "deepseek")
+        self.assertEqual(spec["provider"], "deepseek")
+        self.assertEqual(spec["model"], "deepseek/deepseek-chat")
+        self.assertEqual(spec["command"], [])
+        self.assertEqual(spec["endpoint_host"], "api.deepseek.com")
+        self.assertEqual(spec["max_worker_seconds"], 600)
+        self.assertEqual(spec["credential_file"], str(credential))
+        self.assertNotIn("never-log-this", (self.state / "audit.jsonl").read_text())
+
+    def test_deepseek_remains_pending_when_global_approvals_are_disabled(self):
+        credential = Path(self.temp.name) / "deepseek.key"
+        credential.write_text("not-printed")
+        credential.chmod(0o600)
+        self.controller.close()
+        self.controller = TaskController(
+            Config("owner/repo", self.root, self.state, "origin/main", {
+                "deepseek": Worker("deepseek", (), adapter="deepseek", provider="deepseek",
+                                   model="deepseek/deepseek-chat", credential_file=str(credential)),
+            }, Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+            task_approval_mode="disabled"), popen=self.popen,
+            workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: "11111111-1111-1111-1111-111111111111")
+        task = self.controller.submit_task("direct-approval", "Review", "Do not edit", "deepseek")
+        self.assertEqual(task["status"], "approval_required")
+        self.assertEqual(self.popen.call_count, 0)
 
     def test_protected_and_unclassified_work_still_requires_explicit_approval(self):
         self.controller.close()
@@ -491,7 +549,251 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(len(result["result"]), 1024)
 
 
+    def test_parallel_claims_use_distinct_lanes_and_release_reservations(self):
+        self.controller.close()
+        ids = iter(f"{number:08d}-1111-1111-1111-111111111111" for number in range(1, 4))
+        profiles = {}
+        workers = {}
+        for number in range(1, 4):
+            root = Path(self.temp.name) / f"project-{number}"
+            root.mkdir()
+            profiles[f"repo-{number}"] = RepositoryProfile(
+                f"repo-{number}", f"owner/repo-{number}", root, "origin/main",
+            )
+            workers[f"worker-{number}"] = Worker(f"worker-{number}", ("codex",))
+        self.controller = TaskController(
+            Config(
+                "owner/repo-1", profiles["repo-1"].project_root, self.state, "origin/main",
+                workers, Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+                repository_profiles=profiles, default_profile="repo-1",
+                task_approval_mode="disabled", max_parallel_tasks=4,
+            ),
+            popen=self.popen, workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: next(ids),
+        )
+        submitted = [
+            self.controller.submit_task(
+                f"parallel-{number}", "Parallel", "Run independently",
+                f"worker-{number}", True, f"repo-{number}", "unclassified",
+            )
+            for number in range(1, 4)
+        ]
+
+        self.assertEqual([item["status"] for item in submitted], ["running"] * 3)
+        reservations = [
+            self.controller.state["tasks"][item["task_id"]]["reservation"]
+            for item in submitted
+        ]
+        self.assertEqual({item["lane"] for item in reservations}, {1, 2, 3})
+        self.assertTrue(all(item["status"] == "active" for item in reservations))
+        self.complete(submitted[1]["task_id"])
+        self.controller.tick()
+        self.assertEqual(reservations[1]["status"], "released")
+        self.assertEqual(self.controller.worker_availability()["execution_limit"], 4)
+
+    def test_repository_writer_conflict_blocks_second_profile_for_same_repository(self):
+        self.controller.close()
+        other = Path(self.temp.name) / "other-checkout"
+        other.mkdir()
+        ids = iter([
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        ])
+        profiles = {
+            "one": RepositoryProfile("one", "owner/shared", self.root, "origin/main"),
+            "two": RepositoryProfile("two", "OWNER/SHARED", other, "origin/main"),
+        }
+        self.controller = TaskController(
+            Config(
+                "owner/shared", self.root, self.state, "origin/main",
+                {"one": Worker("one", ("codex",)), "two": Worker("two", ("codex",))},
+                Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+                repository_profiles=profiles, default_profile="one",
+                task_approval_mode="disabled", max_parallel_tasks=2,
+            ),
+            popen=self.popen, workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: next(ids),
+        )
+        first = self.controller.submit_task(
+            "writer-one", "Write one", "Edit files", "one", True, "one", "unclassified",
+        )
+        second = self.controller.submit_task(
+            "writer-two", "Write two", "Edit files", "two", True, "two", "unclassified",
+        )
+
+        self.assertEqual(first["status"], "running")
+        self.assertEqual(second["status"], "accepted")
+        self.assertEqual(self.popen.call_count, 1)
+
+    def test_repository_round_robin_prevents_hot_repository_starvation(self):
+        self.controller.close()
+        other = Path(self.temp.name) / "fair-repo"
+        other.mkdir()
+        ids = iter([
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+            "33333333-3333-3333-3333-333333333333",
+        ])
+        profiles = {
+            "hot": RepositoryProfile("hot", "owner/hot", self.root, "origin/main"),
+            "other": RepositoryProfile("other", "owner/other", other, "origin/main"),
+        }
+        self.controller = TaskController(
+            Config(
+                "owner/hot", self.root, self.state, "origin/main",
+                {name: Worker(name, ("codex",)) for name in ("hot-1", "hot-2", "other")},
+                Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+                repository_profiles=profiles, default_profile="hot",
+                task_approval_mode="disabled", max_parallel_tasks=1,
+            ),
+            popen=self.popen, workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: next(ids),
+        )
+        first = self.controller.submit_task(
+            "hot-1", "Hot one", "Edit", "hot-1", True, "hot", "unclassified",
+        )
+        hot_waiting = self.controller.submit_task(
+            "hot-2", "Hot two", "Edit", "hot-2", True, "hot", "unclassified",
+        )
+        other_waiting = self.controller.submit_task(
+            "other", "Other", "Edit", "other", True, "other", "unclassified",
+        )
+        self.complete(first["task_id"])
+        self.controller.tick()
+
+        self.assertEqual(self.controller.task_status(other_waiting["task_id"])["status"], "running")
+        self.assertEqual(self.controller.task_status(hot_waiting["task_id"])["status"], "accepted")
+
+    def test_restart_adopts_matching_runner_lease_and_rejects_tampered_lease(self):
+        submitted = self.controller.submit_task(
+            "lease", "Lease", "Recover", "ina", True,
+        )
+        task = self.controller.state["tasks"][submitted["task_id"]]
+        self.controller._start = Mock()
+        self.controller.resolve_approval(
+            submitted["task_id"], "approve", "approved", "local:test-operator",
+        )
+        lease = task["startup_lease"]
+        lease_path = Path(lease["path"])
+        lease_path.parent.mkdir(parents=True, exist_ok=True)
+        lease_path.write_text(json.dumps({
+            "task_id": task["task_id"], "lease_id": lease["lease_id"],
+            "pid": os.getpid(), "started_at": "2026-10-19T00:00:00+00:00",
+        }))
+        self.controller.close()
+        self.controller = TaskController(
+            self.config, popen=self.popen, workspace_preparer=lambda *_: self.root,
+        )
+        self.assertEqual(self.controller.state["tasks"][task["task_id"]]["status"], "running")
+
+        recovered = self.controller.state["tasks"][task["task_id"]]
+        recovered.pop("runner_pid")
+        recovered["status"] = "starting"
+        recovered["startup_lease"]["expires_at"] = "2000-01-01T00:00:00+00:00"
+        lease_path.write_text(json.dumps({
+            "task_id": task["task_id"], "lease_id": "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            "pid": os.getpid(), "started_at": "2026-10-19T00:00:00+00:00",
+        }))
+        self.controller.reconcile()
+        self.assertEqual(recovered["status"], "interrupted")
+        self.assertEqual(recovered["failure"]["type"], "startup_lease_expired")
+        self.assertEqual(recovered["reservation"]["status"], "released")
+
+    def test_cancellation_during_startup_lease_becomes_terminal(self):
+        submitted = self.controller.submit_task(
+            "cancel-starting", "Cancel startup", "Wait for cancellation", "ina", True,
+        )
+        self.controller._start = Mock()
+        self.controller.resolve_approval(
+            submitted["task_id"], "approve", "approved", "local:test-operator",
+        )
+        task = self.controller.state["tasks"][submitted["task_id"]]
+
+        cancelled = self.controller.cancel_task(submitted["task_id"], "stop during startup")
+        self.assertEqual(cancelled["status"], "cancel_requested")
+        task["startup_lease"]["expires_at"] = "2000-01-01T00:00:00+00:00"
+        self.controller.reconcile()
+
+        self.assertEqual(task["status"], "cancelled")
+        self.assertEqual(task["reservation"]["status"], "released")
+
+
+
+
 class ConfigTests(unittest.TestCase):
+    def test_config_loads_independent_allowlisted_opencode_and_deepseek_workers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            credential = Path(directory) / "deepseek.key"
+            credential.write_text("not-printed")
+            credential.chmod(0o600)
+            opencode_credential = Path(directory) / "opencode.key"
+            opencode_credential.write_text("not-printed")
+            opencode_credential.chmod(0o600)
+            config_path = Path(directory) / "omcp.json"
+            config_path.write_text(json.dumps({
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(Path(directory) / "state"),
+                "opencode_model_allowlist": {"openai": ["openai/gpt-4.1"]},
+                "workers": {
+                    "opencode": {
+                        "adapter": "opencode",
+                        "command": ["/allowlisted/opencode-cli"],
+                        "provider": "openai", "model": "openai/gpt-4.1",
+                        "credential_file": str(opencode_credential),
+                    },
+                    "deepseek": {
+                        "adapter": "deepseek",
+                        "provider": "deepseek", "model": "deepseek/deepseek-chat",
+                        "credential_file": str(credential),
+                    },
+                },
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+                "max_worker_seconds": 600,
+            }))
+            os.chmod(config_path, 0o600)
+            with patch("omcp.controller.canonical_opencode_executable", return_value="/allowlisted/opencode-cli"):
+                config = Config.load(config_path)
+            self.assertEqual(config.max_worker_seconds, 600)
+            self.assertEqual(config.workers["opencode"].adapter, "opencode")
+            self.assertEqual(config.workers["opencode"].provider, "openai")
+            self.assertEqual(config.workers["deepseek"].adapter, "deepseek")
+            self.assertEqual(config.workers["deepseek"].provider, "deepseek")
+            self.assertEqual(config.workers["deepseek"].credential_file, str(credential.resolve()))
+
+    def test_config_rejects_unapproved_opencode_provider_command_and_credential_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            credential = Path(directory) / "deepseek.key"
+            credential.write_text("not-printed")
+            credential.chmod(0o644)
+            config_path = Path(directory) / "omcp.json"
+            raw = {
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(Path(directory) / "state"),
+                "workers": {"deepseek": {
+                    "adapter": "opencode", "command": ["/bin/sh", "-c", "anything"],
+                    "provider": "other", "model": "other/model", "credential_file": str(credential),
+                }},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+            }
+            config_path.write_text(json.dumps(raw))
+            os.chmod(config_path, 0o600)
+            with self.assertRaisesRegex(ValueError, "may not contain CLI arguments"):
+                Config.load(config_path)
+            raw["workers"]["deepseek"]["command"] = ["/allowlisted/opencode-cli"]
+            config_path.write_text(json.dumps(raw))
+            with self.assertRaisesRegex(ValueError, "opencode_model_allowlist"):
+                Config.load(config_path)
+            raw["workers"]["deepseek"].update({
+                "provider": "deepseek", "model": "deepseek/deepseek-chat",
+            })
+            raw["opencode_model_allowlist"] = {"deepseek": ["deepseek/deepseek-chat"]}
+            config_path.write_text(json.dumps(raw))
+            with self.assertRaisesRegex(ValueError, "owner-only regular file"):
+                Config.load(config_path)
     def test_config_loads_and_validates_task_approval_mode(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "project"
@@ -514,6 +816,32 @@ class ConfigTests(unittest.TestCase):
                 raw["task_approval_mode"] = "sometimes"
                 config_path.write_text(json.dumps(raw))
                 with self.assertRaisesRegex(ValueError, "must be required or disabled"):
+                    Config.load(config_path)
+
+    def test_config_supports_future_parallel_capacity_without_hardcoded_two(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            codex = Path(directory) / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            config_path = Path(directory) / "omcp.json"
+            raw = {
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(Path(directory) / "state"),
+                "workers": {"ina": {"command": [str(codex)]}},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+                "max_parallel_tasks": 8, "startup_lease_seconds": 45,
+            }
+            config_path.write_text(json.dumps(raw))
+            os.chmod(config_path, 0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                config = Config.load(config_path)
+                self.assertEqual(config.max_parallel_tasks, 8)
+                self.assertEqual(config.startup_lease_seconds, 45)
+                raw["max_parallel_tasks"] = 65
+                config_path.write_text(json.dumps(raw))
+                with self.assertRaisesRegex(ValueError, "between 1 and 64"):
                     Config.load(config_path)
 
     def test_config_loads_bounded_routine_standing_authorization(self):
@@ -663,6 +991,84 @@ class ConfigTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_deepseek_runner_uses_direct_https_and_never_retains_secret_or_raw_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt = root / "prompt"
+            prompt.write_text("task")
+            credential = root / "deepseek.key"
+            credential.write_text("never-log-this")
+            credential.chmod(0o600)
+            spec = root / "spec.json"
+            spec.write_text(json.dumps({
+                "adapter": "deepseek", "command": [],
+                "provider": "deepseek", "model": "deepseek/deepseek-chat",
+                "endpoint_host": "api.deepseek.com", "max_response_bytes": 1024,
+                "credential_file": str(credential), "max_worker_seconds": 600,
+                "workspace": str(root), "prompt_path": str(prompt),
+                "log_path": str(root / "log"), "result_path": str(root / "result"),
+                "completion_path": str(root / "completion"),
+            }))
+            parent_environment = {
+                "PATH": "/trusted/bin", "OPENAI_API_KEY": "tunnel-secret",
+                "DEEPSEEK_API_KEY": "other-secret", "OMCP_AUTHENTICATED_CALLER": "principal",
+            }
+            response = Mock(status=200)
+            response.read.return_value = b'{"choices":[{"message":{"content":"safe response"}}]}'
+            connection = Mock()
+            connection.getresponse.return_value = response
+            with patch.dict(os.environ, parent_environment, clear=True), \
+                    patch("omcp.runner.http.client.HTTPSConnection", return_value=connection) as connect, \
+                    patch("omcp.runner.signal.setitimer") as setitimer:
+                self.assertEqual(run_worker(spec), 0)
+            self.assertEqual(connect.call_args.args[:2], ("api.deepseek.com", 443))
+            self.assertEqual(setitimer.call_args_list[0].args, (signal.ITIMER_REAL, 600))
+            self.assertEqual(setitimer.call_args_list[-1].args, (signal.ITIMER_REAL, 0))
+            self.assertFalse((root / "log").exists())
+            self.assertEqual((root / "result").read_text(), "safe response")
+            self.assertNotIn("never-log-this", (root / "completion").read_text())
+
+    def test_opencode_runner_rejects_incomplete_spec_before_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt = root / "prompt"
+            prompt.write_text("task")
+            spec = root / "spec.json"
+            spec.write_text(json.dumps({
+                "adapter": "opencode", "command": ["/allowlisted/opencode-cli"],
+                "provider": "other", "model": "other/model", "max_worker_seconds": 600,
+                "workspace": str(root), "prompt_path": str(prompt),
+                "log_path": str(root / "log"), "result_path": str(root / "result"),
+                "completion_path": str(root / "completion"),
+            }))
+            with patch("omcp.runner.canonical_opencode_executable", return_value="/allowlisted/opencode-cli"), \
+                    patch("omcp.runner.subprocess.run") as execute:
+                with self.assertRaisesRegex(ValueError, "specification is incomplete"):
+                    run_worker(spec)
+                execute.assert_not_called()
+
+    def test_deepseek_failure_is_sanitized_and_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            credential = root / "deepseek.key"
+            credential.write_text("not-printed")
+            credential.chmod(0o600)
+            prompt = root / "prompt"
+            prompt.write_text("task")
+            spec = root / "spec.json"
+            spec.write_text(json.dumps({
+                "adapter": "deepseek", "command": [], "provider": "deepseek",
+                "model": "deepseek/deepseek-chat", "endpoint_host": "api.deepseek.com",
+                "credential_file": str(credential), "max_worker_seconds": 60,
+                "max_response_bytes": 1024, "workspace": str(root), "prompt_path": str(prompt),
+                "log_path": str(root / "log"), "result_path": str(root / "result"),
+                "completion_path": str(root / "completion"),
+            }))
+            with patch("omcp.runner.http.client.HTTPSConnection", side_effect=OSError("secret diagnostic")):
+                self.assertEqual(run_worker(spec), 1)
+            self.assertEqual((root / "result").read_text(),
+                             "DeepSeek request failed; no provider response was retained.\n")
+            self.assertNotIn("secret diagnostic", (root / "completion").read_text())
     def test_runner_passes_only_explicitly_permitted_environment(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -734,6 +1140,50 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(command[command.index("--sandbox") + 1], "workspace-write")
             self.assertEqual(command[-1], "-")
 
+    def test_runner_publishes_owner_generated_startup_lease(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt = root / "prompt"
+            prompt.write_text("task")
+            lease = root / "lease.json"
+            spec = root / "runner.json"
+            task_id = "11111111-1111-1111-1111-111111111111"
+            lease_id = "22222222-2222-2222-2222-222222222222"
+            spec.write_text(json.dumps({
+                "command": ["codex"], "workspace": str(root),
+                "prompt_path": str(prompt), "log_path": str(root / "log"),
+                "result_path": str(root / "result"),
+                "completion_path": str(root / "completion"),
+                "task_id": task_id, "lease_id": lease_id, "lease_path": str(lease),
+            }))
+            with patch("omcp.runner.canonical_codex_executable", return_value="/codex"), \
+                    patch("omcp.runner.subprocess.run", return_value=Mock(returncode=0)):
+                self.assertEqual(run_worker(spec), 0)
+            record = json.loads(lease.read_text())
+            self.assertEqual(record["task_id"], task_id)
+            self.assertEqual(record["lease_id"], lease_id)
+            self.assertEqual(record["pid"], os.getpid())
+
+    def test_runner_rejects_startup_lease_outside_private_task_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt = root / "prompt"
+            prompt.write_text("task")
+            spec = root / "runner.json"
+            spec.write_text(json.dumps({
+                "command": ["codex"], "workspace": str(root),
+                "prompt_path": str(prompt), "log_path": str(root / "log"),
+                "result_path": str(root / "result"),
+                "completion_path": str(root / "completion"),
+                "task_id": "11111111-1111-1111-1111-111111111111",
+                "lease_id": "22222222-2222-2222-2222-222222222222",
+                "lease_path": str(root.parent / "lease.json"),
+            }))
+            with patch("omcp.runner.subprocess.run") as execute:
+                with self.assertRaisesRegex(ValueError, "private task directory"):
+                    run_worker(spec)
+                execute.assert_not_called()
+
     def test_runner_writes_completion_record_when_terminated(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -802,7 +1252,7 @@ class RunnerTests(unittest.TestCase):
                 "completion_path": str(root / "completion"), "codex_home": None,
             }))
             with patch("omcp.runner.subprocess.run") as execute:
-                with self.assertRaisesRegex(ValueError, "exactly one Codex executable"):
+                with self.assertRaisesRegex(ValueError, "exactly one executable"):
                     run_worker(spec)
                 execute.assert_not_called()
 

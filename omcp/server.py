@@ -76,7 +76,7 @@ TOOLS = [
     },
     {
         "name": "worker_availability",
-        "description": "List configured workers and whether the execution slot is available.",
+        "description": "List configured workers and current scheduler capacity.",
         "inputSchema": _object({}),
     },
     {
@@ -139,7 +139,7 @@ class MCPServer:
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": "orchestra-omcp", "version": __version__},
-                "instructions": "Submit bounded implementation tasks; Orchestra executes one worker at a time.",
+                "instructions": "Submit bounded implementation tasks; Orchestra schedules within owner-configured parallel capacity and repository conflict rules.",
             })
         if method == "ping":
             return self._result(request_id, {})

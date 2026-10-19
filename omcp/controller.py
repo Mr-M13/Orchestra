@@ -19,6 +19,16 @@ from urllib.parse import urlparse
 
 TERMINAL = {"succeeded", "failed", "cancelled", "rejected", "interrupted"}
 ACTIVE = {"starting", "running", "cancel_requested"}
+WORKER_ADAPTERS = {"codex", "opencode", "deepseek"}
+OPENCODE_CLI = Path(
+    "/Users/hamed/Library/Application Support/ai.opencode.desktop/cli/2.0.32-arm64/opencode-cli",
+)
+DEEPSEEK_PROVIDER = "deepseek"
+DEEPSEEK_MODEL = "deepseek/deepseek-chat"
+OPENCODE_PROVIDER_ENDPOINTS = {
+    "deepseek": "api.deepseek.com",
+    "openai": "api.openai.com",
+}
 PERMISSIONS = {
     "status:read", "tasks:submit", "tasks:read", "results:read",
     "workers:read", "tasks:cancel", "approvals:read",
@@ -76,11 +86,54 @@ def canonical_codex_executable(value: str) -> str:
     return str(expected)
 
 
+def canonical_opencode_executable(value: str) -> str:
+    """Accept only the reviewed, version-pinned OpenCode desktop CLI."""
+    if not isinstance(value, str) or not value:
+        raise ValueError("worker command must be the canonical OpenCode executable")
+    try:
+        candidate = Path(value).expanduser().resolve(strict=True)
+        expected = OPENCODE_CLI.resolve(strict=True)
+    except FileNotFoundError:
+        raise ValueError("OpenCode CLI is not installed at the allowlisted path") from None
+    if candidate != expected or not candidate.is_file() or not os.access(candidate, os.X_OK):
+        raise ValueError("worker command does not resolve to the allowlisted OpenCode executable")
+    return str(expected)
+
+
+def _seatbelt_string(value: Path | str) -> str:
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def deepseek_runner_command(spec_path: Path, task_dir: Path, workspace: Path,
+                            credential_file: Path) -> list[str]:
+    """Run the direct adapter with only its private files and DeepSeek egress."""
+    source_root = Path(__file__).resolve().parent.parent
+    profile = "\n".join((
+        "(version 1)", "(deny default)", '(import "system.sb")',
+        f'(allow file-read* (subpath "{_seatbelt_string(source_root)}"))',
+        f'(allow file-read* (subpath "{_seatbelt_string(workspace)}"))',
+        f'(allow file-read* (subpath "{_seatbelt_string(task_dir)}"))',
+        f'(allow file-read* (literal "{_seatbelt_string(spec_path)}"))',
+        f'(allow file-read* (literal "{_seatbelt_string(credential_file)}"))',
+        f'(allow file-write* (subpath "{_seatbelt_string(task_dir)}"))',
+        '(allow network-outbound (remote tcp "api.deepseek.com:443"))',
+    ))
+    return [
+        "/usr/bin/sandbox-exec", "-p", profile, sys.executable,
+        "-m", "omcp.runner", "--spec", str(spec_path),
+    ]
+
+
 @dataclass(frozen=True)
 class Worker:
     name: str
     command: tuple[str, ...]
     codex_home: str | None = None
+    adapter: str = "codex"
+    provider: str | None = None
+    model: str | None = None
+    credential_file: str | None = None
+    endpoint_host: str | None = None
 
 
 @dataclass(frozen=True)
@@ -126,6 +179,9 @@ class Config:
     default_profile: str | None = None
     standing_authorizations: tuple[StandingAuthorization, ...] = ()
     task_approval_mode: str = "required"
+    max_worker_seconds: int = 1_800
+    max_parallel_tasks: int = 1
+    startup_lease_seconds: int = 30
 
     @classmethod
     def load(cls, path: Path) -> "Config":
@@ -144,19 +200,80 @@ class Config:
         base_ref = raw.get("base_ref", "origin/main")
         if not re.fullmatch(r"origin/[A-Za-z0-9._/-]+", base_ref) or ".." in base_ref.split("/"):
             raise ValueError("base_ref must name a safe origin branch")
-        workers = {
-            name: Worker(name, tuple(value["command"]), value.get("codex_home"))
-            for name, value in raw["workers"].items()
-        }
+        if not isinstance(raw.get("workers"), dict):
+            raise ValueError("workers must be an object")
+        model_allowlist_raw = raw.get("opencode_model_allowlist", {})
+        if not isinstance(model_allowlist_raw, dict):
+            raise ValueError("opencode_model_allowlist must be an object")
+        model_allowlist: dict[str, frozenset[str]] = {}
+        for provider, models in model_allowlist_raw.items():
+            if (provider not in OPENCODE_PROVIDER_ENDPOINTS or not isinstance(models, list)
+                    or not models or not all(isinstance(model, str) and re.fullmatch(
+                        r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.:-]+", model,
+                    ) for model in models)):
+                raise ValueError("opencode_model_allowlist contains an invalid provider or model")
+            model_allowlist[provider] = frozenset(models)
+        workers: dict[str, Worker] = {}
+        for name, value in raw["workers"].items():
+            if not isinstance(value, dict):
+                raise ValueError("worker must be an object")
+            adapter = value.get("adapter", "codex")
+            command = value.get("command")
+            if adapter == "deepseek":
+                if command is not None:
+                    raise ValueError("DeepSeek direct adapter may not configure a command")
+                command = []
+            elif not isinstance(command, list):
+                raise ValueError("worker must include a command list")
+            workers[name] = Worker(
+                name, tuple(command), value.get("codex_home"), adapter, value.get("provider"),
+                value.get("model"), value.get("credential_file"),
+            )
         if not workers:
             raise ValueError("at least one worker is required")
         for worker in workers.values():
             if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", worker.name):
                 raise ValueError("invalid worker name")
-            if len(worker.command) != 1:
+            if worker.adapter != "deepseek" and len(worker.command) != 1:
                 raise ValueError(f"{worker.name} command may not contain CLI arguments")
-            canonical = canonical_codex_executable(worker.command[0])
-            workers[worker.name] = Worker(worker.name, (canonical,), worker.codex_home)
+            if worker.adapter not in WORKER_ADAPTERS:
+                raise ValueError("worker adapter must be codex, opencode, or deepseek")
+            if worker.adapter == "codex":
+                if any(value is not None for value in (
+                    worker.provider, worker.model, worker.credential_file,
+                )):
+                    raise ValueError("Codex workers may not configure a provider or credential file")
+                canonical = canonical_codex_executable(worker.command[0])
+                workers[worker.name] = Worker(
+                    worker.name, (canonical,), worker.codex_home, "codex",
+                )
+                continue
+            if worker.codex_home is not None:
+                raise ValueError("non-Codex workers may not configure codex_home")
+            if worker.adapter == "deepseek":
+                if worker.provider != DEEPSEEK_PROVIDER or worker.model != DEEPSEEK_MODEL:
+                    raise ValueError("DeepSeek workers require the fixed DeepSeek provider and model")
+            elif (worker.provider not in OPENCODE_PROVIDER_ENDPOINTS
+                  or worker.model not in model_allowlist.get(worker.provider, frozenset())):
+                raise ValueError("OpenCode worker provider/model is not in opencode_model_allowlist")
+            if not isinstance(worker.credential_file, str) or not worker.credential_file:
+                raise ValueError("non-Codex workers require an owner-only credential_file")
+            credential_file = Path(worker.credential_file).expanduser().resolve(strict=True)
+            stat = credential_file.stat()
+            if (not credential_file.is_file() or stat.st_mode & 0o077
+                    or stat.st_uid != os.getuid()):
+                raise ValueError("credential_file must be an owner-only regular file")
+            if worker.adapter == "deepseek":
+                workers[worker.name] = Worker(
+                    worker.name, (), None, "deepseek", DEEPSEEK_PROVIDER,
+                    DEEPSEEK_MODEL, str(credential_file), "api.deepseek.com",
+                )
+                continue
+            canonical = canonical_opencode_executable(worker.command[0])
+            workers[worker.name] = Worker(
+                worker.name, (canonical,), None, "opencode", worker.provider,
+                worker.model, str(credential_file), OPENCODE_PROVIDER_ENDPOINTS[worker.provider],
+            )
         principal_raw = raw["principal"]
         if not isinstance(principal_raw.get("permissions"), list):
             raise ValueError("principal permissions must be a list")
@@ -178,6 +295,19 @@ class Config:
         task_approval_mode = raw.get("task_approval_mode", "required")
         if task_approval_mode not in {"required", "disabled"}:
             raise ValueError("task_approval_mode must be required or disabled")
+        max_worker_seconds = int(raw.get("max_worker_seconds", 1_800))
+        if not 60 <= max_worker_seconds <= 7_200:
+            raise ValueError("max_worker_seconds must be between 60 and 7200")
+        max_parallel_tasks = raw.get("max_parallel_tasks", 1)
+        if not isinstance(max_parallel_tasks, int) or isinstance(max_parallel_tasks, bool):
+            raise ValueError("max_parallel_tasks must be an integer")
+        if not 1 <= max_parallel_tasks <= 64:
+            raise ValueError("max_parallel_tasks must be between 1 and 64")
+        startup_lease_seconds = raw.get("startup_lease_seconds", 30)
+        if not isinstance(startup_lease_seconds, int) or isinstance(startup_lease_seconds, bool):
+            raise ValueError("startup_lease_seconds must be an integer")
+        if not 5 <= startup_lease_seconds <= 300:
+            raise ValueError("startup_lease_seconds must be between 5 and 300")
         profiles_raw = raw.get("repository_profiles")
         profiles: dict[str, RepositoryProfile] | None = None
         default_profile: str | None = None
@@ -240,6 +370,8 @@ class Config:
                 raise ValueError("standing authorization names an unknown repository profile")
             if set(worker_names) - set(workers):
                 raise ValueError("standing authorization names an unknown worker")
+            if any(workers[name].adapter != "codex" for name in worker_names):
+                raise ValueError("standing authorization may only name Codex workers")
             if not isinstance(writable_paths, list) or not all(
                 isinstance(value, str) and value and value == value.strip()
                 for value in writable_paths
@@ -268,7 +400,7 @@ class Config:
             max(1_024, min(int(raw.get("max_result_bytes", 65_536)), 1_048_576)),
             approval_ttl_seconds,
             profiles, default_profile, tuple(standing_authorizations),
-            task_approval_mode,
+            task_approval_mode, max_worker_seconds, max_parallel_tasks, startup_lease_seconds,
         )
 
     def profile(self, profile_id: str | None) -> RepositoryProfile:
@@ -321,6 +453,7 @@ class TaskController:
         self.state_path = config.state_dir / "state.json"
         self.audit_path = config.state_dir / "audit.jsonl"
         self.state = self._load()
+        self._save()
         self._audit("service.start", None, "allowed", {"authentication": config.principal.authentication})
         self.reconcile()
 
@@ -336,6 +469,35 @@ class TaskController:
         if value.get("schema_version") != 1 or not isinstance(value.get("tasks"), dict):
             raise RuntimeError("unsupported or invalid OMCP state")
         value.setdefault("requests", {})
+        scheduler = value.setdefault("scheduler", {})
+        if not isinstance(scheduler, dict):
+            raise RuntimeError("unsupported or invalid OMCP scheduler state")
+        scheduler.setdefault("last_repository", None)
+        occupied_lanes: set[int] = set()
+        for task in value["tasks"].values():
+            if "resource_requirements" not in task:
+                capabilities = task.get("execution_capabilities", {})
+                read_only = (task.get("authorization", {}).get("mode") == "standing"
+                             and capabilities.get("writable_paths") == [])
+                task["resource_requirements"] = {
+                    "worker": task["worker"],
+                    "repository": task.get("repository", self.config.repository).lower(),
+                    "access": "read" if read_only else "write",
+                }
+            reservation = task.get("reservation")
+            if task.get("status") in ACTIVE and not isinstance(reservation, dict):
+                lane = 1
+                while lane in occupied_lanes:
+                    lane += 1
+                task["reservation"] = {
+                    "status": "active", "lane": lane,
+                    "claimed_at": task.get("started_at", task.get("created_at", utc_now())),
+                    **task["resource_requirements"],
+                }
+                occupied_lanes.add(lane)
+            elif (task.get("status") in ACTIVE and isinstance(reservation, dict)
+                  and isinstance(reservation.get("lane"), int)):
+                occupied_lanes.add(reservation["lane"])
         return value
 
     def _save(self) -> None:
@@ -384,7 +546,7 @@ class TaskController:
             "started_at", "finished_at", "exit_code", "branch", "approval",
             "cancel_reason", "failure", "repository_profile", "repository", "base_ref",
             "consequence_class", "authorization",
-            "execution_capabilities",
+            "execution_capabilities", "resource_requirements", "reservation",
         )
         return {key: task[key] for key in keys if key in task}
 
@@ -436,7 +598,11 @@ class TaskController:
             return {**self._public(previous), "acknowledged": True, "idempotent_replay": True}
         task_id = self.id_factory()
         now = utc_now()
-        approvals_disabled = self.config.task_approval_mode == "disabled"
+        # Direct provider use always needs a fresh local decision.  In particular,
+        # the global convenience mode must not silently authorize DeepSeek egress.
+        requires_explicit_approval = self.config.workers[worker].adapter == "deepseek"
+        approvals_disabled = (self.config.task_approval_mode == "disabled"
+                              and not requires_explicit_approval)
         status = "accepted" if standing_authorization or approvals_disabled else "approval_required"
         task = {
             "task_id": task_id, "request_id": request_id, "request_digest": digest,
@@ -478,6 +644,11 @@ class TaskController:
             task["approval"] = {
                 "status": "pending", "requested_at": now, "expires_at": expires_at,
             }
+        access = ("read" if standing_authorization
+                  and not standing_authorization.writable_paths else "write")
+        task["resource_requirements"] = {
+            "worker": worker, "repository": profile.repository.lower(), "access": access,
+        }
         self.state["tasks"][task_id] = task
         self.state["requests"][request_id] = task_id
         self._save()
@@ -500,6 +671,9 @@ class TaskController:
         result = {"service": "omcp", "status": "ok", "task_counts": counts,
                   "repository": default_profile.repository,
                   "task_approval_mode": self.config.task_approval_mode,
+                  "active_tasks": sum(task["status"] in ACTIVE
+                                      for task in self.state["tasks"].values()),
+                  "execution_limit": self.config.max_parallel_tasks,
                   "default_profile": default_profile.profile_id,
                   "repository_profiles": sorted((self.config.repository_profiles or {"default": default_profile}))}
         self._audit("bridge.status", None, "allowed", {})
@@ -546,14 +720,21 @@ class TaskController:
     def worker_availability(self) -> dict[str, Any]:
         self._authorize("workers:read", "worker.availability")
         self.tick()
-        active = next((task for task in self.state["tasks"].values() if task["status"] in ACTIVE), None)
+        active = [task for task in self.state["tasks"].values() if task["status"] in ACTIVE]
+        active_by_worker = {task["worker"]: task for task in active}
         workers = []
         for name in sorted(self.config.workers):
-            busy = bool(active and active["worker"] == name)
-            workers.append({"worker": name, "available": active is None,
-                            "current_task_id": active["task_id"] if busy else None})
+            current = active_by_worker.get(name)
+            workers.append({
+                "worker": name,
+                "available": current is None and len(active) < self.config.max_parallel_tasks,
+                "current_task_id": current["task_id"] if current else None,
+            })
         self._audit("worker.availability", None, "allowed", {})
-        return {"workers": workers, "execution_limit": 1}
+        return {
+            "workers": workers, "active_tasks": len(active),
+            "execution_limit": self.config.max_parallel_tasks,
+        }
 
     def cancel_task(self, task_id: str, reason: str) -> dict[str, Any]:
         self._authorize("tasks:cancel", "task.cancel", task_id)
@@ -712,6 +893,8 @@ class TaskController:
         for task in self.state["tasks"].values():
             if task.get("status") != "approval_required":
                 continue
+            if self.config.workers[task["worker"]].adapter == "deepseek":
+                continue
             task["status"] = "accepted"
             task["authorization"] = {
                 "mode": "automatic", "policy": "task_approvals_disabled",
@@ -731,11 +914,98 @@ class TaskController:
     def tick(self) -> None:
         self._apply_task_approval_policy()
         self.reconcile()
-        if any(task["status"] in ACTIVE for task in self.state["tasks"].values()):
-            return
-        task = next((item for item in self.state["tasks"].values() if item["status"] == "accepted"), None)
-        if task:
+        while sum(task["status"] in ACTIVE for task in self.state["tasks"].values()) < self.config.max_parallel_tasks:
+            task = self._next_runnable_task()
+            if task is None:
+                return
+            self._claim(task)
             self._start(task)
+
+    def _next_runnable_task(self) -> dict[str, Any] | None:
+        """Choose one repository-fair FIFO task whose resources are available."""
+        accepted = sorted(
+            (task for task in self.state["tasks"].values() if task["status"] == "accepted"),
+            key=lambda task: (task["created_at"], task["task_id"]),
+        )
+        if not accepted:
+            return None
+        active = [task for task in self.state["tasks"].values() if task["status"] in ACTIVE]
+        active_workers = {task["worker"] for task in active}
+        active_repository_access: dict[str, set[str]] = {}
+        for task in active:
+            requirement = task.get("resource_requirements", {})
+            repository = requirement.get("repository", task.get("repository", "").lower())
+            access = requirement.get("access", "write")
+            active_repository_access.setdefault(repository, set()).add(access)
+
+        repository_heads: dict[str, dict[str, Any]] = {}
+        repository_order: list[str] = []
+        for task in accepted:
+            requirement = task.get("resource_requirements", {})
+            repository = requirement.get("repository", task.get("repository", "").lower())
+            if repository not in repository_heads:
+                repository_heads[repository] = task
+                repository_order.append(repository)
+        cursor = self.state["scheduler"].get("last_repository")
+        if cursor in repository_order:
+            index = repository_order.index(cursor) + 1
+            repository_order = repository_order[index:] + repository_order[:index]
+
+        for repository in repository_order:
+            task = repository_heads[repository]
+            if task["worker"] in active_workers:
+                continue
+            requirement = task.get("resource_requirements", {})
+            access = requirement.get("access", "write")
+            held = active_repository_access.get(repository, set())
+            if held and (access == "write" or "write" in held):
+                continue
+            return task
+        return None
+
+    def _claim(self, task: dict[str, Any]) -> None:
+        """Persist the lane and server-derived resources before any side effect."""
+        used_lanes = {
+            reservation.get("lane")
+            for item in self.state["tasks"].values() if item["status"] in ACTIVE
+            for reservation in [item.get("reservation", {})]
+        }
+        lane = next(
+            number for number in range(1, self.config.max_parallel_tasks + 1)
+            if number not in used_lanes
+        )
+        now = utc_now()
+        lease_id = str(uuid.uuid4())
+        expires_at = (datetime.fromisoformat(now) + timedelta(
+            seconds=self.config.startup_lease_seconds,
+        )).isoformat()
+        task_dir = self.config.state_dir / "tasks" / task["task_id"]
+        task.update({
+            "status": "starting",
+            "reservation": {
+                "status": "active", "lane": lane, "claimed_at": now,
+                "worker": task["resource_requirements"]["worker"],
+                "repository": task["resource_requirements"]["repository"],
+                "access": task["resource_requirements"]["access"],
+            },
+            "startup_lease": {
+                "lease_id": lease_id, "expires_at": expires_at,
+                "path": str(task_dir / "lease.json"),
+            },
+        })
+        self.state["scheduler"]["last_repository"] = task["resource_requirements"]["repository"]
+        self._save()
+        self._audit("task.claim", task["task_id"], "allowed", {
+            "lane": lane, "worker": task["worker"],
+            "repository": task["resource_requirements"]["repository"],
+            "access": task["resource_requirements"]["access"],
+        })
+
+    @staticmethod
+    def _release_reservation(task: dict[str, Any], released_at: str | None = None) -> None:
+        reservation = task.get("reservation")
+        if isinstance(reservation, dict) and reservation.get("status") == "active":
+            reservation.update({"status": "released", "released_at": released_at or utc_now()})
 
     def reconcile(self) -> None:
         changed = False
@@ -746,6 +1016,7 @@ class TaskController:
             if completion and completion.exists():
                 result = json.loads(completion.read_text())
                 cancelled = task["status"] == "cancel_requested"
+                self._release_reservation(task, result["finished_at"])
                 task.update({
                     "status": "cancelled" if cancelled else ("succeeded" if result["exit_code"] == 0 else "failed"),
                     "exit_code": result["exit_code"], "finished_at": result["finished_at"],
@@ -757,10 +1028,58 @@ class TaskController:
                 self._audit("task.complete", task["task_id"], "allowed", {"status": task["status"]})
                 continue
             pid = task.get("runner_pid")
-            if task["status"] == "starting" and not pid:
-                task.update({"status": "interrupted", "finished_at": utc_now(),
-                             "failure": {"type": "startup_interrupted"}})
-                changed = True
+            if task["status"] in {"starting", "cancel_requested"} and not pid:
+                cancellation_pending = task["status"] == "cancel_requested"
+                lease = task.get("startup_lease", {})
+                lease_path = Path(lease["path"]) if isinstance(lease.get("path"), str) else None
+                lease_record = None
+                if lease_path and lease_path.exists():
+                    try:
+                        lease_record = json.loads(lease_path.read_text())
+                    except (OSError, ValueError):
+                        lease_record = None
+                valid_lease = (isinstance(lease_record, dict)
+                               and lease_record.get("lease_id") == lease.get("lease_id")
+                               and lease_record.get("task_id") == task["task_id"]
+                               and isinstance(lease_record.get("pid"), int))
+                if valid_lease:
+                    try:
+                        os.kill(lease_record["pid"], 0)
+                    except ProcessLookupError:
+                        lease_record = None
+                    else:
+                        task.update({
+                            "status": "cancel_requested" if cancellation_pending else "running",
+                            "runner_pid": lease_record["pid"],
+                            "started_at": lease_record.get("started_at", utc_now()),
+                        })
+                        changed = True
+                        self._audit("task.recover", task["task_id"], "allowed", {
+                            "status": task["status"],
+                            "lane": task.get("reservation", {}).get("lane"),
+                        })
+                        if cancellation_pending:
+                            try:
+                                os.killpg(lease_record["pid"], signal.SIGTERM)
+                            except ProcessLookupError:
+                                pass
+                else:
+                    lease_record = None
+                if lease_record is None:
+                    try:
+                        expired = datetime.fromisoformat(lease.get("expires_at", "")) <= datetime.now(timezone.utc)
+                    except (TypeError, ValueError):
+                        expired = True
+                    if expired:
+                        finished_at = utc_now()
+                        self._release_reservation(task, finished_at)
+                        task.update({
+                            "status": "cancelled" if cancellation_pending else "interrupted",
+                            "finished_at": finished_at,
+                        })
+                        if not cancellation_pending:
+                            task["failure"] = {"type": "startup_lease_expired"}
+                        changed = True
             elif pid:
                 wait_status = self._reap_child(pid)
                 if wait_status is not None:
@@ -772,6 +1091,7 @@ class TaskController:
                     })
                     if not cancelled:
                         task["failure"] = {"type": "runner_exited_without_completion"}
+                    self._release_reservation(task, task["finished_at"])
                     changed = True
                     self._audit("task.reconcile", task["task_id"], "allowed", {
                         "status": task["status"], "reason": "runner_reaped_without_completion",
@@ -785,6 +1105,7 @@ class TaskController:
                                  "finished_at": utc_now()})
                     if not cancelled:
                         task["failure"] = {"type": "runner_disappeared"}
+                    self._release_reservation(task, task["finished_at"])
                     changed = True
                     self._reap_child(pid)
                     self._audit("task.reconcile", task["task_id"], "allowed", {"status": task["status"]})
@@ -795,7 +1116,9 @@ class TaskController:
         task_id = task["task_id"]
         profile = self.config.profile(task.get("repository_profile"))
         branch = "omcp/task-" + task_id.split("-", 1)[0]
-        task.update({"status": "starting", "branch": branch})
+        if task.get("status") != "starting" or task.get("reservation", {}).get("status") != "active":
+            raise RuntimeError("task must hold an active reservation before startup")
+        task.update({"branch": branch})
         self._save()
         try:
             workspace = self.workspace_preparer(task_id, branch, profile)
@@ -817,22 +1140,49 @@ class TaskController:
             _atomic_json(spec_path, {
                 "command": list(worker.command),
                 "codex_home": str(Path(worker.codex_home).expanduser()) if worker.codex_home else None,
+                "adapter": worker.adapter,
+                "provider": worker.provider,
+                "model": worker.model,
+                "credential_file": worker.credential_file,
+                "endpoint_host": ("api.deepseek.com" if worker.adapter == "deepseek"
+                                  else worker.endpoint_host),
+                "max_worker_seconds": self.config.max_worker_seconds,
+                "max_response_bytes": self.config.max_result_bytes,
                 "workspace": str(workspace), "prompt_path": str(prompt_path),
                 "log_path": str(log_path), "result_path": str(result_path),
                 "completion_path": str(completion_path),
                 "execution_capabilities": task.get("execution_capabilities"),
+                "task_id": task_id,
+                "lease_id": task["startup_lease"]["lease_id"],
+                "lease_path": task["startup_lease"]["path"],
             })
+            task.update({
+                "workspace": str(workspace), "result_path": str(result_path),
+                "completion_path": str(completion_path), "log_path": str(log_path),
+            })
+            self._save()
             self._audit("task.start", task_id, "allowed", {"worker": task["worker"], "branch": branch})
+            runner_command = ([sys.executable, "-m", "omcp.runner", "--spec", str(spec_path)]
+                              if worker.adapter != "deepseek" else deepseek_runner_command(
+                                  spec_path, task_dir, workspace, Path(worker.credential_file or ""),
+                              ))
+            runner_environment = {
+                key: os.environ[key] for key in ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL")
+                if key in os.environ
+            }
+            if worker.adapter == "deepseek":
+                runner_environment.pop("HOME", None)
+                runner_environment.pop("TMPDIR", None)
+                runner_environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            runner_environment["GIT_TERMINAL_PROMPT"] = "0"
             proc = self.popen(
-                [sys.executable, "-m", "omcp.runner", "--spec", str(spec_path)],
-                cwd=Path(__file__).resolve().parent.parent, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                runner_command,
+                cwd=Path(__file__).resolve().parent.parent, env=runner_environment,
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True, close_fds=True,
             )
             task.update({
                 "status": "running", "runner_pid": proc.pid, "started_at": utc_now(),
-                "workspace": str(workspace), "result_path": str(result_path),
-                "completion_path": str(completion_path), "log_path": str(log_path),
             })
             try:
                 self._save()
@@ -843,7 +1193,9 @@ class TaskController:
                     pass
                 raise
         except Exception as exc:
-            task.update({"status": "failed", "finished_at": utc_now(),
+            finished_at = utc_now()
+            self._release_reservation(task, finished_at)
+            task.update({"status": "failed", "finished_at": finished_at,
                          "failure": {"type": type(exc).__name__, "stage": "startup"}})
             self._save()
             self._audit("task.start", task_id, "failed", {"error_type": type(exc).__name__})
