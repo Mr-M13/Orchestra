@@ -27,7 +27,13 @@ DEEPSEEK_PROVIDER = "deepseek"
 DEEPSEEK_MODEL = "deepseek/deepseek-chat"
 OPENCODE_PROVIDER_ENDPOINTS = {
     "deepseek": "api.deepseek.com",
+    "gemini": "generativelanguage.googleapis.com",
     "openai": "api.openai.com",
+}
+OPENCODE_PROVIDER_BASE_PATHS = {
+    "deepseek": "",
+    "gemini": "/v1beta/openai",
+    "openai": "/v1",
 }
 PERMISSIONS = {
     "status:read", "tasks:submit", "tasks:read", "results:read",
@@ -102,7 +108,10 @@ def canonical_opencode_executable(value: str) -> str:
 
 
 def _seatbelt_string(value: Path | str) -> str:
-    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+    text = str(value)
+    if any(ord(character) < 0x20 or ord(character) == 0x7f for character in text):
+        raise ValueError("Seatbelt paths may not contain control characters")
+    return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def deepseek_runner_command(spec_path: Path, task_dir: Path, workspace: Path,
@@ -111,13 +120,15 @@ def deepseek_runner_command(spec_path: Path, task_dir: Path, workspace: Path,
     source_root = Path(__file__).resolve().parent.parent
     profile = "\n".join((
         "(version 1)", "(deny default)", '(import "system.sb")',
+        f'(allow process-exec (literal "{_seatbelt_string(sys.executable)}"))',
+        f'(allow file-read* (literal "{_seatbelt_string(sys.executable)}"))',
         f'(allow file-read* (subpath "{_seatbelt_string(source_root)}"))',
         f'(allow file-read* (subpath "{_seatbelt_string(workspace)}"))',
         f'(allow file-read* (subpath "{_seatbelt_string(task_dir)}"))',
         f'(allow file-read* (literal "{_seatbelt_string(spec_path)}"))',
         f'(allow file-read* (literal "{_seatbelt_string(credential_file)}"))',
         f'(allow file-write* (subpath "{_seatbelt_string(task_dir)}"))',
-        '(allow network-outbound (remote tcp "api.deepseek.com:443"))',
+        '(allow network-outbound (remote tcp "*:443"))',
     ))
     return [
         "/usr/bin/sandbox-exec", "-p", profile, sys.executable,
@@ -223,7 +234,7 @@ class Config:
             if (provider not in OPENCODE_PROVIDER_ENDPOINTS or not isinstance(models, list)
                     or not models or not all(isinstance(model, str) and re.fullmatch(
                         r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.:-]+", model,
-                    ) for model in models)):
+                    ) and model.startswith(provider + "/") for model in models)):
                 raise ValueError("opencode_model_allowlist contains an invalid provider or model")
             model_allowlist[provider] = frozenset(models)
         workers: dict[str, Worker] = {}
@@ -244,6 +255,7 @@ class Config:
             )
         if not workers:
             raise ValueError("at least one worker is required")
+        credential_owners: dict[str, str] = {}
         for worker in workers.values():
             if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", worker.name):
                 raise ValueError("invalid worker name")
@@ -276,16 +288,25 @@ class Config:
             if (not credential_file.is_file() or stat.st_mode & 0o077
                     or stat.st_uid != os.getuid()):
                 raise ValueError("credential_file must be an owner-only regular file")
+            if any(character in str(credential_file) for character in "{}\r\n\x00"):
+                raise ValueError("credential_file path contains unsupported characters")
+            credential_path = str(credential_file)
+            if credential_path in credential_owners:
+                raise ValueError(
+                    "non-Codex workers must use distinct credential files "
+                    f"({credential_owners[credential_path]} and {worker.name})"
+                )
+            credential_owners[credential_path] = worker.name
             if worker.adapter == "deepseek":
                 workers[worker.name] = Worker(
                     worker.name, (), None, "deepseek", DEEPSEEK_PROVIDER,
-                    DEEPSEEK_MODEL, str(credential_file), "api.deepseek.com",
+                    DEEPSEEK_MODEL, credential_path, "api.deepseek.com",
                 )
                 continue
             canonical = canonical_opencode_executable(worker.command[0])
             workers[worker.name] = Worker(
                 worker.name, (canonical,), None, "opencode", worker.provider,
-                worker.model, str(credential_file), OPENCODE_PROVIDER_ENDPOINTS[worker.provider],
+                worker.model, credential_path, OPENCODE_PROVIDER_ENDPOINTS[worker.provider],
             )
         principal_raw = raw["principal"]
         if not isinstance(principal_raw.get("permissions"), list):
@@ -663,11 +684,7 @@ class TaskController:
             return {**self._public(previous), "acknowledged": True, "idempotent_replay": True}
         task_id = self.id_factory()
         now = utc_now()
-        # Direct provider use always needs a fresh local decision.  In particular,
-        # the global convenience mode must not silently authorize DeepSeek egress.
-        requires_explicit_approval = self.config.workers[worker].adapter == "deepseek"
-        approvals_disabled = (self.config.task_approval_mode == "disabled"
-                              and not requires_explicit_approval)
+        approvals_disabled = self.config.task_approval_mode == "disabled"
         status = "accepted" if standing_authorization or approvals_disabled else "approval_required"
         task = {
             "task_id": task_id, "request_id": request_id, "request_digest": digest,
@@ -1034,8 +1051,7 @@ class TaskController:
         for task in self.state["tasks"].values():
             if task.get("status") != "approval_required":
                 continue
-            if (task.get("kind") == "host_operation"
-                    or self.config.workers[task["worker"]].adapter == "deepseek"):
+            if task.get("kind") == "host_operation":
                 self._expire_approval(task)
                 continue
             task["status"] = "accepted"

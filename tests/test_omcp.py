@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 
 from omcp.approval import format_review
 from omcp.controller import (
-    AuthorizationError, Config, HostOperation, Principal, RepositoryProfile, StandingAuthorization,
+    AuthorizationError, Config, HostOperation, OPENCODE_CLI, Principal, RepositoryProfile, StandingAuthorization,
     TaskController, Worker,
 )
 from omcp.docker_gate import gated_command
@@ -243,7 +243,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(spec["credential_file"], str(credential))
         self.assertNotIn("never-log-this", (self.state / "audit.jsonl").read_text())
 
-    def test_deepseek_remains_pending_when_global_approvals_are_disabled(self):
+    def test_deepseek_runs_automatically_when_global_approvals_are_disabled(self):
         credential = Path(self.temp.name) / "deepseek.key"
         credential.write_text("not-printed")
         credential.chmod(0o600)
@@ -257,8 +257,39 @@ class ControllerTests(unittest.TestCase):
             workspace_preparer=lambda *_: self.root,
             id_factory=lambda: "11111111-1111-1111-1111-111111111111")
         task = self.controller.submit_task("direct-approval", "Review", "Do not edit", "deepseek")
-        self.assertEqual(task["status"], "approval_required")
-        self.assertEqual(self.popen.call_count, 0)
+        self.assertEqual(task["status"], "running")
+        self.assertEqual(task["approval"]["status"], "not_required")
+        self.assertEqual(task["authorization"], {
+            "mode": "automatic", "policy": "task_approvals_disabled",
+        })
+        self.assertEqual(self.popen.call_count, 1)
+
+    def test_opencode_provider_runs_automatically_when_global_approvals_are_disabled(self):
+        credential = Path(self.temp.name) / "gemini.key"
+        credential.write_text("not-printed")
+        credential.chmod(0o600)
+        self.controller.close()
+        self.controller = TaskController(
+            Config("owner/repo", self.root, self.state, "origin/main", {
+                "gemini": Worker(
+                    "gemini", ("/allowlisted/opencode-cli",), adapter="opencode",
+                    provider="gemini", model="gemini/gemini-2.5-pro",
+                    credential_file=str(credential),
+                    endpoint_host="generativelanguage.googleapis.com",
+                ),
+            }, Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+            task_approval_mode="disabled"), popen=self.popen,
+            workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: "11111111-1111-1111-1111-111111111111")
+
+        task = self.controller.submit_task("gemini-approval", "Review", "Do not edit", "gemini")
+
+        self.assertEqual(task["status"], "running")
+        self.assertEqual(task["approval"]["status"], "not_required")
+        self.assertEqual(task["authorization"], {
+            "mode": "automatic", "policy": "task_approvals_disabled",
+        })
+        self.assertEqual(self.popen.call_count, 1)
 
     def test_protected_and_unclassified_work_still_requires_explicit_approval(self):
         self.controller.close()
@@ -851,30 +882,34 @@ class ControllerTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
-    def test_config_loads_independent_allowlisted_opencode_and_deepseek_workers(self):
+    def test_config_loads_independent_allowlisted_gemini_and_deepseek_opencode_workers(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "project"
             root.mkdir()
             credential = Path(directory) / "deepseek.key"
             credential.write_text("not-printed")
             credential.chmod(0o600)
-            opencode_credential = Path(directory) / "opencode.key"
-            opencode_credential.write_text("not-printed")
-            opencode_credential.chmod(0o600)
+            gemini_credential = Path(directory) / "gemini.key"
+            gemini_credential.write_text("also-not-printed")
+            gemini_credential.chmod(0o600)
             config_path = Path(directory) / "omcp.json"
             config_path.write_text(json.dumps({
                 "repository": "owner/repo", "project_root": str(root),
                 "state_dir": str(Path(directory) / "state"),
-                "opencode_model_allowlist": {"openai": ["openai/gpt-4.1"]},
+                "opencode_model_allowlist": {
+                    "gemini": ["gemini/gemini-2.5-pro"],
+                    "deepseek": ["deepseek/deepseek-chat"],
+                },
                 "workers": {
-                    "opencode": {
+                    "gemini": {
                         "adapter": "opencode",
                         "command": ["/allowlisted/opencode-cli"],
-                        "provider": "openai", "model": "openai/gpt-4.1",
-                        "credential_file": str(opencode_credential),
+                        "provider": "gemini", "model": "gemini/gemini-2.5-pro",
+                        "credential_file": str(gemini_credential),
                     },
                     "deepseek": {
-                        "adapter": "deepseek",
+                        "adapter": "opencode",
+                        "command": ["/allowlisted/opencode-cli"],
                         "provider": "deepseek", "model": "deepseek/deepseek-chat",
                         "credential_file": str(credential),
                     },
@@ -886,10 +921,19 @@ class ConfigTests(unittest.TestCase):
             with patch("omcp.controller.canonical_opencode_executable", return_value="/allowlisted/opencode-cli"):
                 config = Config.load(config_path)
             self.assertEqual(config.max_worker_seconds, 600)
-            self.assertEqual(config.workers["opencode"].adapter, "opencode")
-            self.assertEqual(config.workers["opencode"].provider, "openai")
-            self.assertEqual(config.workers["deepseek"].adapter, "deepseek")
+            self.assertEqual(config.workers["gemini"].adapter, "opencode")
+            self.assertEqual(config.workers["gemini"].provider, "gemini")
+            self.assertEqual(config.workers["gemini"].model, "gemini/gemini-2.5-pro")
+            self.assertEqual(
+                config.workers["gemini"].endpoint_host,
+                "generativelanguage.googleapis.com",
+            )
+            self.assertEqual(
+                config.workers["gemini"].credential_file, str(gemini_credential.resolve()),
+            )
+            self.assertEqual(config.workers["deepseek"].adapter, "opencode")
             self.assertEqual(config.workers["deepseek"].provider, "deepseek")
+            self.assertEqual(config.workers["deepseek"].endpoint_host, "api.deepseek.com")
             self.assertEqual(config.workers["deepseek"].credential_file, str(credential.resolve()))
 
     def test_config_rejects_unapproved_opencode_provider_command_and_credential_mode(self):
@@ -923,6 +967,72 @@ class ConfigTests(unittest.TestCase):
             raw["opencode_model_allowlist"] = {"deepseek": ["deepseek/deepseek-chat"]}
             config_path.write_text(json.dumps(raw))
             with self.assertRaisesRegex(ValueError, "owner-only regular file"):
+                Config.load(config_path)
+
+    def test_config_rejects_unallowlisted_or_misprefixed_gemini_models(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            credential = Path(directory) / "gemini.key"
+            credential.write_text("not-printed")
+            credential.chmod(0o600)
+            config_path = Path(directory) / "omcp.json"
+            raw = {
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(Path(directory) / "state"),
+                "opencode_model_allowlist": {"gemini": ["gemini/gemini-2.5-pro"]},
+                "workers": {"gemini": {
+                    "adapter": "opencode", "command": ["/allowlisted/opencode-cli"],
+                    "provider": "gemini", "model": "gemini/gemini-2.5-flash",
+                    "credential_file": str(credential),
+                }},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+            }
+            config_path.write_text(json.dumps(raw))
+            os.chmod(config_path, 0o600)
+            with self.assertRaisesRegex(ValueError, "not in opencode_model_allowlist"):
+                Config.load(config_path)
+
+            raw["workers"]["gemini"]["model"] = "gemini/gemini-2.5-pro"
+            raw["opencode_model_allowlist"] = {"gemini": ["openai/gpt-4.1"]}
+            config_path.write_text(json.dumps(raw))
+            with self.assertRaisesRegex(ValueError, "invalid provider or model"):
+                Config.load(config_path)
+
+    def test_config_requires_distinct_credentials_for_non_codex_worker_identities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            credential = Path(directory) / "shared.key"
+            credential.write_text("not-printed")
+            credential.chmod(0o600)
+            alias = Path(directory) / "shared-alias.key"
+            alias.symlink_to(credential)
+            config_path = Path(directory) / "omcp.json"
+            config_path.write_text(json.dumps({
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(Path(directory) / "state"),
+                "opencode_model_allowlist": {"gemini": ["gemini/gemini-2.5-pro"]},
+                "workers": {
+                    "gemini-primary": {
+                        "adapter": "opencode", "command": ["/allowlisted/opencode-cli"],
+                        "provider": "gemini", "model": "gemini/gemini-2.5-pro",
+                        "credential_file": str(credential),
+                    },
+                    "gemini-secondary": {
+                        "adapter": "opencode", "command": ["/allowlisted/opencode-cli"],
+                        "provider": "gemini", "model": "gemini/gemini-2.5-pro",
+                        "credential_file": str(alias),
+                    },
+                },
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+            }))
+            os.chmod(config_path, 0o600)
+
+            with patch("omcp.controller.canonical_opencode_executable",
+                       return_value="/allowlisted/opencode-cli"), self.assertRaisesRegex(
+                           ValueError, "must use distinct credential files",
+                       ):
                 Config.load(config_path)
 
     def test_config_loads_only_built_in_pinned_host_operation(self):
@@ -1160,6 +1270,34 @@ class ConfigTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_installed_opencode_cli_launches_under_generated_seatbelt_profile(self):
+        if not OPENCODE_CLI.is_file():
+            self.skipTest("allowlisted OpenCode CLI is not installed")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            workspace = root / "workspace"
+            workspace.mkdir()
+            prompt = root / "prompt"
+            prompt.write_text("preflight only")
+            credential = root / "credential"
+            credential.write_text("synthetic-secret")
+            credential.chmod(0o600)
+            runtime = root / "runtime"
+            command = opencode_command(
+                str(OPENCODE_CLI), workspace, prompt, credential, runtime,
+                "gemini", "gemini/gemini-3.8-flash",
+                "generativelanguage.googleapis.com",
+            )
+
+            probe = subprocess.run(
+                [*command[:3], str(OPENCODE_CLI), "--version"],
+                capture_output=True, text=True, env=opencode_environment(runtime),
+                check=False,
+            )
+
+            self.assertEqual(probe.returncode, 0, probe.stderr)
+            self.assertIn("opencode v2.0.32", probe.stdout)
+
     def test_deepseek_runner_uses_direct_https_and_never_retains_secret_or_raw_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1215,6 +1353,200 @@ class RunnerTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "specification is incomplete"):
                     run_worker(spec)
                 execute.assert_not_called()
+
+    def test_gemini_opencode_policy_uses_exact_endpoint_and_file_credential(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            prompt = root / "prompt.txt"
+            prompt.write_text("safe task")
+            credential = root / "gemini.key"
+            credential.write_text("synthetic-secret-never-copy")
+            credential.chmod(0o600)
+            runtime = root / "runtime"
+
+            command = opencode_command(
+                "/allowlisted/opencode-cli", workspace, prompt, credential, runtime,
+                "gemini", "gemini/gemini-2.5-pro",
+                "generativelanguage.googleapis.com",
+            )
+
+            self.assertEqual(command[0], "/usr/bin/sandbox-exec")
+            profile = command[2]
+            self.assertIn('(allow network-outbound (remote tcp "*:443"))', profile)
+            self.assertIn('(allow network-inbound (local tcp "*:*"))', profile)
+            self.assertIn('(allow network-outbound (remote tcp "localhost:*"))', profile)
+            self.assertIn('(allow network-bind (local tcp "*:*"))', profile)
+            self.assertIn(
+                '(allow process-exec (literal "/allowlisted/opencode-cli"))', profile,
+            )
+            self.assertIn("(allow process-fork)", profile)
+            self.assertIn(
+                f'(allow file-read-metadata (literal "{root}"))', profile,
+            )
+            self.assertNotIn("generativelanguage.googleapis.com", profile)
+            self.assertNotIn("synthetic-secret-never-copy", json.dumps(command))
+            self.assertEqual(command[command.index("--model") + 1], "gemini/gemini-2.5-pro")
+
+            config_path = runtime / "config" / "opencode" / "opencode.json"
+            config_text = config_path.read_text()
+            policy = json.loads(config_text)
+            provider = policy["provider"]["gemini"]
+            self.assertEqual(provider["npm"], "@ai-sdk/openai-compatible")
+            self.assertEqual(
+                provider["options"]["baseURL"],
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+            )
+            self.assertEqual(provider["options"]["apiKey"], f"{{file:{credential}}}")
+            self.assertEqual(provider["models"], {
+                "gemini-2.5-pro": {},
+            })
+            self.assertNotIn("synthetic-secret-never-copy", config_text)
+
+            parent_environment = {
+                "PATH": "/trusted/bin", "LANG": "C",
+                "GEMINI_API_KEY": "must-not-pass", "OPENAI_API_KEY": "must-not-pass",
+                "HTTPS_PROXY": "must-not-pass", "OMCP_AUTHENTICATED_CALLER": "must-not-pass",
+            }
+            with patch.dict(os.environ, parent_environment, clear=True):
+                environment = opencode_environment(runtime)
+            self.assertEqual(environment["PATH"], "/trusted/bin")
+            for denied in (
+                "GEMINI_API_KEY", "OPENAI_API_KEY", "HTTPS_PROXY",
+                "OMCP_AUTHENTICATED_CALLER",
+            ):
+                self.assertNotIn(denied, environment)
+
+    def test_gemini_and_deepseek_opencode_workers_use_separate_private_sessions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            prompt = root / "prompt.txt"
+            prompt.write_text("safe task")
+            gemini_credential = root / "gemini.key"
+            deepseek_credential = root / "deepseek.key"
+            for credential in (gemini_credential, deepseek_credential):
+                credential.write_text("synthetic-secret")
+                credential.chmod(0o600)
+            gemini_runtime = root / "gemini-runtime"
+            deepseek_runtime = root / "deepseek-runtime"
+
+            gemini_command = opencode_command(
+                "/allowlisted/opencode-cli", workspace, prompt, gemini_credential,
+                gemini_runtime, "gemini", "gemini/gemini-2.5-pro",
+                "generativelanguage.googleapis.com",
+            )
+            deepseek_command = opencode_command(
+                "/allowlisted/opencode-cli", workspace, prompt, deepseek_credential,
+                deepseek_runtime, "deepseek", "deepseek/deepseek-chat",
+                "api.deepseek.com",
+            )
+            gemini_environment = opencode_environment(gemini_runtime)
+            deepseek_environment = opencode_environment(deepseek_runtime)
+
+            self.assertNotEqual(gemini_environment["HOME"], deepseek_environment["HOME"])
+            self.assertIn('(remote tcp "*:443")', gemini_command[2])
+            self.assertIn('(remote tcp "*:443")', deepseek_command[2])
+            self.assertIn(f'(allow file-read* (literal "{root}"))', gemini_command[2])
+            self.assertIn('(allow process-exec (literal "/usr/bin/git"))', gemini_command[2])
+            self.assertNotIn("generativelanguage.googleapis.com", gemini_command[2])
+            self.assertNotIn("api.deepseek.com", deepseek_command[2])
+            gemini_config = (gemini_runtime / "config" / "opencode" / "opencode.json").read_text()
+            deepseek_config = (deepseek_runtime / "config" / "opencode" / "opencode.json").read_text()
+            self.assertIn("https://generativelanguage.googleapis.com/v1beta/openai", gemini_config)
+            self.assertNotIn(str(deepseek_credential), gemini_config)
+            self.assertEqual(
+                json.loads(deepseek_config)["provider"]["deepseek"]["options"]["baseURL"],
+                "https://api.deepseek.com",
+            )
+            self.assertNotIn(str(gemini_credential), deepseek_config)
+
+    def test_gemini_opencode_command_fails_closed_on_endpoint_or_model_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            credential = root / "gemini.key"
+            credential.write_text("synthetic-secret")
+            credential.chmod(0o600)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            prompt = root / "prompt"
+            prompt.write_text("task")
+
+            for model, endpoint in (
+                ("gemini/gemini-2.5-pro", "api.openai.com"),
+                ("openai/gpt-4.1", "generativelanguage.googleapis.com"),
+            ):
+                with self.subTest(model=model, endpoint=endpoint), self.assertRaisesRegex(
+                    ValueError, "invalid OpenCode provider or model",
+                ):
+                    opencode_command(
+                        "/allowlisted/opencode-cli", workspace, prompt, credential,
+                        root / ("runtime-" + model.split("/", 1)[0]),
+                        "gemini", model, endpoint,
+                    )
+
+            unsafe_credential = root / "gemini{unsafe}.key"
+            unsafe_credential.write_text("synthetic-secret")
+            unsafe_credential.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, "unsupported characters"):
+                opencode_command(
+                    "/allowlisted/opencode-cli", workspace, prompt, unsafe_credential,
+                    root / "runtime-unsafe", "gemini", "gemini/gemini-2.5-pro",
+                    "generativelanguage.googleapis.com",
+                )
+
+    def test_gemini_runner_discards_output_and_passes_no_parent_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            prompt = root / "prompt"
+            prompt.write_text("task")
+            credential = root / "gemini.key"
+            credential.write_text("synthetic-secret-never-copy")
+            credential.chmod(0o600)
+            spec = root / "spec.json"
+            spec.write_text(json.dumps({
+                "adapter": "opencode", "command": ["/allowlisted/opencode-cli"],
+                "provider": "gemini", "model": "gemini/gemini-2.5-pro",
+                "endpoint_host": "generativelanguage.googleapis.com",
+                "credential_file": str(credential), "max_worker_seconds": 600,
+                "max_response_bytes": 1024, "workspace": str(workspace),
+                "prompt_path": str(prompt), "log_path": str(root / "log"),
+                "result_path": str(root / "result"),
+                "completion_path": str(root / "completion"),
+            }))
+            parent_environment = {
+                "PATH": "/trusted/bin", "GEMINI_API_KEY": "must-not-pass",
+                "OPENAI_API_KEY": "must-not-pass", "HTTPS_PROXY": "must-not-pass",
+                "OMCP_AUTHENTICATED_CALLER": "must-not-pass",
+            }
+            with patch.dict(os.environ, parent_environment, clear=True), \
+                    patch("omcp.runner.canonical_opencode_executable",
+                          return_value="/allowlisted/opencode-cli"), \
+                    patch("omcp.runner.subprocess.run", return_value=Mock(returncode=0)) as execute:
+                self.assertEqual(run_worker(spec), 0)
+
+            launched = execute.call_args.args[0]
+            self.assertEqual(launched[0], "/usr/bin/sandbox-exec")
+            self.assertIn('(remote tcp "*:443")', launched[2])
+            self.assertNotIn("synthetic-secret-never-copy", json.dumps(launched))
+            environment = execute.call_args.kwargs["env"]
+            for denied in (
+                "GEMINI_API_KEY", "OPENAI_API_KEY", "HTTPS_PROXY",
+                "OMCP_AUTHENTICATED_CALLER",
+            ):
+                self.assertNotIn(denied, environment)
+            self.assertIs(execute.call_args.kwargs["stdout"], subprocess.DEVNULL)
+            self.assertFalse((root / "log").exists())
+            self.assertFalse((root / "opencode-runtime").exists())
+            self.assertEqual(
+                (root / "result").read_text(),
+                "OpenCode execution completed; provider output is intentionally not retained.\n",
+            )
+            self.assertNotIn("synthetic-secret-never-copy", (root / "completion").read_text())
 
     def test_deepseek_failure_is_sanitized_and_bounded(self):
         with tempfile.TemporaryDirectory() as directory:

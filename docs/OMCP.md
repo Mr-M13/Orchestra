@@ -46,9 +46,11 @@ The remote MCP surface cannot decide explicit approvals. A local operator must r
 - use a fresh `omcp/task-<id>` Git branch and worktree from the configured base ref;
 - retain prompts, logs, results and worktrees in the private state directory for inspection.
 
-DeepSeek is a direct, response-only HTTPS adapter, not an OpenCode alias. It has no configured executable and never launches a model-directed subprocess or shell. Each task still gets the normal fresh worktree, but the adapter cannot edit it. A macOS Seatbelt profile constrains the runner to its private task files, the worktree, the owner-only credential file, and TCP to `api.deepseek.com:443`; its process environment excludes tunnel and provider variables. The adapter sends only to the fixed `/v1/chat/completions` endpoint, has the configured 60–7200 second deadline and result-byte cap, bounds the HTTP body before parsing, retains only sanitized assistant text, and emits a neutral failure result without provider diagnostics. DeepSeek always requires a fresh local approval, even if the general `task_approval_mode` is disabled.
+DeepSeek is a direct, response-only HTTPS adapter, not an OpenCode alias. It has no configured executable and never launches a model-directed subprocess or shell. Each task still gets the normal fresh worktree, but the adapter cannot edit it. A macOS Seatbelt profile constrains the runner to its private task files, the worktree, the owner-only credential file, and outbound TCP 443; its process environment excludes tunnel and provider variables. The adapter code sends only to the fixed `api.deepseek.com/v1/chat/completions` endpoint, has the configured 60–7200 second deadline and result-byte cap, bounds the HTTP body before parsing, retains only sanitized assistant text, and emits a neutral failure result without provider diagnostics. It follows the owner-controlled worker task approval mode.
 
-OpenCode is independent. Its only accepted executable is the reviewed absolute OpenCode Desktop CLI, `/Users/hamed/Library/Application Support/ai.opencode.desktop/cli/2.0.32-arm64/opencode-cli`; wrappers, aliases, and configured flags are rejected. The owner selects a provider/model pair from the owner-only `opencode_model_allowlist`; the runner accepts only the supported `openai` or `deepseek` provider endpoints and invokes exactly `opencode-cli run --standalone --format json --model <selected-model> --file <private-prompt> ...`, never `--auto`. It starts with a private home/config, a separate owner-only credential file, a generated deny-by-default policy, and a Seatbelt profile restricted to its selected provider host, worktree, prompt, credential and runtime directories. Shell, external-directory, web, skills and subagents are denied. OpenCode cannot receive standing authorization and provider output is discarded; setup/provider failures fail closed rather than falling back or claiming success.
+OpenCode is independent. Its only accepted executable is the reviewed absolute OpenCode Desktop CLI, `/Users/hamed/Library/Application Support/ai.opencode.desktop/cli/2.0.32-arm64/opencode-cli`; wrappers, aliases, and configured flags are rejected. The owner selects an exact provider/model pair from the owner-only `opencode_model_allowlist`; model IDs must use the same provider prefix. The runner accepts only `openai` at `https://api.openai.com/v1`, `deepseek` at `https://api.deepseek.com`, or `gemini` at Google's OpenAI-compatible `https://generativelanguage.googleapis.com/v1beta/openai` endpoint, and invokes exactly `opencode-cli run --standalone --format json --model <selected-model> --file <private-prompt> ...`, never `--auto`. These endpoints and paths are code-owned rather than configurable. OpenCode tasks follow the owner-controlled worker task approval mode. See Google's [OpenAI compatibility documentation](https://ai.google.dev/gemini-api/docs/openai), DeepSeek's [OpenCode integration guide](https://api-docs.deepseek.com/quick_start/agent_integrations/opencode/), and OpenCode's [file substitution documentation](https://opencode.ai/docs/config/#files).
+
+Each OpenCode worker starts with a private home/config, a distinct owner-only credential file, a generated deny-by-default policy, and a Seatbelt profile restricted to its worktree, prompt, credential and runtime directories. Configuration loading resolves credential paths and rejects reuse, including reuse through a symlink, across all non-Codex worker identities. The generated config contains only a `{file:/absolute/credential/path}` reference; the credential value is neither copied into configuration nor inherited through an API-key environment variable. Shell, external-directory, web, skills and subagents are denied. macOS Seatbelt accepts `*` or `localhost`, but not a remote DNS hostname, in this network filter; it therefore restricts OpenCode to outbound TCP 443 while the code-owned provider configuration and stripped proxy environment bind normal traffic to the selected endpoint. OpenCode cannot receive standing authorization and provider output is discarded; an unknown provider, endpoint mismatch, model-prefix mismatch, unallowlisted model, unsafe credential file, setup failure, or provider failure fails closed rather than falling back or claiming success.
 
 The state directory and its files are owner-only. State updates are atomic. `audit.jsonl` is append-only and fsynced for each event; it records principal, authentication context, action, outcome and safe metadata, but not task instructions or worker output. Result retrieval is size-bounded.
 
@@ -111,7 +113,8 @@ Use Python 3.11 or newer and a current Codex CLI. Create a state directory outsi
     ]
   },
   "opencode_model_allowlist": {
-    "openai": ["openai/gpt-4.1"]
+    "gemini": ["gemini/gemini-3.8-flash"],
+    "deepseek": ["deepseek/deepseek-flash"]
   },
   "workers": {
     "ina": {
@@ -122,17 +125,18 @@ Use Python 3.11 or newer and a current Codex CLI. Create a state directory outsi
       "command": ["codex"],
       "codex_home": "/Users/ACCOUNT/.codex"
     },
-    "opencode": {
+    "opencode-gemini": {
       "adapter": "opencode",
       "command": ["/Users/hamed/Library/Application Support/ai.opencode.desktop/cli/2.0.32-arm64/opencode-cli"],
-      "provider": "openai",
-      "model": "openai/gpt-4.1",
-      "credential_file": "/Users/ACCOUNT/Library/Application Support/Orchestra/credentials/opencode-openai-api-key"
+      "provider": "gemini",
+      "model": "gemini/gemini-3.8-flash",
+      "credential_file": "/Users/ACCOUNT/Library/Application Support/Orchestra/credentials/opencode-gemini-api-key"
     },
-    "deepseek": {
-      "adapter": "deepseek",
+    "opencode-deepseek": {
+      "adapter": "opencode",
+      "command": ["/Users/hamed/Library/Application Support/ai.opencode.desktop/cli/2.0.32-arm64/opencode-cli"],
       "provider": "deepseek",
-      "model": "deepseek/deepseek-chat",
+      "model": "deepseek/deepseek-flash",
       "credential_file": "/Users/ACCOUNT/Library/Application Support/Orchestra/credentials/deepseek-api-key"
     }
   },
@@ -155,19 +159,24 @@ Use Python 3.11 or newer and a current Codex CLI. Create a state directory outsi
 }
 ```
 
-### Add OpenCode and DeepSeek without changing the live service
+### Add OpenCode Gemini and DeepSeek without changing the live service
 
-Do not edit a running `omcp.json`, restart a live tunnel, or activate a new provider before the checks below pass. Build a separate owner-only candidate configuration first, retaining the exact existing principal, profiles, Codex/Ina workers, approval mode, and standing grants. Add the two worker objects above to that candidate only.
+Do not edit a running `omcp.json`, restart a live tunnel, or activate a new provider before the checks below pass. Build a separate owner-only candidate configuration first, retaining the exact existing principal, profiles, Codex/Ina workers, approval mode, and standing grants. Add the independent OpenCode Gemini and DeepSeek worker objects to that candidate only. Each model must appear under its matching provider allowlist key and use the same provider prefix; configuration cannot override either host or base path.
 
-Create each provider credential locally without putting it in shell history, a command line, a task prompt, or a log. The two files are distinct, owner-only files:
+Create each provider credential locally without putting it in shell history, a command line, a task prompt, or a log. Every configured provider uses a distinct owner-only file. For the two OpenCode provider workers above:
 
 ```sh
 umask 077
 mkdir -p "$HOME/Library/Application Support/Orchestra/credentials"
+read -rs 'GEMINI_API_KEY: ' OMCP_GEMINI_KEY
+printf '%s' "$OMCP_GEMINI_KEY" > "$HOME/Library/Application Support/Orchestra/credentials/opencode-gemini-api-key"
+unset OMCP_GEMINI_KEY
 read -rs 'DEEPSEEK_API_KEY: ' OMCP_DEEPSEEK_KEY
 printf '%s' "$OMCP_DEEPSEEK_KEY" > "$HOME/Library/Application Support/Orchestra/credentials/deepseek-api-key"
 unset OMCP_DEEPSEEK_KEY
-chmod 600 "$HOME/Library/Application Support/Orchestra/credentials/deepseek-api-key"
+chmod 600 \
+  "$HOME/Library/Application Support/Orchestra/credentials/opencode-gemini-api-key" \
+  "$HOME/Library/Application Support/Orchestra/credentials/deepseek-api-key"
 ```
 
 Validate the fixed installed CLI and candidate configuration without starting OMCP or a tunnel:
@@ -179,7 +188,7 @@ OPENCODE_CLI='/Users/hamed/Library/Application Support/ai.opencode.desktop/cli/2
 python3 -c 'from pathlib import Path; from omcp.controller import Config; Config.load(Path("/absolute/path/to/omcp-candidate.json")); print("candidate configuration valid")'
 ```
 
-The expected CLI version is `2.0.32`; help must show `run`, `--standalone`, `--format`, and `--file`. Do not issue a provider request against a production worktree as a validation step. In a disposable local clone with separate temporary state, run the unit suite, start a separate candidate server, submit a harmless explicitly approved task to `deepseek`, and confirm that it either completes or reports the provider error. Check that `runner.json`, `state.json`, and `audit.jsonl` contain no credential value; OpenCode stream output is deliberately discarded, so no `worker.log` is created for it. Only after those checks pass may the local operator manually merge the reviewed candidate worker objects into a stopped service configuration and start a new service process. This change does not authorize a deployment, push, live tunnel modification, or production activation.
+The expected CLI version is `2.0.32`; help must show `run`, `--standalone`, `--format`, and `--file`. Do not issue a provider request against a production worktree as a validation step. In a disposable local clone with separate temporary state, run the unit suite and start a separate candidate server. With the intended owner-controlled approval mode, submit harmless tasks to the OpenCode `deepseek` worker and, separately, the OpenCode `gemini` worker; confirm each either completes or reports its neutral failure result. Check that each task has a distinct private runtime directory and that `runner.json`, generated `opencode.json`, `state.json`, `audit.jsonl`, process arguments, and process environment contain no credential value. Confirm each Seatbelt profile compiles and restricts network access to outbound TCP 443, while each generated provider config contains only its code-owned endpoint. OpenCode stream output is deliberately discarded, so no `worker.log` is created for it. Only after those checks pass may the local operator manually merge the reviewed candidate worker objects into a stopped service configuration and start a new service process. This change does not authorize a deployment, push, live tunnel modification, or production activation.
 
 ### Enable the bounded Delnavazan host operation
 
@@ -258,7 +267,7 @@ Then verify through the configured tunnel, not only by calling the Python classe
 8. Inspect the private audit log and worktree locally. Confirm the authorization mode, grant ID, and consequence class are recorded, while task instructions and worker output are absent.
 9. Submit a harmless explicit-approval task. Confirm exactly one macOS notification appears, clicking each action opens the matching full-detail page, reject one request, approve another, and retrieve its terminal result through OMCP. Restart the coordinator and both approval agents with a pending request and confirm it remains visible without duplicate delivery or execution.
 10. In a non-production configuration, enable the Delnavazan operation with a reviewed harness commit. Confirm unknown operation IDs, abbreviated or missing commits, caller command fields, uncached images, pulls, non-private mounts, host networking, and unapproved requests all fail closed. Approve one exact harmless commit locally; verify the audit binds both SHAs, the Docker network is internal, direct containers use no network, teardown runs, and the result/log contain no credentials. Cancel a second run and confirm terminal reconciliation. Do not use a production checkout or production data.
-11. In a dedicated test configuration, set `task_approval_mode` to `disabled`. Submit harmless tasks for `unclassified` and a protected consequence class. Confirm both enter the queue without appearing in `list_approvals`, each records `authorization.mode=automatic` and `approval.status=not_required`, and `bridge_status` reports `task_approval_mode=disabled`. Confirm direct DeepSeek tasks and host operations still remain pending for explicit local approval. Restore the intended policy after testing.
+11. In a dedicated test configuration, set `task_approval_mode` to `disabled`. Submit harmless tasks for Codex and each credentialed provider identity. Confirm all enter the queue without appearing in `list_approvals`, each records `authorization.mode=automatic` and `approval.status=not_required`, and `bridge_status` reports `task_approval_mode=disabled`. Confirm host operations still remain pending for explicit local approval. Restore the intended policy after testing.
 
 Do not disable the Bridge or Desktop Commander on the strength of unit tests alone. The final replacement gate requires the authenticated ChatGPT tunnel, target Mac, real Codex profile, Git worktree creation, completion/result retrieval and cancellation path to pass end to end.
 
@@ -266,7 +275,7 @@ Do not disable the Bridge or Desktop Commander on the strength of unit tests alo
 
 The detached runner writes a completion record even when the MCP server restarts. On startup OMCP reconciles completion records and live runner PIDs. A disappeared runner without a completion record becomes `interrupted`; OMCP does not retry it automatically.
 
-OMCP has local-file authoritative state, configurable local parallel capacity, fixed per-process principal authority and no autonomous retry, merge, deployment or outcome-verification decisions. Workers and host operations consume scheduler lanes and obey the same repository reservations; host operations always require local approval. Standing authorization permits only bounded routine worker execution. When general task approvals are disabled, scheduling eligible worker tasks from the accepted queue is automatic, but direct DeepSeek tasks and host operations still require explicit local approval. Completion does not prove correctness, merge, deployment or end-to-end success.
+OMCP has local-file authoritative state, configurable local parallel capacity, fixed per-process principal authority and no autonomous retry, merge, deployment or outcome-verification decisions. Workers and host operations consume scheduler lanes and obey the same repository reservations; host operations always require local approval. Standing authorization permits only bounded routine worker execution. When general task approvals are disabled, scheduling eligible worker tasks from the accepted queue is automatic for every worker identity, while host operations still require explicit local approval. Completion does not prove correctness, merge, deployment or end-to-end success.
 
 ### Migration to individual identity and roles
 
