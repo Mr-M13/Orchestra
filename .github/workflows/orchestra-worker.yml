@@ -1,0 +1,84 @@
+name: Orchestra ephemeral worker
+
+# The Orchestra coordinator dispatches this workflow only after its own
+# repository, worker, approval and scheduler checks pass.  The workflow has no
+# repository write permission: it returns a patch artifact instead of pushing.
+run-name: Orchestra ${{ inputs.task_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: Orchestra task UUID
+        required: true
+        type: string
+      request_id:
+        description: Orchestra idempotency key
+        required: true
+        type: string
+      agent:
+        description: Reviewed coding agent
+        required: true
+        type: choice
+        options:
+          - codex
+          - deepseek
+      model:
+        description: Owner-configured model identifier
+        required: true
+        type: string
+      payload:
+        description: Compressed task payload produced by Orchestra
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: orchestra-worker-${{ inputs.task_id }}
+  cancel-in-progress: true
+
+jobs:
+  execute:
+    name: Execute approved task
+    runs-on: ubuntu-latest
+    environment: orchestra-workers
+    timeout-minutes: 180
+    steps:
+      - name: Check out the dispatch ref
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pinned coding agents
+        run: npm install --global @openai/codex@0.160.0 opencode-ai@1.19.3
+
+      - name: Execute approved Orchestra task
+        env:
+          ORCHESTRA_TASK_ID: ${{ inputs.task_id }}
+          ORCHESTRA_REQUEST_ID: ${{ inputs.request_id }}
+          ORCHESTRA_AGENT: ${{ inputs.agent }}
+          ORCHESTRA_MODEL: ${{ inputs.model }}
+          ORCHESTRA_PAYLOAD: ${{ inputs.payload }}
+          ORCHESTRA_OUTPUT_DIR: ${{ runner.temp }}/orchestra-output
+          ORCHESTRA_RUNTIME_DIR: ${{ runner.temp }}/orchestra-runtime
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: python3 scripts/orchestra_actions_worker.py
+
+      - name: Upload bounded result and patch
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: omcp-${{ inputs.task_id }}
+          path: ${{ runner.temp }}/orchestra-output
+          if-no-files-found: warn
+          retention-days: 7
