@@ -94,6 +94,8 @@ def _risk_summary(details: dict[str, Any]) -> str:
         return "This operation is destructive. Confirm the exact target, scope, recovery path, and whether a reversible alternative exists."
     if consequence == "security_change":
         return "This changes a security boundary or policy. Confirm the authority impact, least privilege, tests, and rollback path."
+    if consequence == "host_operation":
+        return "This runs one built-in host-side acceptance operation. Verify the operation ID, pinned harness commit, exact target commit, repository, and disposable scope."
     return "This request is unclassified and therefore requires explicit approval. Treat its authority and side effects as unknown until reviewed."
 
 
@@ -164,6 +166,12 @@ def make_handler(
                 "Requested": approval.get("requested_at", details.get("created_at")),
                 "Expires": approval.get("expires_at", "—"),
             }
+            if details.get("kind") == "host_operation":
+                meta.update({
+                    "Operation": details.get("operation_id"),
+                    "Harness SHA": details.get("harness_commit"),
+                    "Target SHA": details.get("target_commit"),
+                })
             meta_html = "".join(
                 f"<strong>{html.escape(str(key))}</strong><span>{html.escape(str(value))}</span>"
                 for key, value in meta.items()

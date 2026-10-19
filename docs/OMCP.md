@@ -10,6 +10,7 @@ OMCP does not replace Desktop Commander or the GitHub Issue Mac Bridge. Keep bot
 | --- | --- | --- |
 | `bridge_status` | `status:read` | Health and task counts; retained for tunnel compatibility. |
 | `submit_task` | `tasks:submit` | Durable submission and immediate acknowledgement. `request_id` is the idempotency key. |
+| `submit_host_operation` | `host_operations:submit` | Request one owner-enabled built-in operation for an exact local commit. No command or arguments are accepted. |
 | `task_status` | `tasks:read` | Status for one task. |
 | `list_tasks` | `tasks:read` | Recent tasks, optionally filtered by status. |
 | `task_result` | `results:read` | Bounded final worker message for a terminal task. |
@@ -20,6 +21,8 @@ OMCP does not replace Desktop Commander or the GitHub Issue Mac Bridge. Keep bot
 Task states are `accepted`, `approval_required`, `starting`, `running`, `cancel_requested`, `succeeded`, `failed`, `cancelled`, `rejected` or `interrupted`. A successful worker exit is an execution result, not independent verification.
 
 `submit_task` requires an explicit `repository_profile` in its published MCP schema. OMCP resolves that allowlisted identifier from its owner-only configuration and never accepts a path, URL, ref, or executable in a task request. Multi-repository deployments also reject an omitted profile at runtime before persisting a task, so older or non-validating clients cannot silently select the wrong repository. The controller retains the legacy implicit `default` profile only for direct single-repository callers. Each request declares a `consequence_class`; omission defaults to `unclassified`. When `task_approval_mode` is `required` (the default), unclassified work requires explicit approval. When the owner-only configuration sets the mode to `disabled`, valid tasks enter the scheduler queue automatically. Retrying the same request and content returns the existing acknowledgement. Reusing a request ID with different content, profile, or consequence class fails closed.
+
+`submit_host_operation` is a separate authority boundary. Its request contains only an idempotency key, an owner-configured operation ID, and a full 40-character commit SHA already present in the operation's configured repository. It cannot name an executable, script, path, environment variable, Docker image, Docker argument, Git ref, URL, or credential. Every host operation is persisted as `approval_required`; standing authorization never applies.
 
 ## Security boundary
 
@@ -73,6 +76,16 @@ In required mode, when no exact standing grant matches, the task remains `approv
 
 An approval is an explicit gate before worker launch. It is not permission to bypass the worker sandbox or an assertion that the completed work is verified. Cancellation of a running worker sends `SIGTERM` to its isolated process group and is reconciled durably when the runner exits.
 
+## Allowlisted host operations
+
+Host operations are not worker capabilities. The Codex worker profile remains unchanged: command network is `false`, external credentials are `false`, Git metadata is read-only for standing-authorized routine work, and no Docker socket or host credential is exposed inside the worker. A host operation is instead a distinct controller task that shares the one global execution slot and requires a fresh local human approval.
+
+The first built-in type is `delnavazan_mariadb_acceptance_v1`. The owner-only configuration binds an operation ID to the `delnavazan` repository profile, a full immutable `harness_commit`, and a bounded timeout. The caller separately supplies the exact `target_commit` to test. OMCP resolves both commits locally without a fetch, shows both SHAs in the local approval review, and creates a detached worktree at the pinned harness commit. This separation prevents a target commit from replacing the host-side harness scripts.
+
+The host runner derives its command internally: pinned `platform/runtime/bin/run-all.sh`, followed by pinned `destroy.sh YES` in a cleanup path. It forwards no tunnel, OpenAI, proxy, GitHub, or other credential variables. A private Docker argument gate permits only the three cached harness images, exact Compose up/down forms, disposable containers, mounts below the operation's private state directory, and the PHP entrypoint. When the pinned harness requests a read-only source from its own approved worktree, the gate copies that source into a private staging directory below runtime state and mounts only the staged copy; writable or unrelated external sources remain denied. Pull, build, push, login, privileged mode, host networking, socket mounts, caller-selected images, and arbitrary Docker/Compose subcommands fail closed. Direct test containers receive `--network none`; the WordPress/MariaDB Compose network is overlaid as `internal: true`. WordPress remains loopback-only on a dynamically selected port, MariaDB is unpublished, and teardown targets only the harness's validated private state.
+
+This operation is acceptance evidence only. It does not merge, push, deploy, contact production, use provider credentials, or prove anything beyond the exact target commit and harness run. Do not add a generic command host operation. A new operation type needs code, tests, documentation, a separate permission/risk review, and the same local approval boundary.
+
 ## Configure on the worker Mac
 
 Use Python 3.11 or newer and a current Codex CLI. Create a state directory outside the project checkout and an owner-only configuration outside the repository, for example `~/Library/Application Support/Orchestra/omcp.json`:
@@ -93,7 +106,8 @@ Use Python 3.11 or newer and a current Codex CLI. Create a state directory outsi
       "results:read",
       "workers:read",
       "tasks:cancel",
-      "approvals:read"
+      "approvals:read",
+      "host_operations:submit"
     ]
   },
   "opencode_model_allowlist": {
@@ -167,6 +181,25 @@ python3 -c 'from pathlib import Path; from omcp.controller import Config; Config
 
 The expected CLI version is `2.0.32`; help must show `run`, `--standalone`, `--format`, and `--file`. Do not issue a provider request against a production worktree as a validation step. In a disposable local clone with separate temporary state, run the unit suite, start a separate candidate server, submit a harmless explicitly approved task to `deepseek`, and confirm that it either completes or reports the provider error. Check that `runner.json`, `state.json`, and `audit.jsonl` contain no credential value; OpenCode stream output is deliberately discarded, so no `worker.log` is created for it. Only after those checks pass may the local operator manually merge the reviewed candidate worker objects into a stopped service configuration and start a new service process. This change does not authorize a deployment, push, live tunnel modification, or production activation.
 
+### Enable the bounded Delnavazan host operation
+
+Enable the Delnavazan operation only in a multi-repository configuration that already has a `delnavazan` profile. Pin `harness_commit` to a reviewed Delnavazan commit containing the trusted runtime harness; updating that pin is an owner configuration change and should follow review. The operation type and fields are fixed—configuration cannot substitute a command or arguments:
+
+```json
+{
+  "host_operations": {
+    "delnavazan-mariadb-acceptance": {
+      "type": "delnavazan_mariadb_acceptance_v1",
+      "repository_profile": "delnavazan",
+      "harness_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timeout_seconds": 3600
+    }
+  }
+}
+```
+
+Replace the illustrative all-`a` SHA above with the reviewed commit. Request the operation with a unique `request_id`, the configured operation ID, and a full local target commit. Review and decide it through the same owner-only local approval channel. The approval screen must show the intended repository, pinned harness SHA, and target SHA before approval. Retrieve the bounded summary with `task_result`; inspect the owner-only `host-operation.log` locally for full test output.
+
 ```sh
 chmod 600 "$HOME/Library/Application Support/Orchestra/omcp.json"
 cd /Users/ACCOUNT/Projects/Orchestra
@@ -215,7 +248,7 @@ python3 -m compileall -q mac_bridge omcp tests
 
 Then verify through the configured tunnel, not only by calling the Python classes:
 
-1. Discover tools and confirm all eight names above are present.
+1. Discover tools and confirm all nine names above are present.
 2. Call `bridge_status` and `worker_availability`.
 3. With `task_approval_mode` set to `required`, submit an `unclassified` harmless task with a unique `request_id`; confirm it remains `approval_required` and no worker starts, even if the caller sends `requires_approval: false`.
 4. Review the task and approve it from the local interactive Mac terminal, observe `running`, then retrieve its terminal result.
@@ -224,7 +257,8 @@ Then verify through the configured tunnel, not only by calling the Python classe
 7. In a non-production test configuration, add one exact `routine_development` standing grant with narrow `writable_paths`. Confirm the effective permission profile denies home-directory reads, network, Git metadata changes, and writes outside those roots. Confirm a matching task starts without entering `list_approvals`, while profile/worker mismatches and every protected consequence class remain `approval_required`.
 8. Inspect the private audit log and worktree locally. Confirm the authorization mode, grant ID, and consequence class are recorded, while task instructions and worker output are absent.
 9. Submit a harmless explicit-approval task. Confirm exactly one macOS notification appears, clicking each action opens the matching full-detail page, reject one request, approve another, and retrieve its terminal result through OMCP. Restart the coordinator and both approval agents with a pending request and confirm it remains visible without duplicate delivery or execution.
-10. In a dedicated test configuration, set `task_approval_mode` to `disabled`. Submit harmless tasks for `unclassified` and a protected consequence class. Confirm both enter the queue without appearing in `list_approvals`, each records `authorization.mode=automatic` and `approval.status=not_required`, and `bridge_status` reports `task_approval_mode=disabled`. Restore the intended policy after testing.
+10. In a non-production configuration, enable the Delnavazan operation with a reviewed harness commit. Confirm unknown operation IDs, abbreviated or missing commits, caller command fields, uncached images, pulls, non-private mounts, host networking, and unapproved requests all fail closed. Approve one exact harmless commit locally; verify the audit binds both SHAs, the Docker network is internal, direct containers use no network, teardown runs, and the result/log contain no credentials. Cancel a second run and confirm terminal reconciliation. Do not use a production checkout or production data.
+11. In a dedicated test configuration, set `task_approval_mode` to `disabled`. Submit harmless tasks for `unclassified` and a protected consequence class. Confirm both enter the queue without appearing in `list_approvals`, each records `authorization.mode=automatic` and `approval.status=not_required`, and `bridge_status` reports `task_approval_mode=disabled`. Confirm direct DeepSeek tasks and host operations still remain pending for explicit local approval. Restore the intended policy after testing.
 
 Do not disable the Bridge or Desktop Commander on the strength of unit tests alone. The final replacement gate requires the authenticated ChatGPT tunnel, target Mac, real Codex profile, Git worktree creation, completion/result retrieval and cancellation path to pass end to end.
 
@@ -232,7 +266,7 @@ Do not disable the Bridge or Desktop Commander on the strength of unit tests alo
 
 The detached runner writes a completion record even when the MCP server restarts. On startup OMCP reconciles completion records and live runner PIDs. A disappeared runner without a completion record becomes `interrupted`; OMCP does not retry it automatically.
 
-OMCP has local-file authoritative state, configurable local parallel capacity, fixed per-process principal authority and no autonomous retry, merge, deployment or outcome-verification decisions. Standing authorization permits only bounded routine worker execution. When task approvals are disabled, scheduling from the accepted queue is automatic, but completion still does not prove correctness, merge, deployment, or end-to-end success.
+OMCP has local-file authoritative state, configurable local parallel capacity, fixed per-process principal authority and no autonomous retry, merge, deployment or outcome-verification decisions. Workers and host operations consume scheduler lanes and obey the same repository reservations; host operations always require local approval. Standing authorization permits only bounded routine worker execution. When general task approvals are disabled, scheduling eligible worker tasks from the accepted queue is automatic, but direct DeepSeek tasks and host operations still require explicit local approval. Completion does not prove correctness, merge, deployment or end-to-end success.
 
 ### Migration to individual identity and roles
 
