@@ -1,6 +1,6 @@
 [Unit]
 Description=Orchestra OMCP coordinator (PixelBox)
-Documentation=file:/opt/orchestra/docs/PIXELBOX-MIGRATION.md
+Documentation=file:/opt/orchestra/current/docs/PIXELBOX-MIGRATION.md
 After=network-online.target
 Wants=network-online.target
 # These units do not manage or restart Tailscale Serve or the Nextcloud stack.
@@ -10,8 +10,9 @@ Conflicts=shutdown.target
 Type=simple
 User=hamed
 Group=hamed
-WorkingDirectory=/opt/orchestra
+WorkingDirectory=/opt/orchestra/current
 EnvironmentFile=/etc/orchestra/omcp.env
+ExecStartPre=/usr/bin/test -r /etc/orchestra/omcp.json
 ExecStart=/usr/bin/python3 -m omcp.server --config /etc/orchestra/omcp.json --socket /home/hamed/orchestra-migration/state/mcp.sock
 Restart=on-failure
 RestartSec=5
@@ -27,9 +28,9 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/home/hamed/orchestra-migration/state
-ReadWritePaths=/home/hamed/orchestra-migration/checkout
-ReadWritePaths=/home/hamed/.codex
-ReadWritePaths=/home/hamed/.codex-ina
+ReadWritePaths=-/home/hamed/orchestra-migration/checkout
+ReadWritePaths=-/home/hamed/.codex
+ReadWritePaths=-/home/hamed/.codex-ina
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=yes
 RestrictRealtime=yes

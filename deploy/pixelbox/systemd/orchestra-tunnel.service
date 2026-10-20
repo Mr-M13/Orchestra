@@ -1,6 +1,6 @@
 [Unit]
 Description=OpenAI Secure MCP Tunnel for Orchestra (PixelBox)
-Documentation=file:/opt/orchestra/docs/PIXELBOX-MIGRATION.md
+Documentation=file:/opt/orchestra/current/docs/PIXELBOX-MIGRATION.md
 After=network-online.target orchestra-omcp.service
 Wants=network-online.target
 Requires=orchestra-omcp.service
@@ -12,8 +12,9 @@ Requires=orchestra-omcp.service
 Type=simple
 User=hamed
 Group=hamed
-WorkingDirectory=/opt/orchestra
+WorkingDirectory=/opt/orchestra/current
 EnvironmentFile=/etc/orchestra/tunnel.env
+ExecStartPre=/usr/bin/test -S /home/hamed/orchestra-migration/state/mcp.sock
 ExecStart=/usr/local/bin/tunnel-client run --profile pixelbox
 Restart=always
 RestartSec=5
@@ -23,9 +24,9 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/hamed/.config/tunnel-client
-ReadWritePaths=/home/hamed/.local/share/tunnel-client
-ReadWritePaths=/home/hamed/.local/state/tunnel-client
+ReadWritePaths=-/home/hamed/.config/tunnel-client
+ReadWritePaths=-/home/hamed/.local/share/tunnel-client
+ReadWritePaths=-/home/hamed/.local/state/tunnel-client
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=yes
 

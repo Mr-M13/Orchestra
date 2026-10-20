@@ -1,6 +1,8 @@
 # PixelBox migration: Linux ARM64 coordinator with GitHub Actions workers
 
-Status: **implementation complete; deployment and cutover require explicit owner approval.**
+Status: **implementation and portable release-staging logic are locally tested;
+Linux ARM64 staging, live deployment verification, and production cutover have
+not been performed and require explicit owner approval.**
 
 PixelBox (`hamed@100.70.11.93`) becomes the persistent Orchestra coordinator.
 GitHub Actions supplies disposable coding workers. ChatGPT remains the control
@@ -87,7 +89,10 @@ available; remote approval is not enabled by this migration.
 Keep the deployed source, checkout and state separate:
 
 ```text
-/opt/orchestra/                         deployed reviewed source
+/opt/orchestra/
+  releases/<40-character-git-sha>/      root-owned source exported from Git
+  current -> releases/<sha>              atomically selected active release
+  previous -> releases/<sha>             last successfully active release
 /home/hamed/orchestra-migration/
   checkout/                             owner Git checkout (origin/main)
   state/                                private authoritative state
@@ -100,7 +105,10 @@ Keep the deployed source, checkout and state separate:
 ```
 
 `state_dir` must remain outside `project_root`. OMCP enforces this and refuses a
-configuration whose state lives inside the checkout.
+configuration whose state lives inside the checkout. Create and verify the
+actual checkout before activation; the installer does not clone a repository
+or infer a production revision. Every mutating command requires the full,
+reviewed 40-character Git commit SHA.
 
 ## 4. GitHub Actions worker setup
 
@@ -186,7 +194,7 @@ request or log.
 Validate without starting the service:
 
 ```sh
-cd /opt/orchestra
+cd /opt/orchestra/current
 python3 -c 'from pathlib import Path; from omcp.controller import Config; Config.load(Path("/etc/orchestra/omcp.json")); print("configuration valid")'
 ```
 
@@ -255,22 +263,48 @@ Units live in `deploy/pixelbox/systemd/`:
 | `orchestra-health.service` | one-shot sanitized health report |
 | `orchestra-health.timer` | runs health every two minutes |
 
-Preview the installation without changing anything:
+Preview the exact current commit without changing anything:
 
 ```sh
 ./deploy/pixelbox/install.sh
 ```
 
-After explicit cutover approval:
+Record the full reviewed commit ID, then stage only that Git object. `git
+archive` is used, so uncommitted checkout changes cannot enter the release:
 
 ```sh
-ORCHESTRA_CUTOVER_APPROVED=1 ./deploy/pixelbox/install.sh --apply
+release_sha=$(git rev-parse HEAD^{commit})
+ORCHESTRA_DEPLOY_APPROVED=1 \
+  ./deploy/pixelbox/install.sh --stage --sha "$release_sha"
 ```
 
-The installer copies the reviewed tree, installs units, preserves existing
-configuration files, and starts only the coordinator and health timer. It does
-not touch Nextcloud units, Docker, Tailscale Serve, the Mac service, or the
-tunnel. Enable the tunnel separately after its profile is verified.
+Staging records and rechecks a SHA-256 digest of the complete exported tree, in
+addition to validating the release marker, required files, shell syntax, and
+Python compilation. It may create missing configuration templates, but it does not
+install systemd units, change `current`, or start services. Portable staging on
+macOS or x86 validates only those portable mechanics; it is not evidence that
+the release has been staged or run on Linux ARM64.
+
+After reviewing the owner-only configuration and granting separate cutover
+approval, activate the already staged SHA:
+
+```sh
+ORCHESTRA_DEPLOY_APPROVED=1 ORCHESTRA_CUTOVER_APPROVED=1 \
+  ./deploy/pixelbox/install.sh --activate --sha "$release_sha"
+```
+
+Activation is refused unless the host is Linux ARM64 and the reviewed PixelBox
+paths and service user are in use. Configuration validation completes before
+any systemd state changes. The installer then installs units that point at
+`/opt/orchestra/current`, replaces that symlink with one atomic rename, and
+restarts only the coordinator and health timer. A failed activation restores
+the prior symlink and unit files. It does not touch Nextcloud, Docker, Tailscale,
+the Mac coordinator, or the tunnel. Enable the tunnel separately only after its
+profile is verified.
+
+`--apply` stages and activates in one invocation for compatibility. If it
+creates templates or finds the GitHub token absent, it exits with status `3`
+without changing systemd or the active symlink.
 
 Common commands:
 
@@ -290,7 +324,7 @@ coordinator adopts only a matching task/lease/PID and fails closed otherwise.
 ## 8. Health and diagnostics
 
 ```sh
-cd /opt/orchestra
+cd /opt/orchestra/current
 python3 -m omcp.health --config /etc/orchestra/omcp.json
 python3 -m omcp.health --config /etc/orchestra/omcp.json --json
 python3 -m omcp.health --config /etc/orchestra/omcp.json \
@@ -318,7 +352,7 @@ Approval policy remains server-owned. The remote MCP caller cannot approve a
 task or change policy. Use a local terminal:
 
 ```sh
-cd /opt/orchestra
+cd /opt/orchestra/current
 python3 -m omcp.approval \
   --config /etc/orchestra/omcp.json \
   --task-id TASK_ID \
@@ -430,17 +464,39 @@ of the following evidence is recorded:
     status are observed unchanged. Do not restart or edit them as part of this
     gate.
 
+After the tunnel is enabled, run
+`ORCHESTRA_TUNNEL_HEALTH_URL=<verified-local-ready-url> ./deploy/pixelbox/verify.sh --live --sha <40-character-sha>`.
+Default verification mode is staging-safe and may skip absent services; only
+`--live` turns those skips into cutover failures. It also requires Linux ARM64
+and proves that `current`, the release directory, and its marker identify the
+expected exact SHA.
+
 Only then route the production ChatGPT app to the PixelBox tunnel. Keep the Mac
 service available for rollback until the owner records a successful observation
 window.
 
 ### Rollback
 
-Rollback is a routing action, not a code mutation:
+For a software rollback, choose a previously staged exact SHA (normally the
+target of `/opt/orchestra/previous`) and obtain explicit cutover approval:
+
+```sh
+readlink /opt/orchestra/previous
+ORCHESTRA_DEPLOY_APPROVED=1 ORCHESTRA_CUTOVER_APPROVED=1 \
+  /opt/orchestra/current/deploy/pixelbox/install.sh \
+  --rollback --sha <previous-40-character-sha>
+```
+
+Rollback revalidates configuration against that release, atomically selects
+it, reinstalls its unit files, and restarts only the coordinator and health
+timer. The release being replaced becomes `previous`, so the operation is
+reversible. An activation failure also attempts this restoration automatically.
+
+Routing rollback remains a separate, explicitly approved operation:
 
 1. Disable the PixelBox tunnel unit.
 2. Point the private ChatGPT app back to the verified Mac tunnel.
-3. Leave PixelBox state and logs intact for evidence.
+3. Leave PixelBox releases, state, and logs intact for evidence.
 4. Re-run the Mac health and harmless-task checks.
 5. Do not delete PixelBox state until the owner authorises retention cleanup.
 
