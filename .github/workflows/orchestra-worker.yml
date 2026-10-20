@@ -3,7 +3,7 @@ name: Orchestra ephemeral worker
 # The Orchestra coordinator dispatches this workflow only after its own
 # repository, worker, approval and scheduler checks pass.  The workflow has no
 # repository write permission: it returns a patch artifact instead of pushing.
-run-name: Orchestra ${{ inputs.task_id }}
+run-name: Orchestra ${{ inputs.task_id }} ${{ inputs.dispatch_id }}
 
 on:
   workflow_dispatch:
@@ -14,6 +14,14 @@ on:
         type: string
       request_id:
         description: Orchestra idempotency key
+        required: true
+        type: string
+      dispatch_id:
+        description: Coordinator-generated UUID for this dispatch attempt
+        required: true
+        type: string
+      dispatched_at:
+        description: Coordinator-persisted UTC dispatch timestamp
         required: true
         type: string
       agent:
@@ -43,7 +51,8 @@ concurrency:
 jobs:
   execute:
     name: Execute approved task
-    runs-on: ubuntu-latest
+    # Fixed ARM64 image label exercises the same architecture as PixelBox.
+    runs-on: ubuntu-24.04-arm
     environment: orchestra-workers
     timeout-minutes: 180
     steps:
@@ -66,6 +75,8 @@ jobs:
         env:
           ORCHESTRA_TASK_ID: ${{ inputs.task_id }}
           ORCHESTRA_REQUEST_ID: ${{ inputs.request_id }}
+          ORCHESTRA_DISPATCH_ID: ${{ inputs.dispatch_id }}
+          ORCHESTRA_DISPATCHED_AT: ${{ inputs.dispatched_at }}
           ORCHESTRA_AGENT: ${{ inputs.agent }}
           ORCHESTRA_MODEL: ${{ inputs.model }}
           ORCHESTRA_PAYLOAD: ${{ inputs.payload }}
@@ -79,6 +90,8 @@ jobs:
         env:
           ORCHESTRA_TASK_ID: ${{ inputs.task_id }}
           ORCHESTRA_REQUEST_ID: ${{ inputs.request_id }}
+          ORCHESTRA_DISPATCH_ID: ${{ inputs.dispatch_id }}
+          ORCHESTRA_DISPATCHED_AT: ${{ inputs.dispatched_at }}
           ORCHESTRA_AGENT: ${{ inputs.agent }}
           ORCHESTRA_MODEL: ${{ inputs.model }}
           ORCHESTRA_PAYLOAD: ${{ inputs.payload }}

@@ -18,10 +18,9 @@ from pathlib import Path
 from typing import Any
 
 from omcp.github_actions import (
-    GitHubActionsClient, GitHubActionsError, RunState, client_from_spec,
-    write_state,
+    DispatchIdentity, GitHubActionsClient, GitHubActionsError, RunState,
+    client_from_spec, load_or_create_dispatch_identity, write_state,
 )
-from omcp.platform import canonical_git_executable
 from omcp.runner import (
     RunnerTerminated, atomic_json, utc_now, write_private_text,
     write_startup_lease,
@@ -47,18 +46,30 @@ def _apply_patch(workspace: Path, task_dir: Path, patch: bytes, maximum: int) ->
         raise RuntimeError("remote patch exceeded the configured result bound")
     patch_path = task_dir / "remote.patch.diff"
     write_private_text(patch_path, patch.decode("utf-8", "replace"))
-    git = canonical_git_executable()
+    git = "/usr/bin/git"
+    git_home = task_dir / "git-home"
+    git_home.mkdir(mode=0o700, exist_ok=True)
+    git_environment = {
+        key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL")
+        if key in os.environ
+    }
+    git_environment.update({
+        "HOME": str(git_home),
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+    })
     check = subprocess.run(
         [git, "-C", str(workspace), "apply", "--check", str(patch_path)],
         capture_output=True, text=True, check=False, timeout=60,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        env=git_environment,
     )
     if check.returncode:
         raise RuntimeError("remote patch does not apply to the base worktree")
     applied = subprocess.run(
         [git, "-C", str(workspace), "apply", str(patch_path)],
         capture_output=True, text=True, check=False, timeout=60,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        env=git_environment,
     )
     if applied.returncode:
         raise RuntimeError("remote patch application failed")
@@ -89,9 +100,12 @@ def run(spec_path: Path) -> int:
     deadline_seconds = int(spec.get("max_worker_seconds", 1_800))
     poll_seconds = int(spec.get("poll_seconds", 10))
     state_path = Path(spec.get("remote_state_path") or (task_dir / "github-state.json"))
+    if state_path.resolve(strict=False).parent != task_dir.resolve():
+        raise ValueError("remote state must stay in the private task directory")
     artifact_name = str(spec.get("artifact_name") or ("omcp-" + task_id))
     client: GitHubActionsClient | None = None
     run_state: RunState | None = None
+    identity: DispatchIdentity | None = None
     exit_code, error_type = 125, None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
 
@@ -101,41 +115,52 @@ def run(spec_path: Path) -> int:
     signal.signal(signal.SIGTERM, terminate)
     try:
         client = client_from_spec(spec)
-        # A crash after dispatch but before recording the run ID is recovered by
-        # adopting the deterministic run name rather than dispatching twice.
-        run_state = client.find_run(task_id)
+        request_id = str(spec.get("request_id", task_id))
+        identity, resumed = load_or_create_dispatch_identity(
+            state_path, task_id, request_id,
+        )
+        # A restart may adopt only the exact pre-persisted nonce, dispatch time,
+        # configured ref and head SHA.  If it is not visible, fail closed rather
+        # than dispatching a possible duplicate.
+        run_state = client.find_run(identity)
         if _cancelled(task_dir):
             # A queued runner can start after the coordinator has already
             # recorded cancellation.  Adopt and cancel an existing run, but do
             # not create a new remote side effect for a cancelled task.
             exit_code, error_type = 130, "Cancelled"
-            _cancel_quietly(client, run_state, state_path)
+            _cancel_quietly(client, run_state, state_path, identity)
             return exit_code
         if run_state is None:
+            if resumed:
+                raise GitHubActionsError(
+                    "prepared GitHub dispatch has no exact adoptable run"
+                )
             # Close the cancellation race as near as possible to dispatch.
             if _cancelled(task_dir):
                 exit_code, error_type = 130, "Cancelled"
                 return exit_code
             client.dispatch(
-                task_id, str(spec.get("request_id", task_id)),
-                str(spec["agent"]), str(spec["model"]),
+                identity, str(spec["agent"]), str(spec["model"]),
                 prompt.read_text(encoding="utf-8"),
             )
-            run_state = client.wait_for_run(task_id)
-        write_state(state_path, run_state, dispatched_at=utc_now())
+            run_state = client.wait_for_run(identity)
+        write_state(state_path, run_state, identity)
         started = time.monotonic()
         while True:
             if _cancelled(task_dir):
-                client.cancel(run_state.run_id)
-                write_state(state_path, run_state, cancellation_requested_at=utc_now())
+                client.cancel(run_state.run_id, identity)
+                write_state(
+                    state_path, run_state, identity,
+                    cancellation_requested_at=utc_now(),
+                )
                 exit_code, error_type = 130, "Cancelled"
                 break
             if time.monotonic() - started > deadline_seconds:
-                client.cancel(run_state.run_id)
+                client.cancel(run_state.run_id, identity)
                 exit_code, error_type = 124, "WorkerTimeout"
                 break
-            run_state = client.status(run_state.run_id)
-            write_state(state_path, run_state)
+            run_state = client.status(run_state.run_id, identity)
+            write_state(state_path, run_state, identity)
             if run_state.status == "completed":
                 if run_state.conclusion != "success":
                     exit_code = 1
@@ -171,11 +196,11 @@ def run(spec_path: Path) -> int:
     except RunnerTerminated as exc:
         error_type = type(exc).__name__
         exit_code = 128 + exc.signum
-        _cancel_quietly(client, run_state, state_path, task_id)
+        _cancel_quietly(client, run_state, state_path, identity)
     except (GitHubActionsError, OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
         error_type = type(exc).__name__
         exit_code = 1
-        _cancel_quietly(client, run_state, state_path, task_id)
+        _cancel_quietly(client, run_state, state_path, identity)
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
         if exit_code != 0:
@@ -196,19 +221,22 @@ def run(spec_path: Path) -> int:
 
 def _cancel_quietly(client: GitHubActionsClient | None,
                     run_state: RunState | None, state_path: Path,
-                    task_id: str | None = None) -> None:
-    if client is None:
+                    identity: DispatchIdentity | None = None) -> None:
+    if client is None or identity is None:
         return
     try:
-        if run_state is None and task_id is not None:
+        if run_state is None:
             # SIGTERM can arrive after dispatch but before the run ID was
             # persisted.  Adopt the deterministic run and cancel it rather than
             # leaving an orphan executing in GitHub.
-            run_state = client.find_run(task_id)
+            run_state = client.find_run(identity)
         if run_state is None:
             return
-        client.cancel(run_state.run_id)
-        write_state(state_path, run_state, cancellation_requested_at=utc_now())
+        client.cancel(run_state.run_id, identity)
+        write_state(
+            state_path, run_state, identity,
+            cancellation_requested_at=utc_now(),
+        )
     except Exception:
         # The completion record remains authoritative; an operator can cancel
         # the exact run URL from the persisted safe metadata.

@@ -9,12 +9,14 @@ import urllib.request
 import warnings
 import zipfile
 import zlib
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from omcp.github_actions import (
     GitHubActionsClient,
     GitHubActionsError,
+    DispatchIdentity,
     _SafeRedirectHandler,
     decode_instructions,
     encode_instructions,
@@ -28,6 +30,13 @@ from scripts.orchestra_actions_worker import (
 
 
 TASK_ID = "11111111-1111-1111-1111-111111111111"
+TASK_SHA = "a" * 40
+DISPATCH_ID = "22222222-2222-4222-8222-222222222222"
+DISPATCHED_AT = "2026-10-20T00:00:00+00:00"
+
+
+def dispatch_identity() -> DispatchIdentity:
+    return DispatchIdentity(TASK_ID, "request-1", DISPATCH_ID, DISPATCHED_AT)
 
 
 class Response:
@@ -92,11 +101,68 @@ class HttpHardeningTests(unittest.TestCase):
             token.write_text("secret-token\n")
             token.chmod(0o600)
             client = GitHubActionsClient(
-                "owner/repo", "orchestra-worker.yml", "main", token,
+                "owner/repo", "orchestra-worker.yml", "main", TASK_SHA, token,
                 opener=Mock(),
             )
             with self.assertRaisesRegex(ValueError, "task_id"):
-                client.dispatch("-" * 36, "request-1", "codex", "gpt-5", "task")
+                client.dispatch(
+                    DispatchIdentity("-" * 36, "request-1", DISPATCH_ID, DISPATCHED_AT),
+                    "codex", "gpt-5", "task",
+                )
+
+    def test_client_requires_current_service_uid_and_private_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token = Path(directory) / "token"
+            token.write_text("secret-token\n")
+            token.chmod(0o600)
+            with self.assertRaisesRegex(PermissionError, "identity"):
+                GitHubActionsClient(
+                    "owner/repo", "orchestra-worker.yml", "main", TASK_SHA,
+                    token, service_uid=os.geteuid() + 1,
+                )
+            Path(directory).chmod(0o750)
+            with self.assertRaisesRegex(PermissionError, "directory"):
+                GitHubActionsClient(
+                    "owner/repo", "orchestra-worker.yml", "main", TASK_SHA, token,
+                )
+
+    def test_client_rejects_symlinked_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            real = root / "real-token"
+            link = root / "token"
+            real.write_text("secret-token\n")
+            real.chmod(0o600)
+            link.symlink_to(real)
+            with self.assertRaisesRegex(PermissionError, "regular file"):
+                GitHubActionsClient(
+                    "owner/repo", "orchestra-worker.yml", "main", TASK_SHA, link,
+                )
+
+    def test_find_run_rejects_stale_same_name_and_wrong_ref_or_sha(self):
+        created = datetime.fromisoformat(DISPATCHED_AT)
+        exact = {
+            "id": 7, "display_title": dispatch_identity().run_name,
+            "event": "workflow_dispatch", "head_sha": TASK_SHA,
+            "head_branch": "main", "created_at": created.isoformat(),
+            "status": "queued", "conclusion": None,
+            "html_url": "https://github.com/owner/repo/actions/runs/7",
+        }
+        stale = {**exact, "id": 6,
+                 "created_at": (created - timedelta(days=1)).isoformat()}
+        wrong_sha = {**exact, "id": 5, "head_sha": "b" * 40}
+        payload = json.dumps({"workflow_runs": [stale, wrong_sha, exact]}).encode()
+        with tempfile.TemporaryDirectory() as directory:
+            token = Path(directory) / "token"
+            token.write_text("secret-token\n")
+            token.chmod(0o600)
+            client = GitHubActionsClient(
+                "owner/repo", "orchestra-worker.yml", "main", TASK_SHA, token,
+                opener=lambda *_args, **_kwargs: Response(payload),
+            )
+            run = client.find_run(dispatch_identity())
+        self.assertIsNotNone(run)
+        self.assertEqual(run.run_id, 7)
 
 
 class ArtifactHardeningTests(unittest.TestCase):
@@ -118,7 +184,7 @@ class ArtifactHardeningTests(unittest.TestCase):
         }]}).encode()
         responses = iter((metadata, archive))
         return GitHubActionsClient(
-            "owner/repo", "orchestra-worker.yml", "main", self.token,
+            "owner/repo", "orchestra-worker.yml", "main", TASK_SHA, self.token,
             opener=lambda *_args, **_kwargs: Response(next(responses)),
         )
 
@@ -196,6 +262,8 @@ class WorkerArtifactTests(unittest.TestCase):
                 "HOME": str(root / "home"),
                 "ORCHESTRA_TASK_ID": TASK_ID,
                 "ORCHESTRA_REQUEST_ID": "request-1",
+                "ORCHESTRA_DISPATCH_ID": DISPATCH_ID,
+                "ORCHESTRA_DISPATCHED_AT": DISPATCHED_AT,
                 "ORCHESTRA_AGENT": "codex",
                 "ORCHESTRA_MODEL": "gpt-5-codex",
                 "ORCHESTRA_PAYLOAD": encoded,
@@ -232,19 +300,34 @@ class WorkerArtifactTests(unittest.TestCase):
             run.call_args_list[0].kwargs["env"]["OPENAI_API_KEY"],
             "openai-secret-token-value",
         )
+        self.assertTrue(
+            run.call_args_list[0].kwargs["env"]["HOME"].endswith("runtime/codex-home")
+        )
         self.assertNotIn("DEEPSEEK_API_KEY", run.call_args_list[0].kwargs["env"])
         for call in run.call_args_list[1:]:
             self.assertNotIn("OPENAI_API_KEY", call.kwargs["env"])
             self.assertNotIn("DEEPSEEK_API_KEY", call.kwargs["env"])
 
     def test_workflow_actions_are_pinned_to_full_commit_shas(self):
-        workflow = (
-            Path(__file__).resolve().parents[1]
-            / ".github/workflows/orchestra-worker.yml"
+        workflows = list(
+            (Path(__file__).resolve().parents[1] / ".github/workflows").glob("*.yml")
+        )
+        text = "\n".join(path.read_text() for path in workflows)
+        for line in text.splitlines():
+            if "uses:" in line:
+                self.assertRegex(line, r"uses: [^@]+@[0-9a-f]{40}(?:\s|$)")
+
+    def test_arm64_verification_is_reproducible_and_manual_only(self):
+        root = Path(__file__).resolve().parents[1]
+        worker = (root / ".github/workflows/orchestra-worker.yml").read_text()
+        verification = (
+            root / ".github/workflows/orchestra-security-ci.yml"
         ).read_text()
-        for action in ("actions/checkout", "actions/setup-python", "actions/upload-artifact"):
-            self.assertRegex(workflow, action + r"@[0-9a-f]{40}")
-        self.assertNotRegex(workflow, r"uses: actions/[^@]+@v\d")
+        self.assertIn("runs-on: ubuntu-24.04-arm", worker)
+        self.assertIn("runs-on: ubuntu-24.04-arm", verification)
+        self.assertIn("workflow_dispatch:", verification)
+        self.assertNotIn("pull_request:", verification)
+        self.assertNotIn("push:", verification)
 
     def test_workflow_scopes_each_provider_secret_to_its_agent_step(self):
         workflow = (

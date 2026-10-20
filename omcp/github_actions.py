@@ -19,17 +19,17 @@ import io
 import json
 import os
 import re
+import stat
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
-
-from omcp.platform import ensure_owner_only
+from uuid import uuid4
 
 
 DEFAULT_API_URL = "https://api.github.com"
@@ -38,6 +38,8 @@ MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 MAX_INSTRUCTION_BYTES = 65_536
 ALLOWED_ARTIFACT_FILES = {"result.txt", "patch.diff", "worker.log", "summary.json"}
 RUN_NAME_PREFIX = "Orchestra "
+RUN_CREATION_SKEW = timedelta(seconds=30)
+RUN_CREATION_WINDOW = timedelta(minutes=15)
 
 
 class GitHubActionsError(RuntimeError):
@@ -67,6 +69,71 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_utc(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError) as exc:
+        raise ValueError("invalid UTC timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("invalid UTC timestamp")
+    return parsed.astimezone(timezone.utc)
+
+
+def ensure_service_credential(path: Path, expected_uid: int) -> None:
+    """Require a token owned by this dedicated Unix service identity.
+
+    The immediate credential directory is private as well as the file.  A
+    coordinator or tunnel account therefore cannot reuse a token by pointing
+    this process at a shared or symlinked path.  Cross-identity transfer must
+    happen through the task/state protocol, never by sharing credential files.
+    """
+    if (not isinstance(expected_uid, int) or isinstance(expected_uid, bool)
+            or expected_uid < 0 or os.geteuid() != expected_uid):
+        raise PermissionError("GitHub adapter service identity does not match configuration")
+    path = Path(path)
+    try:
+        file_stat = path.lstat()
+        directory_stat = path.parent.lstat()
+    except OSError as exc:
+        raise PermissionError("GitHub token file is unavailable") from exc
+    if (stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_uid != expected_uid or file_stat.st_mode & 0o077):
+        raise PermissionError("GitHub token must be an owner-only regular file")
+    if (stat.S_ISLNK(directory_stat.st_mode)
+            or not stat.S_ISDIR(directory_stat.st_mode)
+            or directory_stat.st_uid != expected_uid
+            or directory_stat.st_mode & 0o077):
+        raise PermissionError("GitHub token directory must be owner-only")
+
+
+def _read_service_credential(path: Path, expected_uid: int) -> str:
+    """Open without following symlinks and revalidate the opened inode."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise GitHubActionsError("GitHub token file is unavailable") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != expected_uid
+                or opened.st_mode & 0o077):
+            raise GitHubActionsError("GitHub token file is invalid")
+        chunks = bytearray()
+        while len(chunks) <= 8192:
+            chunk = os.read(descriptor, 8193 - len(chunks))
+            if not chunk:
+                break
+            chunks.extend(chunk)
+    finally:
+        os.close(descriptor)
+    try:
+        value = bytes(chunks).decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise GitHubActionsError("GitHub token file is invalid") from exc
+    if not value or len(chunks) > 8192 or any(character.isspace() for character in value):
+        raise GitHubActionsError("GitHub token file is invalid")
+    return value
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -155,6 +222,62 @@ class RunState:
     url: str | None
 
 
+@dataclass(frozen=True)
+class DispatchIdentity:
+    task_id: str
+    request_id: str
+    dispatch_id: str
+    dispatched_at: str
+
+    @property
+    def run_name(self) -> str:
+        return RUN_NAME_PREFIX + self.task_id + " " + self.dispatch_id
+
+
+def _validate_dispatch_identity(identity: DispatchIdentity) -> DispatchIdentity:
+    if not re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        identity.task_id,
+    ):
+        raise ValueError("invalid task_id for GitHub dispatch")
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", identity.request_id):
+        raise ValueError("invalid request_id for GitHub dispatch")
+    if not re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+        identity.dispatch_id,
+    ):
+        raise ValueError("invalid GitHub dispatch identity")
+    _parse_utc(identity.dispatched_at)
+    return identity
+
+
+def load_or_create_dispatch_identity(
+    path: Path, task_id: str, request_id: str,
+) -> tuple[DispatchIdentity, bool]:
+    """Persist identity and dispatch time before any remote side effect."""
+    if path.exists():
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("invalid GitHub dispatch state")
+        identity = DispatchIdentity(
+            str(value.get("task_id", "")), str(value.get("request_id", "")),
+            str(value.get("dispatch_id", "")), str(value.get("dispatched_at", "")),
+        )
+        _validate_dispatch_identity(identity)
+        if identity.task_id != task_id or identity.request_id != request_id:
+            raise ValueError("GitHub dispatch state does not match this task")
+        return identity, True
+    identity = _validate_dispatch_identity(DispatchIdentity(
+        task_id, request_id, str(uuid4()), utc_now(),
+    ))
+    _atomic_json(path, {
+        "schema_version": 2, "phase": "prepared",
+        "task_id": identity.task_id, "request_id": identity.request_id,
+        "dispatch_id": identity.dispatch_id, "dispatched_at": identity.dispatched_at,
+    })
+    return identity, False
+
+
 class GitHubActionsClient:
     """Small, bounded REST client with no shell or token-in-argument path."""
 
@@ -163,7 +286,9 @@ class GitHubActionsClient:
         repository: str,
         workflow: str,
         ref: str,
+        head_sha: str,
         credential_file: Path,
+        service_uid: int | None = None,
         api_url: str = DEFAULT_API_URL,
         opener: Callable[..., Any] | None = None,
         sleep: Callable[[float], None] = time.sleep,
@@ -175,6 +300,9 @@ class GitHubActionsClient:
         if ".." in ref.split("/") or ref.startswith("-"):
             raise ValueError("GitHub workflow ref is unsafe")
         self.ref = ref
+        if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", head_sha):
+            raise ValueError("GitHub workflow head SHA must be a full commit SHA")
+        self.head_sha = head_sha.lower()
         self.api_url = api_url.rstrip("/")
         parsed = urllib.parse.urlparse(self.api_url)
         loopback = parsed.hostname in {"127.0.0.1", "localhost", "::1"}
@@ -183,7 +311,8 @@ class GitHubActionsClient:
                 or parsed.query or parsed.fragment):
             raise ValueError("GitHub API URL must use HTTPS")
         self.credential_file = Path(credential_file)
-        ensure_owner_only(self.credential_file)
+        self.service_uid = os.geteuid() if service_uid is None else service_uid
+        ensure_service_credential(self.credential_file, self.service_uid)
         self._opener = opener or urllib.request.build_opener(
             _SafeRedirectHandler(),
         ).open
@@ -192,13 +321,9 @@ class GitHubActionsClient:
 
     def _credential(self) -> str:
         if self._token is None:
-            try:
-                value = self.credential_file.read_text(encoding="utf-8").strip()
-            except OSError as exc:
-                raise GitHubActionsError("GitHub token file is unavailable") from exc
-            if not value or len(value) > 8192 or any(character.isspace() for character in value):
-                raise GitHubActionsError("GitHub token file is invalid")
-            self._token = value
+            self._token = _read_service_credential(
+                self.credential_file, self.service_uid,
+            )
         return self._token
 
     def _request(
@@ -244,18 +369,10 @@ class GitHubActionsClient:
         workflow = urllib.parse.quote(self.workflow, safe="")
         return f"/repos/{self.repository}/actions/workflows/{workflow}"
 
-    def dispatch(self, task_id: str, request_id: str, agent: str, model: str,
+    def dispatch(self, identity: DispatchIdentity, agent: str, model: str,
                  instructions: str) -> str:
         """Dispatch one workflow run and return the encoded dispatch marker."""
-        if not isinstance(task_id, str) or not re.fullmatch(
-            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-            task_id,
-        ):
-            raise ValueError("invalid task_id for GitHub dispatch")
-        if not isinstance(request_id, str) or not re.fullmatch(
-            r"[A-Za-z0-9_.:-]{1,128}", request_id,
-        ):
-            raise ValueError("invalid request_id for GitHub dispatch")
+        _validate_dispatch_identity(identity)
         if agent not in {"codex", "deepseek"}:
             raise ValueError("unsupported GitHub Actions agent")
         if not isinstance(model, str) or not re.fullmatch(
@@ -266,8 +383,10 @@ class GitHubActionsClient:
         self._request("POST", self._workflow_path + "/dispatches", {
             "ref": self.ref,
             "inputs": {
-                "task_id": task_id,
-                "request_id": request_id,
+                "task_id": identity.task_id,
+                "request_id": identity.request_id,
+                "dispatch_id": identity.dispatch_id,
+                "dispatched_at": identity.dispatched_at,
                 "agent": agent,
                 "model": model,
                 "payload": encoded,
@@ -275,10 +394,39 @@ class GitHubActionsClient:
         })
         return encoded
 
-    def find_run(self, task_id: str) -> RunState | None:
-        """Find a run by the workflow's deterministic run-name."""
+    def _run_state(self, run: object, identity: DispatchIdentity) -> RunState | None:
+        if not isinstance(run, dict):
+            return None
+        if (run.get("display_title") != identity.run_name
+                or run.get("event") != "workflow_dispatch"
+                or str(run.get("head_sha", "")).lower() != self.head_sha):
+            return None
+        ref_name = self.ref.removeprefix("refs/heads/").removeprefix("refs/tags/")
+        if run.get("head_branch") != ref_name:
+            return None
+        try:
+            created = _parse_utc(str(run.get("created_at", "")))
+        except ValueError:
+            return None
+        dispatched = _parse_utc(identity.dispatched_at)
+        if not dispatched - RUN_CREATION_SKEW <= created <= dispatched + RUN_CREATION_WINDOW:
+            return None
+        run_id = run.get("id")
+        if not isinstance(run_id, int) or isinstance(run_id, bool):
+            return None
+        conclusion = run.get("conclusion")
+        url = run.get("html_url")
+        return RunState(
+            run_id, str(run.get("status", "unknown")),
+            conclusion if isinstance(conclusion, str) or conclusion is None else None,
+            url if isinstance(url, str) or url is None else None,
+        )
+
+    def find_run(self, identity: DispatchIdentity) -> RunState | None:
+        """Find only the exact ref/SHA/time-bound dispatch instance."""
+        _validate_dispatch_identity(identity)
         query = urllib.parse.urlencode({
-            "event": "workflow_dispatch", "per_page": 100,
+            "event": "workflow_dispatch", "branch": self.ref, "per_page": 100,
         })
         result = self._request(
             "GET", self._workflow_path + "/runs?" + query,
@@ -286,42 +434,32 @@ class GitHubActionsClient:
         runs = result.get("workflow_runs") if isinstance(result, dict) else None
         if not isinstance(runs, list):
             return None
-        expected = RUN_NAME_PREFIX + task_id
         for run in runs:
-            if not isinstance(run, dict):
-                continue
-            if run.get("display_title") != expected:
-                continue
-            run_id = run.get("id")
-            if not isinstance(run_id, int):
-                continue
-            return RunState(
-                run_id, str(run.get("status", "unknown")),
-                run.get("conclusion"), run.get("html_url"),
-            )
+            state = self._run_state(run, identity)
+            if state is not None:
+                return state
         return None
 
-    def wait_for_run(self, task_id: str, seconds: int = 90) -> RunState:
+    def wait_for_run(self, identity: DispatchIdentity, seconds: int = 90) -> RunState:
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
-            found = self.find_run(task_id)
+            found = self.find_run(identity)
             if found is not None:
                 return found
             self.sleep(3)
         raise GitHubActionsError("GitHub Actions run was not created")
 
-    def status(self, run_id: int) -> RunState:
+    def status(self, run_id: int, identity: DispatchIdentity) -> RunState:
         result = self._request(
             "GET", f"/repos/{self.repository}/actions/runs/{int(run_id)}",
         )
-        if not isinstance(result, dict):
+        state = self._run_state(result, identity)
+        if state is None or state.run_id != int(run_id):
             raise GitHubActionsError("invalid GitHub Actions run response")
-        return RunState(
-            int(run_id), str(result.get("status", "unknown")),
-            result.get("conclusion"), result.get("html_url"),
-        )
+        return state
 
-    def cancel(self, run_id: int) -> None:
+    def cancel(self, run_id: int, identity: DispatchIdentity) -> None:
+        self.status(run_id, identity)
         self._request(
             "POST", f"/repos/{self.repository}/actions/runs/{int(run_id)}/cancel",
         )
@@ -390,9 +528,13 @@ def load_spec(task_dir: Path) -> dict[str, Any]:
 
 
 def client_from_spec(spec: dict[str, Any]) -> GitHubActionsClient:
+    service_uid = spec.get("github_service_uid")
+    if not isinstance(service_uid, int) or isinstance(service_uid, bool):
+        raise ValueError("github_service_uid must bind the GitHub adapter identity")
     return GitHubActionsClient(
         str(spec["github_repository"]), str(spec["workflow"]),
-        str(spec["workflow_ref"]), Path(str(spec["credential_file"])),
+        str(spec["workflow_ref"]), str(spec["workflow_sha"]),
+        Path(str(spec["credential_file"])), service_uid=service_uid,
         api_url=str(spec.get("github_api_url") or DEFAULT_API_URL),
     )
 
@@ -407,20 +549,34 @@ def cancel_task_run(task_dir: Path, reason: str = "task cancelled") -> dict[str,
         return None
     run_id = state.get("run_id") if isinstance(state, dict) else None
     client = client_from_spec(spec)
+    if not isinstance(state, dict):
+        return None
+    try:
+        identity = _validate_dispatch_identity(DispatchIdentity(
+            str(state.get("task_id", "")), str(state.get("request_id", "")),
+            str(state.get("dispatch_id", "")), str(state.get("dispatched_at", "")),
+        ))
+    except ValueError:
+        return None
     if not isinstance(run_id, int):
-        # The runner may have dispatched and died before persisting the run ID.
-        # Adopt the deterministic run name and cancel that exact run.
-        found = client.find_run(str(spec.get("task_id", "")))
+        # Adopt only the exact pre-persisted dispatch identity, ref and head SHA.
+        found = client.find_run(identity)
         if found is None:
             return None
         run_id = found.run_id
-    client.cancel(run_id)
+    client.cancel(run_id, identity)
     return {"run_id": run_id, "reason": reason[:500]}
 
 
-def write_state(path: Path, run: RunState, **extra: Any) -> None:
+def write_state(path: Path, run: RunState, identity: DispatchIdentity,
+                **extra: Any) -> None:
     value = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "phase": "adopted",
+        "task_id": identity.task_id,
+        "request_id": identity.request_id,
+        "dispatch_id": identity.dispatch_id,
+        "dispatched_at": identity.dispatched_at,
         "run_id": run.run_id,
         "status": run.status,
         "conclusion": run.conclusion,
