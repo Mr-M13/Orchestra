@@ -43,10 +43,34 @@ CONSEQUENCE_CLASSES = {
     "security_change", "unclassified",
 }
 STANDING_AUTHORIZABLE_CLASSES = {"routine_development"}
+OPENCODE_DIAGNOSTIC_CATEGORIES = {
+    "authentication", "config", "endpoint_or_model_not_found", "local_server_bind",
+    "model_unavailable", "network", "provider_request", "provider_server", "rate_limit",
+    "request_rejected", "sandbox_denied", "sandbox_profile", "standalone_startup", "timeout",
+    "tls", "unknown",
+}
+OPENCODE_EXIT_CAUSES = {"process_exit", "signal", "timeout"}
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def safe_opencode_diagnostic(value: object) -> dict[str, Any] | None:
+    """Accept only the fixed, non-sensitive OpenCode diagnostic vocabulary."""
+    if not isinstance(value, dict) or set(value) - {"category", "status", "exit_cause"}:
+        return None
+    category, exit_cause = value.get("category"), value.get("exit_cause")
+    status = value.get("status")
+    if category not in OPENCODE_DIAGNOSTIC_CATEGORIES or exit_cause not in OPENCODE_EXIT_CAUSES:
+        return None
+    if status is not None and (
+            not isinstance(status, int) or isinstance(status, bool) or not 100 <= status <= 599):
+        return None
+    result = {"category": category, "exit_cause": exit_cause}
+    if status is not None:
+        result["status"] = status
+    return result
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -1369,6 +1393,14 @@ class TaskController:
                 })
                 if result.get("runner_error"):
                     task["failure"] = {"type": result["runner_error"]}
+                worker = self.config.workers.get(task.get("worker"))
+                diagnostic = (safe_opencode_diagnostic(result.get("worker_diagnostic"))
+                              if worker is not None and worker.adapter == "opencode" else None)
+                if diagnostic is not None and result["exit_code"] != 0:
+                    task["failure"] = {
+                        "type": result.get("runner_error") or "OpenCodeExecutionFailed",
+                        **diagnostic,
+                    }
                 changed = True
                 self._reap_child(task.get("runner_pid"))
                 self._audit("task.complete", task["task_id"], "allowed", {"status": task["status"]})

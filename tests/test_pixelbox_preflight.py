@@ -13,8 +13,8 @@ from unittest.mock import patch
 
 from omcp.health import _iso_age_seconds
 from omcp.mcp_proxy import _validate_socket_path, connect
-from omcp.platform import SandboxPolicy, sandbox_command
-from omcp.runner import opencode_command
+from omcp.platform import SandboxPolicy, SandboxUnavailable, sandbox_command
+from omcp.runner import opencode_commands
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -108,7 +108,7 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
         self.assertIn("--share-net", command)
         self.assertNotIn("--unshare-net", command)
 
-    def test_opencode_runtime_environment_is_forwarded_after_clearenv(self):
+    def test_opencode_loopback_gateway_fails_closed_without_filtered_linux_backend(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             workspace = root / "workspace"
@@ -117,21 +117,19 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
             runtime.mkdir()
             prompt = root / "prompt.txt"
             prompt.write_text("bounded test")
-            credential = root / "credential"
-            credential.write_text("test-only")
-            credential.chmod(0o600)
             executable = root / "opencode-cli"
             executable.write_text("#!/bin/sh\nexit 0\n")
             executable.chmod(0o700)
             with patch("omcp.platform.host_platform", return_value="linux"), patch(
                 "omcp.platform.sandbox_executable", return_value="/usr/bin/bwrap"
             ):
-                command = opencode_command(
-                    str(executable), workspace, prompt, credential, runtime,
-                    "deepseek", "deepseek/deepseek-chat", "api.deepseek.com",
-                )
-        self.assertIn("XDG_CONFIG_HOME", command)
-        self.assertIn(str(runtime / "config"), command)
+                with self.assertRaisesRegex(SandboxUnavailable, "seatbelt.*not available"):
+                    opencode_commands(
+                        str(executable), workspace, prompt, runtime,
+                        "deepseek", "deepseek/deepseek-chat", "api.deepseek.com",
+                        "http://127.0.0.1:49152/abcdefghijklmnopqrstuvwxyzABCDEFG_123456/v1",
+                        49153,
+                    )
 
     def test_future_heartbeat_does_not_prove_liveness(self):
         future = datetime.now(timezone.utc) + timedelta(minutes=10)

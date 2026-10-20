@@ -82,6 +82,35 @@ class PlatformTests(unittest.TestCase):
         self.assertIn("--share-net", command)
         self.assertNotIn("--unshare-net", command)
 
+    def test_seatbelt_sandbox_emits_only_exact_loopback_ports(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("omcp.platform.host_platform", return_value="darwin"), \
+                patch("omcp.platform.sandbox_executable",
+                      return_value="/usr/bin/sandbox-exec"):
+            workspace = Path(directory)
+            command = sandbox_command(SandboxPolicy(
+                read_paths=(workspace,), write_paths=(workspace,),
+                loopback_bind_ports=(49153,), loopback_connect_ports=(49152,),
+                backend="seatbelt", workdir=workspace,
+            ), ["/usr/bin/true"])
+        profile = command[2]
+        self.assertIn('(local tcp "localhost:49153")', profile)
+        self.assertIn('(remote tcp "localhost:49152")', profile)
+        self.assertNotIn("localhost:*", profile)
+        self.assertNotIn("*:443", profile)
+        self.assertNotIn("api.deepseek.com", profile)
+
+    def test_linux_sandbox_rejects_unfiltered_loopback_policy(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("omcp.platform.host_platform", return_value="linux"), \
+                patch("omcp.platform.sandbox_executable", return_value="/usr/bin/bwrap"):
+            workspace = Path(directory)
+            with self.assertRaisesRegex(SandboxUnavailable, "exact loopback-port"):
+                sandbox_command(SandboxPolicy(
+                    write_paths=(workspace,), loopback_connect_ports=(49152,),
+                    backend="bubblewrap", workdir=workspace,
+                ), ["python3", "-V"])
+
     def test_sandbox_selection_fails_closed_on_an_unsupported_backend(self):
         with patch("omcp.platform.host_platform", return_value="linux"):
             self.assertEqual(sandbox_backend("bubblewrap"), "bubblewrap")
