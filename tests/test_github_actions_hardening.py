@@ -21,6 +21,7 @@ from omcp.github_actions import (
     _SafeRedirectHandler,
     decode_instructions,
     encode_instructions,
+    load_or_create_dispatch_identity,
 )
 from omcp.github_runner import run as run_github_worker
 from omcp.github_dispatch_service import DispatchService, ServiceConfig
@@ -38,7 +39,9 @@ DISPATCHED_AT = "2026-10-20T00:00:00+00:00"
 
 
 def dispatch_identity() -> DispatchIdentity:
-    return DispatchIdentity(TASK_ID, "request-1", DISPATCH_ID, DISPATCHED_AT)
+    return DispatchIdentity(
+        TASK_ID, "request-1", DISPATCH_ID, DISPATCHED_AT, TASK_SHA,
+    )
 
 
 class Response:
@@ -56,6 +59,19 @@ class Response:
 
 
 class PayloadHardeningTests(unittest.TestCase):
+    def test_persisted_dispatch_identity_is_bound_to_source_sha(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            identity, resumed = load_or_create_dispatch_identity(
+                state, TASK_ID, "request-1", TASK_SHA,
+            )
+            self.assertFalse(resumed)
+            self.assertEqual(identity.source_sha, TASK_SHA)
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                load_or_create_dispatch_identity(
+                    state, TASK_ID, "request-1", "b" * 40,
+                )
+
     def test_encode_rejects_compressible_input_over_uncompressed_limit(self):
         with self.assertRaisesRegex(ValueError, "too large"):
             encode_instructions("A" * 65_537)
@@ -108,7 +124,9 @@ class HttpHardeningTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "task_id"):
                 client.dispatch(
-                    DispatchIdentity("-" * 36, "request-1", DISPATCH_ID, DISPATCHED_AT),
+                    DispatchIdentity(
+                        "-" * 36, "request-1", DISPATCH_ID, DISPATCHED_AT, TASK_SHA,
+                    ),
                     "codex", "gpt-5", "task",
                 )
 
@@ -223,6 +241,31 @@ class HttpHardeningTests(unittest.TestCase):
                 client.dispatch(dispatch_identity(), "codex", "gpt-5", "task")
         self.assertEqual([request.method for request in requests], ["GET"])
 
+    def test_dispatch_fails_closed_when_source_sha_is_not_protected_head(self):
+        requests = []
+
+        def opener(request, **_kwargs):
+            requests.append(request)
+            return Response(json.dumps({
+                "name": "main", "protected": True,
+                "commit": {"sha": TASK_SHA},
+            }).encode())
+
+        with tempfile.TemporaryDirectory() as directory:
+            token = Path(directory) / "token"
+            token.write_text("secret-token\n")
+            token.chmod(0o600)
+            client = GitHubActionsClient(
+                "owner/repo", "orchestra-worker.yml", "main", TASK_SHA, token,
+                opener=opener,
+            )
+            identity = DispatchIdentity(
+                TASK_ID, "request-1", DISPATCH_ID, DISPATCHED_AT, "b" * 40,
+            )
+            with self.assertRaisesRegex(GitHubActionsError, "source SHA"):
+                client.dispatch(identity, "codex", "gpt-5", "task")
+        self.assertEqual([request.method for request in requests], ["GET"])
+
     def test_dispatch_requires_review_protected_secret_environment(self):
         requests = []
         responses = iter((
@@ -319,6 +362,7 @@ class RunnerHardeningTests(unittest.TestCase):
                 "github_service_uid": os.geteuid() + 1,
                 "lease_id": "22222222-2222-2222-2222-222222222222",
                 "lease_path": str(task / "lease.json"),
+                "source_sha": TASK_SHA,
             }))
             client = Mock()
             client.find_run.return_value = None
@@ -346,6 +390,7 @@ class DispatchBrokerBoundaryTests(unittest.TestCase):
             "identity": {
                 "task_id": TASK_ID, "request_id": "request-1",
                 "dispatch_id": DISPATCH_ID, "dispatched_at": DISPATCHED_AT,
+                "source_sha": TASK_SHA,
             },
             **values,
         }
@@ -517,6 +562,7 @@ class WorkerArtifactTests(unittest.TestCase):
         ).read_text()
         verification, execution = workflow.split("  execute:\n", 1)
         self.assertIn("workflow_sha:", workflow)
+        self.assertIn("source_sha:", workflow)
         self.assertIn("verify-workflow-sha:", verification)
         self.assertIn("ACTUAL_WORKFLOW_SHA: ${{ github.sha }}", verification)
         self.assertNotIn("environment: orchestra-workers", verification)
@@ -524,7 +570,8 @@ class WorkerArtifactTests(unittest.TestCase):
         self.assertNotIn("DEEPSEEK_API_KEY", verification)
         self.assertIn("needs: verify-workflow-sha", execution)
         self.assertIn("environment: orchestra-workers", execution)
-        self.assertIn("ref: ${{ inputs.workflow_sha }}", execution)
+        self.assertIn("SOURCE_SHA: ${{ inputs.source_sha }}", verification)
+        self.assertIn("ref: ${{ inputs.source_sha }}", execution)
 
 
 if __name__ == "__main__":

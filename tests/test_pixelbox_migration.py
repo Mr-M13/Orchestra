@@ -16,7 +16,7 @@ from omcp.github_actions import (
     DispatchIdentity, GitHubActionsClient, GitHubActionsError, decode_instructions,
     encode_instructions,
 )
-from omcp.github_runner import run as run_github_worker
+from omcp.github_runner import _apply_patch, run as run_github_worker
 from omcp.health import collect_health
 from omcp.platform import (
     SandboxPolicy, SandboxUnavailable, sandbox_backend, sandbox_command,
@@ -206,6 +206,7 @@ class GitHubActionsClientTests(unittest.TestCase):
             "request-1",
             "22222222-2222-4222-8222-222222222222",
             "2026-10-20T00:00:00+00:00",
+            WORKFLOW_SHA,
         )
 
     def tearDown(self):
@@ -256,6 +257,7 @@ class GitHubActionsClientTests(unittest.TestCase):
         body = json.loads(request.data)
         self.assertEqual(body["ref"], "main")
         self.assertEqual(body["inputs"]["workflow_sha"], WORKFLOW_SHA)
+        self.assertEqual(body["inputs"]["source_sha"], WORKFLOW_SHA)
         self.assertEqual(decode_instructions(body["inputs"]["payload"]), "Implement the task")
         self.assertNotIn(b"secret-token-value", request.data)
 
@@ -299,6 +301,7 @@ class GitHubActionsClientTests(unittest.TestCase):
             "request_id": self.identity.request_id,
             "dispatch_id": self.identity.dispatch_id,
             "dispatched_at": self.identity.dispatched_at,
+            "source_sha": self.identity.source_sha,
         }))
         (task / "github-actions.json").write_text(json.dumps({
             "github_service_uid": os.geteuid() + 1,
@@ -337,6 +340,15 @@ class GitHubControllerTests(unittest.TestCase):
             base = Path(directory)
             root = base / "project"
             root.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            (root / "tracked.txt").write_text("base\n")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True)
+            source_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=root, text=True,
+            ).strip()
             config = Config(
                 "owner/repo", root, base / "state", "origin/main",
                 {"actions": Worker(
@@ -371,6 +383,7 @@ class GitHubControllerTests(unittest.TestCase):
                 self.assertEqual(spec["github_service_uid"], os.geteuid() + 1)
                 self.assertEqual(spec["github_dispatch_socket"],
                                  "/run/orchestra-github-dispatch/dispatch.sock")
+                self.assertEqual(spec["source_sha"], source_sha)
                 self.assertNotIn("credential", json.dumps(spec))
                 self.assertNotIn("github_repository", spec)
                 self.assertNotIn("workflow", spec)
@@ -380,6 +393,27 @@ class GitHubControllerTests(unittest.TestCase):
 
 
 class GitHubRunnerTests(unittest.TestCase):
+    def test_patch_application_rejects_a_drifted_local_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            workspace = base / "workspace"
+            task = base / "task"
+            workspace.mkdir()
+            task.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=workspace, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=workspace, check=True)
+            (workspace / "file.txt").write_text("before\n")
+            subprocess.run(["git", "add", "file.txt"], cwd=workspace, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=workspace, check=True)
+            patch_text = (
+                "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n"
+                "@@ -1 +1 @@\n-before\n+after\n"
+            ).encode()
+            with self.assertRaisesRegex(RuntimeError, "source SHA"):
+                _apply_patch(workspace, task, patch_text, 1024, "b" * 40)
+            self.assertEqual((workspace / "file.txt").read_text(), "before\n")
+
     def test_successful_run_downloads_result_and_applies_patch(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
@@ -391,6 +425,9 @@ class GitHubRunnerTests(unittest.TestCase):
             (workspace / "file.txt").write_text("before\n")
             subprocess.run(["git", "add", "file.txt"], cwd=workspace, check=True)
             subprocess.run(["git", "commit", "-qm", "base"], cwd=workspace, check=True)
+            source_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=workspace, text=True,
+            ).strip()
             task = base / "task"
             task.mkdir()
             prompt = task / "prompt.txt"
@@ -409,6 +446,7 @@ class GitHubRunnerTests(unittest.TestCase):
                 "max_worker_seconds": 60, "max_response_bytes": 1024,
                 "poll_seconds": 2, "lease_id": "22222222-2222-2222-2222-222222222222",
                 "lease_path": str(task / "lease.json"),
+                "source_sha": source_sha,
             }))
             patch_text = (
                 "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n"

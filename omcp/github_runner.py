@@ -40,7 +40,8 @@ def _bounded_text(value: str, maximum: int) -> str:
     return value.encode("utf-8")[:maximum].decode("utf-8", "ignore")
 
 
-def _apply_patch(workspace: Path, task_dir: Path, patch: bytes, maximum: int) -> None:
+def _apply_patch(workspace: Path, task_dir: Path, patch: bytes, maximum: int,
+                 source_sha: str) -> None:
     if not patch.strip():
         return
     if len(patch) > maximum:
@@ -60,6 +61,13 @@ def _apply_patch(workspace: Path, task_dir: Path, patch: bytes, maximum: int) ->
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_TERMINAL_PROMPT": "0",
     })
+    head = subprocess.run(
+        [git, "-C", str(workspace), "rev-parse", "--verify", "HEAD^{commit}"],
+        capture_output=True, text=True, check=False, timeout=30,
+        env=git_environment,
+    )
+    if head.returncode or head.stdout.strip() != source_sha:
+        raise RuntimeError("local worktree no longer matches dispatched source SHA")
     check = subprocess.run(
         [git, "-C", str(workspace), "apply", "--check", str(patch_path)],
         capture_output=True, text=True, check=False, timeout=60,
@@ -120,12 +128,13 @@ def run(spec_path: Path) -> int:
             int(spec["github_service_uid"]),
         )
         request_id = str(spec.get("request_id", task_id))
+        source_sha = str(spec["source_sha"])
         identity, resumed = load_or_create_dispatch_identity(
-            state_path, task_id, request_id,
+            state_path, task_id, request_id, source_sha,
         )
         # A restart may adopt only the exact pre-persisted nonce, dispatch time,
-        # configured ref and head SHA.  If it is not visible, fail closed rather
-        # than dispatching a possible duplicate.
+        # configured ref, workflow SHA and source SHA. If it is not visible,
+        # fail closed rather than dispatching a possible duplicate.
         run_state = client.find_run(identity)
         if _cancelled(task_dir):
             # A queued runner can start after the coordinator has already
@@ -187,7 +196,7 @@ def run(spec_path: Path) -> int:
                 assert files is not None
                 _write_remote_artifact(task_dir, files)
                 patch = files.get("patch.diff", b"")
-                _apply_patch(workspace, task_dir, patch, maximum)
+                _apply_patch(workspace, task_dir, patch, maximum, source_sha)
                 text = files.get("result.txt", b"").decode("utf-8", "replace")
                 if not text:
                     text = "GitHub Actions worker completed; no textual result was returned.\n"

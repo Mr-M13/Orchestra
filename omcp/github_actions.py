@@ -229,10 +229,14 @@ class DispatchIdentity:
     request_id: str
     dispatch_id: str
     dispatched_at: str
+    source_sha: str
 
     @property
     def run_name(self) -> str:
-        return RUN_NAME_PREFIX + self.task_id + " " + self.dispatch_id
+        return (
+            RUN_NAME_PREFIX + self.task_id + " " + self.dispatch_id
+            + " " + self.source_sha
+        )
 
 
 def _validate_dispatch_identity(identity: DispatchIdentity) -> DispatchIdentity:
@@ -249,11 +253,13 @@ def _validate_dispatch_identity(identity: DispatchIdentity) -> DispatchIdentity:
     ):
         raise ValueError("invalid GitHub dispatch identity")
     _parse_utc(identity.dispatched_at)
+    if not re.fullmatch(r"[0-9a-f]{40}", identity.source_sha):
+        raise ValueError("invalid GitHub source SHA")
     return identity
 
 
 def load_or_create_dispatch_identity(
-    path: Path, task_id: str, request_id: str,
+    path: Path, task_id: str, request_id: str, source_sha: str,
 ) -> tuple[DispatchIdentity, bool]:
     """Persist identity and dispatch time before any remote side effect."""
     if path.exists():
@@ -263,18 +269,21 @@ def load_or_create_dispatch_identity(
         identity = DispatchIdentity(
             str(value.get("task_id", "")), str(value.get("request_id", "")),
             str(value.get("dispatch_id", "")), str(value.get("dispatched_at", "")),
+            str(value.get("source_sha", "")),
         )
         _validate_dispatch_identity(identity)
-        if identity.task_id != task_id or identity.request_id != request_id:
+        if (identity.task_id != task_id or identity.request_id != request_id
+                or identity.source_sha != source_sha):
             raise ValueError("GitHub dispatch state does not match this task")
         return identity, True
     identity = _validate_dispatch_identity(DispatchIdentity(
-        task_id, request_id, str(uuid4()), utc_now(),
+        task_id, request_id, str(uuid4()), utc_now(), source_sha,
     ))
     _atomic_json(path, {
-        "schema_version": 2, "phase": "prepared",
+        "schema_version": 3, "phase": "prepared",
         "task_id": identity.task_id, "request_id": identity.request_id,
         "dispatch_id": identity.dispatch_id, "dispatched_at": identity.dispatched_at,
+        "source_sha": identity.source_sha,
     })
     return identity, False
 
@@ -393,7 +402,7 @@ class GitHubActionsClient:
         ):
             raise ValueError("unsupported GitHub Actions model")
         encoded = encode_instructions(instructions)
-        self._verify_protected_ref()
+        self._verify_protected_ref(identity.source_sha)
         self._verify_secret_environment()
         self._request("POST", self._workflow_path + "/dispatches", {
             "ref": self.ref,
@@ -405,12 +414,13 @@ class GitHubActionsClient:
                 "agent": agent,
                 "model": model,
                 "workflow_sha": self.head_sha,
+                "source_sha": identity.source_sha,
                 "payload": encoded,
             },
         })
         return encoded
 
-    def _verify_protected_ref(self) -> None:
+    def _verify_protected_ref(self, source_sha: str) -> None:
         """Fail closed unless the configured branch is protected at its exact SHA."""
         branch = urllib.parse.quote(self.ref, safe="")
         result = self._request(
@@ -424,6 +434,8 @@ class GitHubActionsClient:
         if (not isinstance(resolved_sha, str)
                 or resolved_sha.lower() != self.head_sha):
             raise GitHubActionsError("GitHub workflow ref does not match configured SHA")
+        if resolved_sha.lower() != source_sha:
+            raise GitHubActionsError("GitHub source SHA does not match protected ref")
 
     def _verify_secret_environment(self) -> None:
         """Require the external approval boundary that guards provider keys."""
@@ -607,11 +619,13 @@ def cancel_task_run(task_dir: Path, reason: str = "task cancelled") -> dict[str,
         identity = _validate_dispatch_identity(DispatchIdentity(
             str(state.get("task_id", "")), str(state.get("request_id", "")),
             str(state.get("dispatch_id", "")), str(state.get("dispatched_at", "")),
+            str(state.get("source_sha", "")),
         ))
     except ValueError:
         return None
     if not isinstance(run_id, int):
-        # Adopt only the exact pre-persisted dispatch identity, ref and head SHA.
+        # Adopt only the exact pre-persisted dispatch identity, ref, workflow
+        # SHA and source SHA.
         found = client.find_run(identity)
         if found is None:
             return None
@@ -623,12 +637,13 @@ def cancel_task_run(task_dir: Path, reason: str = "task cancelled") -> dict[str,
 def write_state(path: Path, run: RunState, identity: DispatchIdentity,
                 **extra: Any) -> None:
     value = {
-        "schema_version": 2,
+        "schema_version": 3,
         "phase": "adopted",
         "task_id": identity.task_id,
         "request_id": identity.request_id,
         "dispatch_id": identity.dispatch_id,
         "dispatched_at": identity.dispatched_at,
+        "source_sha": identity.source_sha,
         "run_id": run.run_id,
         "status": run.status,
         "conclusion": run.conclusion,

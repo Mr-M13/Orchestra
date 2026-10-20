@@ -3,7 +3,7 @@ name: Orchestra ephemeral worker
 # The Orchestra coordinator dispatches this workflow only after its own
 # repository, worker, approval and scheduler checks pass.  The workflow has no
 # repository write permission: it returns a patch artifact instead of pushing.
-run-name: Orchestra ${{ inputs.task_id }} ${{ inputs.dispatch_id }}
+run-name: Orchestra ${{ inputs.task_id }} ${{ inputs.dispatch_id }} ${{ inputs.source_sha }}
 
 on:
   workflow_dispatch:
@@ -39,6 +39,10 @@ on:
         description: Coordinator-verified workflow commit SHA
         required: true
         type: string
+      source_sha:
+        description: Coordinator-derived protected source commit SHA
+        required: true
+        type: string
       payload:
         description: Compressed task payload produced by Orchestra
         required: true
@@ -63,6 +67,7 @@ jobs:
         env:
           EXPECTED_WORKFLOW_SHA: ${{ inputs.workflow_sha }}
           ACTUAL_WORKFLOW_SHA: ${{ github.sha }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           if [[ ! "$EXPECTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "Configured workflow SHA is invalid" >&2
@@ -70,6 +75,10 @@ jobs:
           fi
           if [[ "$ACTUAL_WORKFLOW_SHA" != "$EXPECTED_WORKFLOW_SHA" ]]; then
             echo "Dispatched workflow SHA does not match the approved SHA" >&2
+            exit 1
+          fi
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Dispatched source SHA is invalid" >&2
             exit 1
           fi
 
@@ -84,7 +93,7 @@ jobs:
       - name: Check out the approved SHA
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ inputs.workflow_sha }}
+          ref: ${{ inputs.source_sha }}
           fetch-depth: 0
           persist-credentials: false
 
