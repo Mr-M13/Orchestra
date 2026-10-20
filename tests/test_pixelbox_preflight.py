@@ -13,8 +13,8 @@ from unittest.mock import patch
 
 from omcp.health import _iso_age_seconds
 from omcp.mcp_proxy import _validate_socket_path, connect
-from omcp.platform import SandboxPolicy, sandbox_command
-from omcp.runner import opencode_command
+from omcp.platform import SandboxPolicy, SandboxUnavailable, sandbox_command
+from omcp.runner import opencode_commands
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,12 +49,18 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
     def test_installer_cannot_start_services_before_readiness_preflight(self):
         source = (DEPLOY / "install.sh").read_text()
         staged_gate = source.index('if [[ "$STAGED_ONLY" == "1" ]]')
-        config_gate = source.index("Config.load")
+        broker_config_gate = source.index("ServiceConfig.load")
         daemon_reload = source.index("systemctl daemon-reload")
-        service_start = source.index("systemctl enable --now")
-        self.assertLess(staged_gate, config_gate)
-        self.assertLess(config_gate, daemon_reload)
-        self.assertLess(daemon_reload, service_start)
+        broker_start = source.index("systemctl enable --now orchestra-github-dispatch.service")
+        coordinator_config_gate = source.index(
+            "from omcp.controller import Config; Config.load"
+        )
+        coordinator_start = source.index("systemctl enable orchestra-omcp.service")
+        self.assertLess(staged_gate, broker_config_gate)
+        self.assertLess(broker_config_gate, daemon_reload)
+        self.assertLess(daemon_reload, broker_start)
+        self.assertLess(broker_start, coordinator_config_gate)
+        self.assertLess(coordinator_config_gate, coordinator_start)
         self.assertIn("--apply requires a Linux ARM64 host", source)
         self.assertIn("units use this path", source)
 
@@ -62,10 +68,18 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
         coordinator = (
             DEPLOY / "systemd" / "orchestra-omcp.service"
         ).read_text()
+        broker = (
+            DEPLOY / "systemd" / "orchestra-github-dispatch.service"
+        ).read_text()
         tunnel = (DEPLOY / "systemd" / "orchestra-tunnel.service").read_text()
         health = (DEPLOY / "systemd" / "orchestra-health.service").read_text()
 
         self.assertIn("ExecStartPre=/usr/bin/test -r /etc/orchestra/omcp.json", coordinator)
+        self.assertIn("User=orchestra-github", broker)
+        self.assertIn("Group=orchestra-ipc", broker)
+        self.assertIn("ProtectSystem=strict", broker)
+        self.assertNotIn("EnvironmentFile=", broker)
+        self.assertIn("Before=orchestra-omcp.service", broker)
         self.assertIn("ExecStartPre=/usr/bin/test -S ", tunnel)
         self.assertIn("After=orchestra-omcp.service", health)
         for optional in (
@@ -108,7 +122,7 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
         self.assertIn("--share-net", command)
         self.assertNotIn("--unshare-net", command)
 
-    def test_opencode_runtime_environment_is_forwarded_after_clearenv(self):
+    def test_opencode_loopback_gateway_fails_closed_without_filtered_linux_backend(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             workspace = root / "workspace"
@@ -117,21 +131,19 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
             runtime.mkdir()
             prompt = root / "prompt.txt"
             prompt.write_text("bounded test")
-            credential = root / "credential"
-            credential.write_text("test-only")
-            credential.chmod(0o600)
             executable = root / "opencode-cli"
             executable.write_text("#!/bin/sh\nexit 0\n")
             executable.chmod(0o700)
             with patch("omcp.platform.host_platform", return_value="linux"), patch(
                 "omcp.platform.sandbox_executable", return_value="/usr/bin/bwrap"
             ):
-                command = opencode_command(
-                    str(executable), workspace, prompt, credential, runtime,
-                    "deepseek", "deepseek/deepseek-chat", "api.deepseek.com",
-                )
-        self.assertIn("XDG_CONFIG_HOME", command)
-        self.assertIn(str(runtime / "config"), command)
+                with self.assertRaisesRegex(SandboxUnavailable, "seatbelt.*not available"):
+                    opencode_commands(
+                        str(executable), workspace, prompt, runtime,
+                        "deepseek", "deepseek/deepseek-chat", "api.deepseek.com",
+                        "http://127.0.0.1:49152/abcdefghijklmnopqrstuvwxyzABCDEFG_123456/v1",
+                        49153,
+                    )
 
     def test_future_heartbeat_does_not_prove_liveness(self):
         future = datetime.now(timezone.utc) + timedelta(minutes=10)
@@ -171,6 +183,22 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
         for document in (runbook, readme):
             self.assertNotIn("Linux ARM64 staging verification complete", document)
         self.assertIn("verify.sh --live", runbook)
+        self.assertIn("separate owner approval", runbook)
+        self.assertIn("A `0600` file under the same\nUID is not isolation", runbook)
+
+    def test_coordinator_example_contains_no_github_target_or_credential(self):
+        import json
+
+        example = json.loads((DEPLOY / "omcp.example.json").read_text())
+        for name in ("actions-codex", "actions-deepseek"):
+            worker = example["workers"][name]
+            self.assertIn("github_dispatch_socket", worker)
+            self.assertIn("github_service_uid", worker)
+            for forbidden in (
+                "credential_file", "github_repository", "workflow",
+                "workflow_ref", "workflow_sha",
+            ):
+                self.assertNotIn(forbidden, worker)
 
 
 if __name__ == "__main__":

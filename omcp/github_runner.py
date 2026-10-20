@@ -18,9 +18,10 @@ from pathlib import Path
 from typing import Any
 
 from omcp.github_actions import (
-    DispatchIdentity, GitHubActionsClient, GitHubActionsError, RunState,
-    client_from_spec, load_or_create_dispatch_identity, write_state,
+    DispatchIdentity, GitHubActionsError, RunState,
+    load_or_create_dispatch_identity, write_state,
 )
+from omcp.github_dispatch_service import DispatchClient
 from omcp.runner import (
     RunnerTerminated, atomic_json, utc_now, write_private_text,
     write_startup_lease,
@@ -103,7 +104,7 @@ def run(spec_path: Path) -> int:
     if state_path.resolve(strict=False).parent != task_dir.resolve():
         raise ValueError("remote state must stay in the private task directory")
     artifact_name = str(spec.get("artifact_name") or ("omcp-" + task_id))
-    client: GitHubActionsClient | None = None
+    client: DispatchClient | None = None
     run_state: RunState | None = None
     identity: DispatchIdentity | None = None
     exit_code, error_type = 125, None
@@ -114,7 +115,10 @@ def run(spec_path: Path) -> int:
 
     signal.signal(signal.SIGTERM, terminate)
     try:
-        client = client_from_spec(spec)
+        client = DispatchClient(
+            Path(str(spec["github_dispatch_socket"])),
+            int(spec["github_service_uid"]),
+        )
         request_id = str(spec.get("request_id", task_id))
         identity, resumed = load_or_create_dispatch_identity(
             state_path, task_id, request_id,
@@ -169,7 +173,9 @@ def run(spec_path: Path) -> int:
                 files = None
                 for attempt in range(12):
                     try:
-                        files = client.download_artifact(run_state.run_id, artifact_name)
+                        files = client.download_artifact(
+                            run_state.run_id, artifact_name, identity,
+                        )
                         break
                     except GitHubActionsError:
                         # Artifact registration can lag the completed run by a
@@ -219,7 +225,7 @@ def run(spec_path: Path) -> int:
     return exit_code
 
 
-def _cancel_quietly(client: GitHubActionsClient | None,
+def _cancel_quietly(client: DispatchClient | None,
                     run_state: RunState | None, state_path: Path,
                     identity: DispatchIdentity | None = None) -> None:
     if client is None or identity is None:

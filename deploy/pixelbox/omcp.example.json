@@ -38,25 +38,17 @@
       "adapter": "github_actions",
       "agent": "codex",
       "model": "gpt-5-codex",
-      "github_repository": "Mr-M13/Orchestra",
-      "workflow": "orchestra-worker.yml",
-      "workflow_ref": "main",
-      "workflow_sha": "REPLACE_WITH_REVIEWED_40_CHARACTER_COMMIT_SHA",
       "github_service_uid": -1,
-      "poll_seconds": 10,
-      "credential_file": "/etc/orchestra/secrets/github-actions.token"
+      "github_dispatch_socket": "/run/orchestra-github-dispatch/dispatch.sock",
+      "poll_seconds": 10
     },
     "actions-deepseek": {
       "adapter": "github_actions",
       "agent": "deepseek",
       "model": "deepseek/deepseek-chat",
-      "github_repository": "Mr-M13/Orchestra",
-      "workflow": "orchestra-worker.yml",
-      "workflow_ref": "main",
-      "workflow_sha": "REPLACE_WITH_REVIEWED_40_CHARACTER_COMMIT_SHA",
       "github_service_uid": -1,
-      "poll_seconds": 10,
-      "credential_file": "/etc/orchestra/secrets/github-actions.token"
+      "github_dispatch_socket": "/run/orchestra-github-dispatch/dispatch.sock",
+      "poll_seconds": 10
     }
   },
   "max_task_bytes": 65536,

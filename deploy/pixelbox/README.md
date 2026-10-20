@@ -5,6 +5,8 @@ default and every mutating mode requires an explicit approval marker. No mode
 starts the tunnel or touches unrelated host services.
 
 - `omcp.example.json` — owner-only coordinator configuration template.
+- `github-dispatch.example.json` — dedicated broker configuration template;
+  it and the token must be owned by the separate `orchestra-github` UID.
 - `omcp.env.example` — fixed-principal tunnel assertions and service `PATH`.
 - `tunnel.env.example` — tunnel runtime key placeholder.
 - `systemd/` — coordinator, tunnel, health service and health timer units.
@@ -29,6 +31,7 @@ produce that evidence.
 
 Read [docs/PIXELBOX-MIGRATION.md](../../docs/PIXELBOX-MIGRATION.md) before use.
 Never commit a filled environment file, GitHub token or provider key.
-Replace the invalid `workflow_sha` and `github_service_uid` placeholders in the
-example configuration during local owner review; the installer does not create
-an identity or credential.
+Replace invalid UID/SHA placeholders in both templates during local owner
+review. The installer deliberately does not create the service account, group,
+broker configuration or credential; those migration steps require separate
+future approval.

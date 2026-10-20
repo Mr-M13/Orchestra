@@ -12,6 +12,7 @@ validated, owner-configured execution policy into an operating-system command.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sys
 from dataclasses import dataclass, field
@@ -104,7 +105,10 @@ def sandbox_executable(backend: str) -> str:
 
 
 def _seatbelt_quote(value: Path | str) -> str:
-    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+    text = str(value)
+    if any(ord(character) < 0x20 or ord(character) == 0x7f for character in text):
+        raise ValueError("Seatbelt values may not contain control characters")
+    return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
 @dataclass(frozen=True)
@@ -112,14 +116,18 @@ class SandboxPolicy:
     """A validated filesystem and network policy for one worker process.
 
     ``read_paths`` and ``write_paths`` are directories.  ``read_files`` are
-    individual files such as a prompt or credential.  A policy with no
-    ``network_hosts`` gets no outbound network at all.
+    individual files such as a prompt or credential.  Provider hosts are
+    HTTPS-only.  Loopback rules are exact ports and are currently supported
+    only by Seatbelt; Linux must fail closed until an equivalent filtered
+    local-network boundary is implemented.
     """
 
     read_paths: tuple[Path, ...] = ()
     read_files: tuple[Path, ...] = ()
     write_paths: tuple[Path, ...] = ()
     network_hosts: tuple[str, ...] = ()
+    loopback_bind_ports: tuple[int, ...] = ()
+    loopback_connect_ports: tuple[int, ...] = ()
     backend: str = "auto"
     workdir: Path | None = None
     environment: dict[str, str] = field(default_factory=dict)
@@ -132,11 +140,25 @@ class SandboxPolicy:
             for key, value in environment.items()
         ):
             raise ValueError("sandbox environment must contain valid strings")
+        if not all(
+            isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65_535
+            for port in (*self.loopback_bind_ports, *self.loopback_connect_ports)
+        ):
+            raise ValueError("sandbox loopback ports must be integers from 1 to 65535")
+        if not all(
+            isinstance(host, str) and re.fullmatch(
+                r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?", host,
+            ) and "*" not in host and ".." not in host
+            for host in self.network_hosts
+        ):
+            raise ValueError("sandbox network hosts must be fixed DNS names or addresses")
         return SandboxPolicy(
             read_paths=tuple(Path(value).resolve() for value in self.read_paths),
             read_files=tuple(Path(value).resolve() for value in self.read_files),
             write_paths=tuple(Path(value).resolve() for value in self.write_paths),
             network_hosts=tuple(self.network_hosts),
+            loopback_bind_ports=tuple(self.loopback_bind_ports),
+            loopback_connect_ports=tuple(self.loopback_connect_ports),
             backend=self.backend,
             workdir=Path(self.workdir).resolve() if self.workdir else None,
             environment=environment,
@@ -156,10 +178,23 @@ def _seatbelt_profile(policy: SandboxPolicy) -> str:
             f'(allow network-outbound (remote tcp "{_seatbelt_quote(host)}:443"))'
             for host in policy.network_hosts
         )
+    for port in policy.loopback_bind_ports:
+        rules.extend((
+            f'(allow network-bind (local tcp "localhost:{port}"))',
+            f'(allow network-inbound (local tcp "localhost:{port}"))',
+        ))
+    rules.extend(
+        f'(allow network-outbound (remote tcp "localhost:{port}"))'
+        for port in policy.loopback_connect_ports
+    )
     return "\n".join(rules)
 
 
 def _bubblewrap_command(policy: SandboxPolicy, command: Sequence[str]) -> list[str]:
+    if policy.loopback_bind_ports or policy.loopback_connect_ports:
+        raise SandboxUnavailable(
+            "exact loopback-port filtering is not available with bubblewrap"
+        )
     bwrap = sandbox_executable("bubblewrap")
     args = [
         bwrap,

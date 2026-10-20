@@ -37,8 +37,12 @@ untouched until verification and explicit approval.
    coordinator downloads the named artifact with size and path validation and
    applies the patch only in its isolated task worktree. No merge, push or
    deployment authority is introduced.
-5. **Credentials stay off task paths.** The coordinator's fine-grained GitHub
-   token is owner-only and sent only in an HTTPS header. Provider keys live in a
+5. **Credentials are isolated behind a dedicated service identity.** A `0600`
+   file owned by the coordinator is not an adequate boundary. The
+   `orchestra-github` UID alone owns the private broker config and token. The
+   coordinator uses an owner-checked Unix socket and a fixed, bounded protocol;
+   repository, workflow, ref, exact SHA and token path are not request fields.
+   Worker sandboxes cannot reach the socket. Provider keys live only in a
    protected Actions environment. Tunnel keys, approval capabilities and the
    OMCP principal marker are never forwarded to a GitHub worker.
 6. **Cancellation is durable.** The coordinator writes a cancellation request,

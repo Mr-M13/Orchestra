@@ -78,9 +78,13 @@ def collect_health(config_path: Path, tunnel_url: str | None = None) -> dict[str
             name: {
                 "adapter": worker.adapter,
                 "remote": worker.adapter == "github_actions",
+                "broker_socket_present": bool(
+                    worker.github_dispatch_socket
+                    and Path(worker.github_dispatch_socket).exists()
+                ) if worker.adapter == "github_actions" else None,
                 "credential_present": bool(
                     worker.credential_file and Path(worker.credential_file).exists()
-                ),
+                ) if worker.adapter != "github_actions" else None,
             }
             for name, worker in sorted(config.workers.items())
         },

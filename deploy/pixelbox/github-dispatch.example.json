@@ -1,0 +1,13 @@
+{
+  "github_repository": "Mr-M13/Orchestra",
+  "workflow": "orchestra-worker.yml",
+  "workflow_ref": "main",
+  "workflow_sha": "REPLACE_WITH_REVIEWED_40_CHARACTER_COMMIT_SHA",
+  "credential_file": "/etc/orchestra/github-dispatch/github-actions.token",
+  "service_uid": -1,
+  "coordinator_uid": -1,
+  "allowed_models": {
+    "codex": ["gpt-5-codex"],
+    "deepseek": ["deepseek/deepseek-chat"]
+  }
+}

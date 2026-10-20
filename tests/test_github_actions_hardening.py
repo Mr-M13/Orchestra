@@ -9,6 +9,7 @@ import urllib.request
 import warnings
 import zipfile
 import zlib
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -22,6 +23,7 @@ from omcp.github_actions import (
     encode_instructions,
 )
 from omcp.github_runner import run as run_github_worker
+from omcp.github_dispatch_service import DispatchService, ServiceConfig
 from scripts.orchestra_actions_worker import (
     decode_payload,
     main as worker_main,
@@ -139,6 +141,19 @@ class HttpHardeningTests(unittest.TestCase):
                     "owner/repo", "orchestra-worker.yml", "main", TASK_SHA, link,
                 )
 
+    def test_client_rejects_tag_and_raw_sha_workflow_refs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token = Path(directory) / "token"
+            token.write_text("secret-token\n")
+            token.chmod(0o600)
+            for ref in ("refs/tags/reviewed", TASK_SHA, "refs/heads/"):
+                with self.subTest(ref=ref), self.assertRaisesRegex(
+                    ValueError, "must name a branch",
+                ):
+                    GitHubActionsClient(
+                        "owner/repo", "orchestra-worker.yml", ref, TASK_SHA, token,
+                    )
+
     def test_find_run_rejects_stale_same_name_and_wrong_ref_or_sha(self):
         created = datetime.fromisoformat(DISPATCHED_AT)
         exact = {
@@ -163,6 +178,80 @@ class HttpHardeningTests(unittest.TestCase):
             run = client.find_run(dispatch_identity())
         self.assertIsNotNone(run)
         self.assertEqual(run.run_id, 7)
+
+    def test_dispatch_fails_closed_for_unprotected_ref_before_post(self):
+        requests = []
+
+        def opener(request, **_kwargs):
+            requests.append(request)
+            return Response(json.dumps({
+                "name": "main", "protected": False,
+                "commit": {"sha": TASK_SHA},
+            }).encode())
+
+        with tempfile.TemporaryDirectory() as directory:
+            token = Path(directory) / "token"
+            token.write_text("secret-token\n")
+            token.chmod(0o600)
+            client = GitHubActionsClient(
+                "owner/repo", "orchestra-worker.yml", "main", TASK_SHA, token,
+                opener=opener,
+            )
+            with self.assertRaisesRegex(GitHubActionsError, "protected branch"):
+                client.dispatch(dispatch_identity(), "codex", "gpt-5", "task")
+        self.assertEqual([request.method for request in requests], ["GET"])
+
+    def test_dispatch_fails_closed_when_ref_moved_before_post(self):
+        requests = []
+
+        def opener(request, **_kwargs):
+            requests.append(request)
+            return Response(json.dumps({
+                "name": "main", "protected": True,
+                "commit": {"sha": "b" * 40},
+            }).encode())
+
+        with tempfile.TemporaryDirectory() as directory:
+            token = Path(directory) / "token"
+            token.write_text("secret-token\n")
+            token.chmod(0o600)
+            client = GitHubActionsClient(
+                "owner/repo", "orchestra-worker.yml", "main", TASK_SHA, token,
+                opener=opener,
+            )
+            with self.assertRaisesRegex(GitHubActionsError, "configured SHA"):
+                client.dispatch(dispatch_identity(), "codex", "gpt-5", "task")
+        self.assertEqual([request.method for request in requests], ["GET"])
+
+    def test_dispatch_requires_review_protected_secret_environment(self):
+        requests = []
+        responses = iter((
+            {
+                "name": "main", "protected": True,
+                "commit": {"sha": TASK_SHA},
+            },
+            {
+                "name": "orchestra-workers",
+                "protection_rules": [],
+                "deployment_branch_policy": {"protected_branches": True},
+            },
+        ))
+
+        def opener(request, **_kwargs):
+            requests.append(request)
+            return Response(json.dumps(next(responses)).encode())
+
+        with tempfile.TemporaryDirectory() as directory:
+            token = Path(directory) / "token"
+            token.write_text("secret-token\n")
+            token.chmod(0o600)
+            client = GitHubActionsClient(
+                "owner/repo", "orchestra-worker.yml", "main", TASK_SHA, token,
+                opener=opener,
+            )
+            with self.assertRaisesRegex(GitHubActionsError, "environment"):
+                client.dispatch(dispatch_identity(), "codex", "gpt-5", "task")
+        self.assertEqual([request.method for request in requests], ["GET", "GET"])
 
 
 class ArtifactHardeningTests(unittest.TestCase):
@@ -226,18 +315,89 @@ class RunnerHardeningTests(unittest.TestCase):
                 "completion_path": str(task / "completion.json"),
                 "result_path": str(task / "result.txt"),
                 "workspace": str(workspace),
+                "github_dispatch_socket": str(task / "dispatch.sock"),
+                "github_service_uid": os.geteuid() + 1,
                 "lease_id": "22222222-2222-2222-2222-222222222222",
                 "lease_path": str(task / "lease.json"),
             }))
             client = Mock()
             client.find_run.return_value = None
-            with patch("omcp.github_runner.client_from_spec", return_value=client):
+            with patch("omcp.github_runner.DispatchClient", return_value=client):
                 self.assertEqual(run_github_worker(spec_path), 130)
             client.dispatch.assert_not_called()
             self.assertEqual(
                 json.loads((task / "completion.json").read_text())["runner_error"],
                 "Cancelled",
             )
+
+
+class DispatchBrokerBoundaryTests(unittest.TestCase):
+    def service(self):
+        service = object.__new__(DispatchService)
+        service.config = SimpleNamespace(
+            allowed_models={"codex": frozenset({"gpt-5-codex"})},
+        )
+        service.github = Mock()
+        return service
+
+    def request(self, action, **values):
+        return {
+            "version": 1, "action": action,
+            "identity": {
+                "task_id": TASK_ID, "request_id": "request-1",
+                "dispatch_id": DISPATCH_ID, "dispatched_at": DISPATCHED_AT,
+            },
+            **values,
+        }
+
+    def test_dispatch_api_rejects_caller_selected_target_fields(self):
+        service = self.service()
+        request = self.request(
+            "dispatch", agent="codex", model="gpt-5-codex",
+            instructions="bounded task", github_repository="attacker/repo",
+        )
+        with self.assertRaisesRegex(ValueError, "fields are invalid"):
+            service.handle(request)
+        service.github.dispatch.assert_not_called()
+
+    def test_dispatch_api_enforces_model_allowlist(self):
+        service = self.service()
+        with self.assertRaisesRegex(ValueError, "not allowlisted"):
+            service.handle(self.request(
+                "dispatch", agent="codex", model="unreviewed",
+                instructions="bounded task",
+            ))
+        service.github.dispatch.assert_not_called()
+
+    def test_artifact_name_is_derived_from_task_identity(self):
+        service = self.service()
+        service.github.status.return_value = Mock()
+        with self.assertRaisesRegex(ValueError, "not bound to this task"):
+            service.handle(self.request("artifact", run_id=7, name="other"))
+        service.github.download_artifact.assert_not_called()
+
+    def test_broker_config_rejects_symlink_even_when_target_is_private(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            token = root / "token"
+            token.write_text("secret-token\n")
+            token.chmod(0o600)
+            real = root / "config.json"
+            real.write_text(json.dumps({
+                "github_repository": "owner/repo",
+                "workflow": "orchestra-worker.yml",
+                "workflow_ref": "main",
+                "workflow_sha": TASK_SHA,
+                "credential_file": str(token),
+                "service_uid": os.geteuid(),
+                "coordinator_uid": os.geteuid() + 1,
+                "allowed_models": {"codex": ["gpt-5-codex"]},
+            }))
+            real.chmod(0o600)
+            link = root / "linked-config.json"
+            link.symlink_to(real)
+            with self.assertRaisesRegex(PermissionError, "service-owner-only"):
+                ServiceConfig.load(link)
 
 
 class WorkerArtifactTests(unittest.TestCase):
@@ -349,6 +509,22 @@ class WorkerArtifactTests(unittest.TestCase):
         self.assertIn("if: inputs.agent == 'deepseek'", deepseek_step)
         self.assertIn("DEEPSEEK_API_KEY", deepseek_step)
         self.assertNotIn("OPENAI_API_KEY", deepseek_step)
+
+    def test_workflow_verifies_sha_before_environment_can_release_secrets(self):
+        workflow = (
+            Path(__file__).resolve().parents[1]
+            / ".github/workflows/orchestra-worker.yml"
+        ).read_text()
+        verification, execution = workflow.split("  execute:\n", 1)
+        self.assertIn("workflow_sha:", workflow)
+        self.assertIn("verify-workflow-sha:", verification)
+        self.assertIn("ACTUAL_WORKFLOW_SHA: ${{ github.sha }}", verification)
+        self.assertNotIn("environment: orchestra-workers", verification)
+        self.assertNotIn("OPENAI_API_KEY", verification)
+        self.assertNotIn("DEEPSEEK_API_KEY", verification)
+        self.assertIn("needs: verify-workflow-sha", execution)
+        self.assertIn("environment: orchestra-workers", execution)
+        self.assertIn("ref: ${{ inputs.workflow_sha }}", execution)
 
 
 if __name__ == "__main__":

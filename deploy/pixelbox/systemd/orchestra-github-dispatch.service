@@ -1,0 +1,35 @@
+[Unit]
+Description=Orchestra credential-isolated GitHub dispatch broker
+Documentation=file:/opt/orchestra/current/docs/PIXELBOX-MIGRATION.md
+After=network-online.target
+Wants=network-online.target
+Before=orchestra-omcp.service
+Conflicts=shutdown.target
+
+[Service]
+Type=simple
+User=orchestra-github
+Group=orchestra-ipc
+RuntimeDirectory=orchestra-github-dispatch
+RuntimeDirectoryMode=0750
+WorkingDirectory=/opt/orchestra/current
+ExecStartPre=/usr/bin/test -r /etc/orchestra/github-dispatch/config.json
+ExecStart=/usr/bin/python3 -m omcp.github_dispatch_service --config /etc/orchestra/github-dispatch/config.json --socket /run/orchestra-github-dispatch/dispatch.sock
+Restart=on-failure
+RestartSec=5
+UMask=0007
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/etc/orchestra/github-dispatch
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
