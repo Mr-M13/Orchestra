@@ -94,6 +94,7 @@ class PlatformTests(unittest.TestCase):
                 backend="seatbelt", workdir=workspace,
             ), ["/usr/bin/true"])
         profile = command[2]
+        self.assertIn('(allow process-exec (literal "/usr/bin/true"))', profile)
         self.assertIn('(local tcp "localhost:49153")', profile)
         self.assertIn('(remote tcp "localhost:49152")', profile)
         self.assertNotIn("localhost:*", profile)
