@@ -41,7 +41,10 @@ untouched until verification and explicit approval.
    file owned by the coordinator is not an adequate boundary. The
    `orchestra-github` UID alone owns the private broker config and token. The
    coordinator uses an owner-checked Unix socket and a fixed, bounded protocol;
-   repository, workflow, ref, exact SHA and token path are not request fields.
+   repository, workflow, protected ref, workflow SHA and token path are not
+   request fields. The coordinator derives a source SHA from the isolated task
+   worktree; the broker accepts it only when it is the exact protected-ref head
+   and binds it to dispatch discovery, checkout and patch application.
    Worker sandboxes cannot reach the socket. Provider keys live only in a
    protected Actions environment. Tunnel keys, approval capabilities and the
    OMCP principal marker are never forwarded to a GitHub worker.

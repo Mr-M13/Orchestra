@@ -34,6 +34,7 @@ def _identity(value: object) -> DispatchIdentity:
     return _validate_dispatch_identity(DispatchIdentity(
         str(value.get("task_id", "")), str(value.get("request_id", "")),
         str(value.get("dispatch_id", "")), str(value.get("dispatched_at", "")),
+        str(value.get("source_sha", "")),
     ))
 
 
@@ -41,6 +42,7 @@ def _identity_json(value: DispatchIdentity) -> dict[str, str]:
     return {
         "task_id": value.task_id, "request_id": value.request_id,
         "dispatch_id": value.dispatch_id, "dispatched_at": value.dispatched_at,
+        "source_sha": value.source_sha,
     }
 
 

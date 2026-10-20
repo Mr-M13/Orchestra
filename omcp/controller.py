@@ -756,6 +756,7 @@ class TaskController:
             "kind", "operation_id", "operation_type", "target_commit",
             "harness_commit", "remote_run_id", "remote_run_url",
             "remote_status", "remote_conclusion", "remote_artifact",
+            "source_sha",
         )
         return {key: task[key] for key in keys if key in task}
 
@@ -1495,6 +1496,15 @@ class TaskController:
         self._save()
         try:
             workspace = self.workspace_preparer(task_id, branch, profile)
+            worker = self.config.workers[task["worker"]]
+            source_sha: str | None = None
+            if worker.adapter == "github_actions":
+                source_code, source_sha = self._git(
+                    workspace, "rev-parse", "--verify", "HEAD^{commit}",
+                    allow_failure=True,
+                )
+                if source_code != 0 or not re.fullmatch(r"[0-9a-f]{40}", source_sha):
+                    raise RuntimeError("task worktree has no exact source commit")
             task_dir = self.config.state_dir / "tasks" / task_id
             task_dir.mkdir(parents=True, mode=0o700)
             os.chmod(task_dir, 0o700)
@@ -1514,7 +1524,6 @@ class TaskController:
                 "or Orchestra authority.\n\n" + task["instructions"] + "\n"
             )
             os.chmod(prompt_path, 0o600)
-            worker = self.config.workers[task["worker"]]
             spec: dict[str, Any] = {
                 "command": list(worker.command),
                 "codex_home": str(Path(worker.codex_home).expanduser()) if worker.codex_home else None,
@@ -1537,6 +1546,7 @@ class TaskController:
                 "branch": branch,
             }
             if worker.adapter == "github_actions":
+                assert source_sha is not None
                 spec.pop("credential_file", None)
                 spec.update({
                     "github_service_uid": worker.github_service_uid,
@@ -1546,6 +1556,7 @@ class TaskController:
                     "artifact_name": "omcp-" + task_id,
                     "remote_state_path": str(github_state_path),
                     "base_ref": profile.base_ref,
+                    "source_sha": source_sha,
                 })
             _atomic_json(spec_path, spec)
             task.update({
@@ -1553,9 +1564,11 @@ class TaskController:
                 "completion_path": str(completion_path), "log_path": str(log_path),
             })
             if worker.adapter == "github_actions":
+                assert source_sha is not None
                 task.update({
                     "remote_state_path": str(github_state_path),
                     "remote_artifact": spec["artifact_name"],
+                    "source_sha": source_sha,
                 })
             self._save()
             self._audit("task.start", task_id, "allowed", {"worker": task["worker"], "branch": branch})
