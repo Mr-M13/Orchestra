@@ -48,7 +48,11 @@ The remote MCP surface cannot decide explicit approvals. A local operator must r
 
 DeepSeek is a direct, response-only HTTPS adapter, not an OpenCode alias. It has no configured executable and never launches a model-directed subprocess or shell. Each task still gets the normal fresh worktree, but the adapter cannot edit it. A macOS Seatbelt profile constrains the runner to its private task files, the worktree, the owner-only credential file, and TCP to `api.deepseek.com:443`; its process environment excludes tunnel and provider variables. The adapter sends only to the fixed `/v1/chat/completions` endpoint, has the configured 60–7200 second deadline and result-byte cap, bounds the HTTP body before parsing, retains only sanitized assistant text, and emits a neutral failure result without provider diagnostics. DeepSeek always requires a fresh local approval, even if the general `task_approval_mode` is disabled.
 
-OpenCode is independent. Its only accepted executable is the reviewed absolute OpenCode Desktop CLI, `/Users/hamed/Library/Application Support/ai.opencode.desktop/cli/2.0.32-arm64/opencode-cli`; wrappers, aliases, and configured flags are rejected. The owner selects a provider/model pair from the owner-only `opencode_model_allowlist`; the runner accepts only the supported `openai` or `deepseek` provider endpoints and invokes exactly `opencode-cli run --standalone --format json --model <selected-model> --file <private-prompt> ...`, never `--auto`. It starts with a private home/config, a separate owner-only credential file, a generated deny-by-default policy, and a Seatbelt profile restricted to its selected provider host, worktree, prompt, credential and runtime directories. Shell, external-directory, web, skills and subagents are denied. OpenCode cannot receive standing authorization and provider output is discarded; setup/provider failures fail closed rather than falling back or claiming success.
+OpenCode is independent. Its only accepted executable is the reviewed absolute OpenCode Desktop CLI, `/Users/hamed/Library/Application Support/ai.opencode.desktop/cli/2.0.32-arm64/opencode-cli`; wrappers, aliases, and configured flags are rejected. The owner selects a provider/model pair from the owner-only `opencode_model_allowlist`; the runner accepts only the supported `openai` or `deepseek` provider endpoints. It starts a password-protected private V2 server with `opencode-cli serve --hostname 127.0.0.1 --port <runner-selected-port>`, then invokes exactly `opencode-cli run --server http://127.0.0.1:<same-port> --format json --model <selected-model> --file <private-prompt> ...`, never `--auto`. Both processes use a private home/config and a generated V2 deny-by-default policy. Shell, external-directory, web, skills and subagents are denied.
+
+OpenCode has no remote socket permission and cannot read the provider credential. Its generated provider base URL is a one-task, random capability URL on a second runner-selected `localhost` port; the synthetic API key accepted there has no provider authority. The trusted runner validates an exact `/v1/chat/completions` request, request size, JSON shape and selected model, then injects the owner-only credential and opens verified TLS to the code-owned provider host and path. Redirects, CONNECT, arbitrary destinations, forwarded request headers, transfer encoding, content encoding, model changes, oversized bodies and more than 64 requests fail closed. Provider responses are streamed with a per-response bound and only JSON or event-stream content types. Separate Seatbelt profiles allow the V2 server to bind/inbound only on its exact port and connect only to the exact gateway port, while the CLI client can connect only to the exact V2 server port. Neither profile contains a wildcard loopback rule, remote hostname rule or `*:443` rule. Other same-user processes are outside this boundary, so the V2 server also uses a random task password and the gateway requires both an unguessable path capability and the fixed synthetic authorization header; both exist only for the task lifetime.
+
+OpenCode cannot receive standing authorization. Provider output and raw diagnostics are discarded; failures expose only an allowlisted category, optional integer HTTP status, and process-exit cause. Setup, gateway, TLS or provider failures fail closed rather than falling back or claiming success. See [ADR-005](decisions/ADR-005-opencode-pinned-egress.md) for the boundary and remaining host-verification gate.
 
 The state directory and its files are owner-only. State updates are atomic. `audit.jsonl` is append-only and fsynced for each event; it records principal, authentication context, action, outcome and safe metadata, but not task instructions or worker output. Result retrieval is size-bounded.
 
@@ -85,6 +89,69 @@ The first built-in type is `delnavazan_mariadb_acceptance_v1`. The owner-only co
 The host runner derives its command internally: pinned `platform/runtime/bin/run-all.sh`, followed by pinned `destroy.sh YES` in a cleanup path. It forwards no tunnel, OpenAI, proxy, GitHub, or other credential variables. A private Docker argument gate permits only the three cached harness images, exact Compose up/down forms, disposable containers, mounts below the operation's private state directory, and the PHP entrypoint. When the pinned harness requests a read-only source from its own approved worktree, the gate copies that source into a private staging directory below runtime state and mounts only the staged copy; writable or unrelated external sources remain denied. Pull, build, push, login, privileged mode, host networking, socket mounts, caller-selected images, and arbitrary Docker/Compose subcommands fail closed. Direct test containers receive `--network none`; the WordPress/MariaDB Compose network is overlaid as `internal: true`. WordPress remains loopback-only on a dynamically selected port, MariaDB is unpublished, and teardown targets only the harness's validated private state.
 
 This operation is acceptance evidence only. It does not merge, push, deploy, contact production, use provider credentials, or prove anything beyond the exact target commit and harness run. Do not add a generic command host operation. A new operation type needs code, tests, documentation, a separate permission/risk review, and the same local approval boundary.
+
+## GitHub Actions ephemeral workers
+
+A `github_actions` worker is another owner-configured adapter. It does not accept
+a task-supplied repository, workflow, ref, command, model, container or
+credential. The coordinator-side worker object contains only the bounded broker
+socket and its dedicated UID:
+
+```json
+{
+  "adapter": "github_actions",
+  "agent": "codex",
+  "model": "gpt-5-codex",
+  "github_dispatch_socket": "/run/orchestra-github-dispatch/dispatch.sock",
+  "github_service_uid": 991,
+  "poll_seconds": 10
+}
+```
+
+`agent` is `codex` or `deepseek`. A separate `orchestra-github` service owns the
+repository, workflow, ref, exact SHA, agent/model allowlist and fine-grained
+token. The coordinator and detached runner cannot read that config directory or
+token. The broker authenticates the coordinator UID on its Unix socket and
+offers only dispatch, exact-run lookup/status/cancel and task-bound artifact
+download. It has no generic HTTP or caller-selected target operation. The token
+is sent only in an HTTPS `Authorization` header and never enters a task spec,
+state, audit event, log, environment, command line or worktree.
+
+The coordinator creates the normal fresh worktree, then starts a detached runner
+that dispatches `.github/workflows/orchestra-worker.yml`. The workflow has
+`contents: read` and no persisted checkout credentials; it runs the selected
+agent on an ephemeral `ubuntu-latest` runner and uploads a bounded artifact named
+`omcp-<task_id>`. The coordinator downloads that exact artifact, rejects unsafe
+paths and oversized files, verifies that `patch.diff` applies, and records the
+result. Nothing is pushed or merged by the workflow.
+
+The runner uses the deterministic workflow run name `Orchestra <task_id>` to
+adopt an existing run after a crash instead of dispatching twice. It persists the
+run ID before polling. Cancellation writes a durable request, signals the local
+runner and asks GitHub to cancel the exact run. An orphaned run whose runner has
+disappeared is cancelled during reconciliation when its run ID is known.
+
+The workflow needs an `orchestra-workers` environment containing
+`OPENAI_API_KEY` and/or `DEEPSEEK_API_KEY`; do not add tunnel, approval or GitHub
+tokens there. Configure required reviewers and prevent self-review, and approve
+only when the run head SHA equals the configured `workflow_sha`. The coordinator
+requires `workflow_ref` to resolve to that exact SHA on a protected branch before
+dispatch, and fails closed unless the environment API confirms required
+reviewers, self-review prevention and protected-branch-only deployments. A
+secretless workflow job repeats the SHA check before the dependent
+environment-gated job can receive provider keys, mitigating a ref move between
+lookup and dispatch. The pinned Codex CLI runs the `codex` agent. The pinned
+OpenCode CLI runs the `deepseek` agent against the DeepSeek chat API, because
+current Codex releases no longer accept DeepSeek's chat wire protocol. Provider
+keys and OpenCode runtime directories are kept outside the uploaded artifact.
+This GitHub Actions DeepSeek worker is distinct from the direct, response-only
+DeepSeek adapter described above.
+
+Linux uses bubblewrap instead of Seatbelt. Filesystem access remains
+deny-by-default. For a policy that needs provider egress, bubblewrap shares the
+network namespace because it cannot filter destinations by host; add host
+firewall policy if destination filtering is required. Routine Codex work denies
+the network namespace entirely.
 
 ## Configure on the worker Mac
 
@@ -176,10 +243,13 @@ Validate the fixed installed CLI and candidate configuration without starting OM
 OPENCODE_CLI='/Users/hamed/Library/Application Support/ai.opencode.desktop/cli/2.0.32-arm64/opencode-cli'
 "$OPENCODE_CLI" --version
 "$OPENCODE_CLI" run --help
+"$OPENCODE_CLI" serve --help
 python3 -c 'from pathlib import Path; from omcp.controller import Config; Config.load(Path("/absolute/path/to/omcp-candidate.json")); print("candidate configuration valid")'
 ```
 
-The expected CLI version is `2.0.32`; help must show `run`, `--standalone`, `--format`, and `--file`. Do not issue a provider request against a production worktree as a validation step. In a disposable local clone with separate temporary state, run the unit suite, start a separate candidate server, submit a harmless explicitly approved task to `deepseek`, and confirm that it either completes or reports the provider error. Check that `runner.json`, `state.json`, and `audit.jsonl` contain no credential value; OpenCode stream output is deliberately discarded, so no `worker.log` is created for it. Only after those checks pass may the local operator manually merge the reviewed candidate worker objects into a stopped service configuration and start a new service process. This change does not authorize a deployment, push, live tunnel modification, or production activation.
+The expected CLI version is `2.0.32`; help must show `run`, `--server`, `--format`, `--file`, `serve`, `--hostname`, and `--port`. Its configuration uses singular `provider` / `npm` / `options` fields, plus `permissions`, `snapshots`, and top-level `policies`. First run the unit suite and the noncredentialed host checks in [ADR-005](decisions/ADR-005-opencode-pinned-egress.md). Confirm both generated Seatbelt profiles compile on the target Mac and that a synthetic-key run reaches only the local gateway and produces a neutral provider failure. Inspect the generated policy before cleanup and confirm it contains the random local URL and synthetic key but no credential value or remote endpoint.
+
+Do not issue a credentialed provider request against a production worktree as a validation step. A real provider test requires a fresh local approval. In a disposable local clone with separate temporary state, start a separate candidate server, submit a harmless explicitly approved task to the OpenCode DeepSeek worker, and confirm that it either completes or reports an allowlisted failure category. Check that `runner.json`, `state.json`, `audit.jsonl`, process arguments, process environment and result contain no credential value; OpenCode stream output is reduced in memory and discarded, so no `worker.log` is created for it. Independently verify from the target host that OpenCode has no non-loopback socket access and the gateway uses verified TLS for `api.deepseek.com:443`. Only after those checks pass may the local operator manually merge the reviewed candidate worker object into a stopped service configuration and start a new service process. This change does not authorize a deployment, push, live tunnel modification, or production activation.
 
 ### Enable the bounded Delnavazan host operation
 
@@ -234,7 +304,9 @@ The installer compiles an accessory macOS app, binds the portal to `127.0.0.1:87
 
 The portal already fails closed for non-loopback bindings. Remote mode requires all of: an explicit non-wildcard interface address, `--allow-remote`, a server certificate/key, a client CA, TLS 1.3, and a valid client certificate. Authentication, session validation, CSRF, task lookup, and authorization remain server-side. The local approval socket is never bound, proxied, or exposed to the network; only the portal process may use it.
 
-Remote mode is deliberately not installed or enabled by the Mac installer. Before moving this component to PixelBox, provision device-bound client identities, terminate TLS in the approval component itself or a comparably trusted local boundary, verify Tailscale ACLs as defense in depth, test revocation and expiry, and define how the remote component sends an authenticated decision to the Mac coordinator without forwarding the socket. Until that protocol is implemented and reviewed, PixelBox/iPhone approval is design-ready but unavailable.
+Remote mode is deliberately not installed or enabled by the Mac installer. Before moving this component to PixelBox, provision device-bound client identities, terminate TLS in the approval component itself or a comparably trusted local boundary, verify Tailscale ACLs as defense in depth, test revocation and expiry, and define how the remote component sends an authenticated decision to the coordinator without forwarding the socket. Until that protocol is implemented and reviewed, PixelBox/iPhone approval is design-ready but unavailable.
+
+The PixelBox systemd deployment runs the coordinator as a persistent Unix-socket MCP server and gives the tunnel client only `omcp.mcp_proxy` over stdio. The proxy and socket are owner-only and carry no identity of their own; fixed-principal authentication still comes from the coordinator environment and the verified tunnel/app boundary.
 
 ## Verification
 

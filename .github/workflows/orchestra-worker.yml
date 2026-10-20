@@ -1,0 +1,137 @@
+name: Orchestra ephemeral worker
+
+# The Orchestra coordinator dispatches this workflow only after its own
+# repository, worker, approval and scheduler checks pass.  The workflow has no
+# repository write permission: it returns a patch artifact instead of pushing.
+run-name: Orchestra ${{ inputs.task_id }} ${{ inputs.dispatch_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: Orchestra task UUID
+        required: true
+        type: string
+      request_id:
+        description: Orchestra idempotency key
+        required: true
+        type: string
+      dispatch_id:
+        description: Coordinator-generated UUID for this dispatch attempt
+        required: true
+        type: string
+      dispatched_at:
+        description: Coordinator-persisted UTC dispatch timestamp
+        required: true
+        type: string
+      agent:
+        description: Reviewed coding agent
+        required: true
+        type: choice
+        options:
+          - codex
+          - deepseek
+      model:
+        description: Owner-configured model identifier
+        required: true
+        type: string
+      workflow_sha:
+        description: Coordinator-verified workflow commit SHA
+        required: true
+        type: string
+      payload:
+        description: Compressed task payload produced by Orchestra
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: orchestra-worker-${{ inputs.task_id }}
+  cancel-in-progress: true
+
+jobs:
+  verify-workflow-sha:
+    name: Verify protected workflow SHA before secret release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Match the dispatched run to the coordinator-approved SHA
+        env:
+          EXPECTED_WORKFLOW_SHA: ${{ inputs.workflow_sha }}
+          ACTUAL_WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          if [[ ! "$EXPECTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Configured workflow SHA is invalid" >&2
+            exit 1
+          fi
+          if [[ "$ACTUAL_WORKFLOW_SHA" != "$EXPECTED_WORKFLOW_SHA" ]]; then
+            echo "Dispatched workflow SHA does not match the approved SHA" >&2
+            exit 1
+          fi
+
+  execute:
+    name: Execute approved task
+    needs: verify-workflow-sha
+    # Fixed ARM64 image label exercises the same architecture as PixelBox.
+    runs-on: ubuntu-24.04-arm
+    environment: orchestra-workers
+    timeout-minutes: 180
+    steps:
+      - name: Check out the approved SHA
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.11"
+
+      - name: Install pinned coding agents
+        run: npm install --global @openai/codex@0.160.0 opencode-ai@1.19.3
+
+      - name: Execute approved Orchestra task with Codex
+        if: inputs.agent == 'codex'
+        env:
+          ORCHESTRA_TASK_ID: ${{ inputs.task_id }}
+          ORCHESTRA_REQUEST_ID: ${{ inputs.request_id }}
+          ORCHESTRA_DISPATCH_ID: ${{ inputs.dispatch_id }}
+          ORCHESTRA_DISPATCHED_AT: ${{ inputs.dispatched_at }}
+          ORCHESTRA_AGENT: ${{ inputs.agent }}
+          ORCHESTRA_MODEL: ${{ inputs.model }}
+          ORCHESTRA_PAYLOAD: ${{ inputs.payload }}
+          ORCHESTRA_OUTPUT_DIR: ${{ runner.temp }}/orchestra-output
+          ORCHESTRA_RUNTIME_DIR: ${{ runner.temp }}/orchestra-runtime
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: python3 scripts/orchestra_actions_worker.py
+
+      - name: Execute approved Orchestra task with DeepSeek
+        if: inputs.agent == 'deepseek'
+        env:
+          ORCHESTRA_TASK_ID: ${{ inputs.task_id }}
+          ORCHESTRA_REQUEST_ID: ${{ inputs.request_id }}
+          ORCHESTRA_DISPATCH_ID: ${{ inputs.dispatch_id }}
+          ORCHESTRA_DISPATCHED_AT: ${{ inputs.dispatched_at }}
+          ORCHESTRA_AGENT: ${{ inputs.agent }}
+          ORCHESTRA_MODEL: ${{ inputs.model }}
+          ORCHESTRA_PAYLOAD: ${{ inputs.payload }}
+          ORCHESTRA_OUTPUT_DIR: ${{ runner.temp }}/orchestra-output
+          ORCHESTRA_RUNTIME_DIR: ${{ runner.temp }}/orchestra-runtime
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: python3 scripts/orchestra_actions_worker.py
+
+      - name: Upload bounded result and patch
+        if: always()
+        # actions/upload-artifact@v4, pinned to the reviewed v4.6.2 commit.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: omcp-${{ inputs.task_id }}
+          path: ${{ runner.temp }}/orchestra-output
+          if-no-files-found: warn
+          retention-days: 7

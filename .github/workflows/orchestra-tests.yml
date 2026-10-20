@@ -1,0 +1,47 @@
+name: Orchestra tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+        python-version:
+          - "3.11"
+          - "3.13"
+    steps:
+      - name: Check out
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Compile
+        run: python3 -m compileall -q omcp mac_bridge tests scripts
+
+      - name: Run test suite
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Validate deployment shell scripts
+        run: |
+          bash -n deploy/pixelbox/install.sh
+          bash -n deploy/pixelbox/verify.sh

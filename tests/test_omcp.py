@@ -1,3 +1,5 @@
+import io
+import http.client
 import json
 import os
 import signal
@@ -8,6 +10,7 @@ import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
+from urllib.parse import urlparse
 
 from omcp.approval import format_review
 from omcp.controller import (
@@ -17,7 +20,10 @@ from omcp.controller import (
 from omcp.docker_gate import gated_command
 from omcp.host_runner import run as run_host_operation
 from omcp.local_control import LocalApprovalServer, approval_request
-from omcp.runner import opencode_command, opencode_environment, run as run_worker
+from omcp.runner import (
+    OpenCodeDiagnosticCollector, PinnedProviderGateway, opencode_commands,
+    opencode_environment, opencode_policy, run as run_worker, run_opencode_process,
+)
 from omcp.server import MCPServer, TOOLS, main as server_main
 
 
@@ -30,6 +36,16 @@ ALL_PERMISSIONS = frozenset({
 
 class FakeProcess:
     pid = os.getpid()
+
+
+def codex_fixture(directory: Path) -> dict[str, str]:
+    """Return a deterministic PATH containing the executable Config validates."""
+    bin_dir = directory / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    executable = bin_dir / "codex"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    return {**os.environ, "PATH": str(bin_dir)}
 
 
 class ControllerTests(unittest.TestCase):
@@ -86,6 +102,47 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(persisted["requests"]["request-1"], first["task_id"])
         with self.assertRaisesRegex(ValueError, "different task content"):
             self.controller.submit_task("request-1", "Other", "Other work", "ina")
+
+    def test_opencode_failure_exposes_only_allowlisted_diagnostic_fields(self):
+        self.controller.close()
+        self.controller = TaskController(
+            Config(
+                "owner/repo", self.root, self.state, "origin/main",
+                {"opencode": Worker(
+                    "opencode", ("/allowlisted/opencode-cli",), adapter="opencode",
+                    provider="deepseek", model="deepseek/deepseek-chat",
+                    credential_file="/private/key", endpoint_host="api.deepseek.com",
+                )},
+                Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+            ),
+            popen=self.popen, workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: "11111111-1111-1111-1111-111111111111",
+        )
+        submitted = self.controller.submit_task(
+            "opencode-redacted", "Harmless", "Reply without tools", "opencode", True,
+        )
+        self.controller.resolve_approval(
+            submitted["task_id"], "approve", "Approved harmless provider check",
+            approver_identity="local:test-operator",
+        )
+        task = self.controller.state["tasks"][submitted["task_id"]]
+        Path(task["result_path"]).write_text("generic result")
+        Path(task["completion_path"]).write_text(json.dumps({
+            "exit_code": 1, "finished_at": "2026-10-11T00:00:00+00:00",
+            "runner_error": "OpenCodeExecutionFailed",
+            "worker_diagnostic": {
+                "category": "authentication", "status": 401, "exit_cause": "process_exit",
+            },
+        }))
+
+        status = self.controller.task_status(submitted["task_id"])
+
+        self.assertEqual(status["failure"], {
+            "type": "OpenCodeExecutionFailed", "category": "authentication",
+            "status": 401, "exit_cause": "process_exit",
+        })
+        self.assertNotIn("prompt", json.dumps(status["failure"]))
+        self.assertNotIn("credential", json.dumps(status["failure"]))
 
     def test_profile_is_bound_to_task_approval_and_idempotency(self):
         archive = Path(self.temp.name) / "archive"
@@ -1160,6 +1217,309 @@ class ConfigTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_opencode_policy_uses_v2_schema_and_only_local_gateway(self):
+        gateway = "http://127.0.0.1:49152/abcdefghijklmnopqrstuvwxyzABCDEFG_123456/v1"
+        policy = opencode_policy("deepseek", "deepseek/deepseek-chat", gateway)
+        self.assertEqual(policy["policies"], [
+            {"action": "provider.use", "resource": "*", "effect": "deny"},
+            {"action": "provider.use", "resource": "deepseek", "effect": "allow"},
+        ])
+        provider = policy["provider"]["deepseek"]
+        self.assertEqual(provider["npm"], "@ai-sdk/openai-compatible")
+        self.assertEqual(provider["models"], {"deepseek-chat": {}})
+        self.assertEqual(provider["options"]["timeout"], 1_800_000)
+        self.assertEqual(provider["options"]["baseURL"], gateway)
+        self.assertEqual(provider["options"]["apiKey"], "omcp-local-gateway")
+        self.assertNotIn("api.deepseek.com", json.dumps(policy))
+        self.assertFalse(policy["snapshots"])
+
+    def test_opencode_commands_have_only_exact_loopback_egress_and_no_credential_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            prompt = root / "prompt"
+            prompt.write_text("task")
+            runtime = root / "runtime"
+            gateway = "http://127.0.0.1:49152/abcdefghijklmnopqrstuvwxyzABCDEFG_123456/v1"
+
+            with patch("omcp.platform.host_platform", return_value="darwin"), \
+                    patch("omcp.platform.sandbox_executable",
+                          return_value="/usr/bin/sandbox-exec"):
+                server, client = opencode_commands(
+                    "/allowlisted/opencode-cli", workspace, prompt, runtime,
+                    "deepseek", "deepseek/deepseek-chat", "api.deepseek.com", gateway, 49153,
+                )
+
+            server_profile, client_profile = server[2], client[2]
+            profiles = server_profile + client_profile
+            self.assertIn(
+                '(allow process-exec (literal "/allowlisted/opencode-cli"))',
+                server_profile,
+            )
+            self.assertIn(
+                '(allow process-exec (literal "/allowlisted/opencode-cli"))',
+                client_profile,
+            )
+            self.assertNotIn("api.deepseek.com", profiles)
+            self.assertNotIn("*:443", profiles)
+            self.assertNotIn("localhost:*", profiles)
+            self.assertNotIn('tcp "*:*"', profiles)
+            self.assertIn('(allow network-bind (local tcp "localhost:49153"))', server_profile)
+            self.assertIn('(allow network-outbound (remote tcp "localhost:49152"))', server_profile)
+            self.assertIn('(allow network-outbound (remote tcp "localhost:49153"))', client_profile)
+            self.assertNotIn("localhost:49152", client_profile)
+            self.assertIn("serve", server)
+            self.assertIn("--server", client)
+            self.assertNotIn("--standalone", client)
+            config = (runtime / "config" / "opencode" / "opencode.json").read_text()
+            self.assertNotIn("credential", config)
+            self.assertIn(gateway, config)
+
+    def test_opencode_policy_rejects_cross_provider_model(self):
+        gateway = "http://127.0.0.1:49152/abcdefghijklmnopqrstuvwxyzABCDEFG_123456/v1"
+        with self.assertRaisesRegex(ValueError, "gateway URL"):
+            opencode_policy("deepseek", "openai/gpt-4.1", gateway)
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and Path("/usr/bin/sandbox-exec").is_file(),
+        "requires macOS Seatbelt",
+    )
+    def test_opencode_exact_port_seatbelt_profiles_compile_on_macos(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            prompt = root / "prompt"
+            prompt.write_text("offline synthetic probe")
+            runtime = root / "runtime"
+            server, client = opencode_commands(
+                "/usr/bin/true", workspace, prompt, runtime,
+                "deepseek", "deepseek/deepseek-chat", "api.deepseek.com",
+                "http://127.0.0.1:49152/abcdefghijklmnopqrstuvwxyzABCDEFG_123456/v1",
+                49153,
+            )
+            baseline = subprocess.run(
+                ["/usr/bin/sandbox-exec", "-p", "(version 1)\n(allow default)",
+                 "/usr/bin/true"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                timeout=10,
+            )
+            if (baseline.returncode != 0
+                    and b"Operation not permitted" in baseline.stderr):
+                self.skipTest("enclosing sandbox blocks sandbox execution")
+            self.assertEqual(
+                baseline.returncode, 0, baseline.stderr.decode("utf-8", "replace"),
+            )
+            for command in (server, client):
+                probe = subprocess.run(
+                    ["/usr/bin/sandbox-exec", "-p", command[2], "/usr/bin/true"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                    timeout=10,
+                )
+                self.assertEqual(probe.returncode, 0, probe.stderr.decode("utf-8", "replace"))
+
+    def test_pinned_gateway_offline_synthetic_key_probe_uses_no_real_provider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            credential = Path(directory) / "synthetic.key"
+            credential.write_text("offline-synthetic-key")
+            credential.chmod(0o600)
+            gateway = PinnedProviderGateway(
+                "deepseek", "deepseek/deepseek-chat", "api.deepseek.com", credential, 60,
+            )
+            try:
+                gateway_url = gateway.start()
+            except PermissionError as exc:
+                if exc.errno == 1:
+                    self.skipTest("enclosing sandbox prevents loopback bind")
+                raise
+            url = urlparse(gateway_url)
+            upstream_response = Mock(status=401)
+            upstream_response.getheader.side_effect = lambda name, default=None: {
+                "Content-Type": "application/json",
+            }.get(name, default)
+            upstream_response.read.side_effect = [b'{"error":{"message":"synthetic"}}', b""]
+            upstream = Mock()
+            upstream.getresponse.return_value = upstream_response
+            payload = json.dumps({
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": "offline"}],
+                "stream": False,
+            })
+            try:
+                with patch("omcp.runner.http.client.HTTPSConnection",
+                           return_value=upstream) as connect:
+                    local = http.client.HTTPConnection(url.hostname, url.port, timeout=5)
+                    local.request(
+                        "POST", url.path + "/chat/completions", payload,
+                        {"Authorization": "Bearer omcp-local-gateway",
+                         "Content-Type": "application/json"},
+                    )
+                    response = local.getresponse()
+                    body = response.read()
+                    local.close()
+                self.assertEqual(response.status, 401)
+                self.assertEqual(connect.call_args.args[:2], ("api.deepseek.com", 443))
+                self.assertEqual(
+                    upstream.request.call_args.args[3]["Authorization"],
+                    "Bearer offline-synthetic-key",
+                )
+                self.assertNotIn(b"offline-synthetic-key", body)
+            finally:
+                gateway.close()
+
+    def test_pinned_gateway_forwards_only_exact_deepseek_request_with_verified_tls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            credential = Path(directory) / "deepseek.key"
+            credential.write_text("synthetic-secret-never-retain")
+            credential.chmod(0o600)
+            gateway = PinnedProviderGateway(
+                "deepseek", "deepseek/deepseek-chat", "api.deepseek.com", credential, 600,
+            )
+            gateway._server = Mock(server_port=49152)
+            payload = json.dumps({
+                "model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            }).encode()
+            handler = Mock()
+            handler.path = f"/{gateway._token}/v1/chat/completions"
+            handler.headers = {
+                "Host": "127.0.0.1:49152", "Authorization": "Bearer omcp-local-gateway",
+                "Content-Type": "application/json", "Content-Length": str(len(payload)),
+            }
+            handler.rfile = io.BytesIO(payload)
+            handler.wfile = io.BytesIO()
+            handler.close_connection = False
+            response = Mock(status=200)
+            response.getheader.side_effect = lambda name, default=None: {
+                "Content-Type": "text/event-stream",
+            }.get(name, default)
+            response.read.side_effect = [b"data: safe\n\n", b""]
+            connection = Mock()
+            connection.getresponse.return_value = response
+
+            with patch("omcp.runner.http.client.HTTPSConnection", return_value=connection) as connect:
+                gateway._serve_request(handler)
+
+            self.assertEqual(connect.call_args.args[:2], ("api.deepseek.com", 443))
+            context = connect.call_args.kwargs["context"]
+            ssl_module = __import__("ssl")
+            self.assertIsInstance(context, ssl_module.SSLContext)
+            self.assertTrue(context.check_hostname)
+            self.assertEqual(context.verify_mode, ssl_module.CERT_REQUIRED)
+            request = connection.request.call_args
+            self.assertEqual(request.args[:2], ("POST", "/v1/chat/completions"))
+            self.assertEqual(request.args[3]["Authorization"], "Bearer synthetic-secret-never-retain")
+            self.assertNotIn("synthetic-secret-never-retain", handler.wfile.getvalue().decode())
+            gateway.close()
+
+    def test_pinned_gateway_rejects_wrong_route_without_upstream_connection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            credential = Path(directory) / "deepseek.key"
+            credential.write_text("synthetic-secret")
+            credential.chmod(0o600)
+            gateway = PinnedProviderGateway(
+                "deepseek", "deepseek/deepseek-chat", "api.deepseek.com", credential, 600,
+            )
+            gateway._server = Mock(server_port=49152)
+            handler = Mock()
+            handler.path = "/v1/chat/completions"
+            handler.headers = {}
+            handler.rfile = io.BytesIO()
+            handler.wfile = io.BytesIO()
+            handler.close_connection = False
+
+            with patch("omcp.runner.http.client.HTTPSConnection") as connect:
+                gateway._serve_request(handler)
+
+            connect.assert_not_called()
+            self.assertTrue(handler.close_connection)
+            gateway.close()
+
+    def test_pinned_gateway_rejects_model_encoding_size_and_request_count_deviations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            credential = Path(directory) / "deepseek.key"
+            credential.write_text("synthetic-secret")
+            credential.chmod(0o600)
+            gateway = PinnedProviderGateway(
+                "deepseek", "deepseek/deepseek-chat", "api.deepseek.com", credential, 600,
+            )
+            gateway._server = Mock(server_port=49152)
+
+            def rejected(payload: bytes, **headers: str) -> None:
+                gateway._request_count = 0
+                handler = Mock()
+                handler.path = f"/{gateway._token}/v1/chat/completions"
+                handler.headers = {
+                    "Host": "127.0.0.1:49152", "Authorization": "Bearer omcp-local-gateway",
+                    "Content-Type": "application/json", "Content-Length": str(len(payload)),
+                    **headers,
+                }
+                handler.rfile = io.BytesIO(payload)
+                handler.wfile = io.BytesIO()
+                handler.close_connection = False
+                gateway._serve_request(handler)
+                self.assertTrue(handler.close_connection)
+
+            wrong_model = json.dumps({"model": "other", "messages": []}).encode()
+            valid = json.dumps({"model": "deepseek-chat", "messages": []}).encode()
+            with patch("omcp.runner.http.client.HTTPSConnection") as connect:
+                rejected(wrong_model)
+                rejected(valid, **{"Transfer-Encoding": "chunked"})
+                rejected(valid, **{"Content-Encoding": "gzip"})
+                rejected(valid, **{"Content-Length": str(gateway.MAX_REQUEST_BYTES + 1)})
+                gateway._request_count = gateway.MAX_REQUESTS
+                handler = Mock()
+                handler.path = f"/{gateway._token}/v1/chat/completions"
+                handler.headers = {
+                    "Host": "127.0.0.1:49152", "Authorization": "Bearer omcp-local-gateway",
+                    "Content-Type": "application/json", "Content-Length": str(len(valid)),
+                }
+                handler.rfile, handler.wfile = io.BytesIO(valid), io.BytesIO()
+                gateway._serve_request(handler)
+                connect.assert_not_called()
+            gateway.close()
+
+    def test_opencode_diagnostics_reduce_provider_output_without_retaining_content(self):
+        collector = OpenCodeDiagnosticCollector()
+        secret = "credential-never-retained"
+        prompt = "prompt-never-retained"
+        model_output = "model-output-never-retained"
+        collector.feed((json.dumps({
+            "type": "error",
+            "error": {"type": "provider.auth", "status": 429,
+                      "message": prompt, "response": {"body": secret + model_output}},
+        }) + "\n").encode())
+        collector.finish()
+        diagnostic = collector.result(1)
+        self.assertEqual(diagnostic, {
+            "category": "rate_limit", "status": 429, "exit_cause": "process_exit",
+        })
+        serialized = json.dumps(diagnostic)
+        self.assertNotIn(secret, serialized)
+        self.assertNotIn(prompt, serialized)
+        self.assertNotIn(model_output, serialized)
+
+    def test_opencode_process_discards_raw_stream_and_reports_http_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            raw = json.dumps({
+                "type": "error", "error": {"type": "provider.auth", "status": 403,
+                "message": "secret diagnostic"},
+            })
+            code, diagnostic = run_opencode_process(
+                [sys.executable, "-c", "import sys; print(sys.argv[1]); raise SystemExit(1)", raw],
+                root, {"PATH": os.environ.get("PATH", "")}, runtime, 60,
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(diagnostic, {
+                "category": "authentication", "status": 403, "exit_cause": "process_exit",
+            })
+            self.assertEqual(list(runtime.iterdir()), [])
+            self.assertNotIn("secret diagnostic", json.dumps(diagnostic))
+
     def test_deepseek_runner_uses_direct_https_and_never_retains_secret_or_raw_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1215,6 +1575,57 @@ class RunnerTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "specification is incomplete"):
                     run_worker(spec)
                 execute.assert_not_called()
+
+    def test_opencode_runner_uses_gateway_and_records_only_redacted_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt = root / "prompt"
+            prompt.write_text("sensitive prompt")
+            credential = root / "opencode.key"
+            credential.write_text("sensitive credential")
+            credential.chmod(0o600)
+            completion = root / "completion"
+            spec = root / "spec.json"
+            spec.write_text(json.dumps({
+                "adapter": "opencode", "command": ["/allowlisted/opencode-cli"],
+                "provider": "deepseek", "model": "deepseek/deepseek-chat",
+                "endpoint_host": "api.deepseek.com", "credential_file": str(credential),
+                "max_worker_seconds": 600, "workspace": str(root), "prompt_path": str(prompt),
+                "log_path": str(root / "log"), "result_path": str(root / "result"),
+                "completion_path": str(completion),
+            }))
+            safe = {"category": "authentication", "status": 401, "exit_cause": "process_exit"}
+            gateway = Mock()
+            gateway.start.return_value = (
+                "http://127.0.0.1:49152/abcdefghijklmnopqrstuvwxyzABCDEFG_123456/v1"
+            )
+            with patch("omcp.runner.canonical_opencode_executable",
+                       return_value="/allowlisted/opencode-cli"), \
+                    patch("omcp.runner.PinnedProviderGateway", return_value=gateway) as gateway_type, \
+                    patch("omcp.runner.reserve_loopback_port", return_value=49153), \
+                    patch("omcp.runner.run_opencode_with_server", return_value=(1, safe)) as execute, \
+                    patch("omcp.platform.host_platform", return_value="darwin"), \
+                    patch("omcp.platform.sandbox_executable",
+                          return_value="/usr/bin/sandbox-exec"):
+                self.assertEqual(run_worker(spec), 1)
+
+            gateway_type.assert_called_once_with(
+                "deepseek", "deepseek/deepseek-chat", "api.deepseek.com", credential, 600,
+            )
+            gateway.close.assert_called_once_with()
+            server_command, client_command = execute.call_args.args[:2]
+            self.assertNotIn("api.deepseek.com", server_command[2] + client_command[2])
+            self.assertNotIn("sensitive credential", json.dumps([server_command, client_command]))
+            self.assertNotIn("sensitive credential", json.dumps(execute.call_args.args[3]))
+            self.assertIn("OPENCODE_PASSWORD", execute.call_args.args[3])
+            record = json.loads(completion.read_text())
+            self.assertEqual(record["runner_error"], "OpenCodeExecutionFailed")
+            self.assertEqual(record["worker_diagnostic"], safe)
+            retained = completion.read_text() + (root / "result").read_text()
+            self.assertNotIn("sensitive prompt", retained)
+            self.assertNotIn("sensitive credential", retained)
+            self.assertFalse((root / "log").exists())
+            self.assertFalse((root / "opencode-runtime").exists())
 
     def test_deepseek_failure_is_sanitized_and_bounded(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1299,7 +1710,8 @@ class RunnerTests(unittest.TestCase):
                 "result_path": str(root / "result"), "completion_path": str(completion),
                 "codex_home": None,
             }))
-            with patch("omcp.runner.subprocess.run", return_value=Mock(returncode=0)) as execute:
+            with patch.dict(os.environ, codex_fixture(root), clear=True), \
+                    patch("omcp.runner.subprocess.run", return_value=Mock(returncode=0)) as execute:
                 self.assertEqual(run_worker(spec), 0)
             self.assertEqual(json.loads(completion.read_text())["exit_code"], 0)
             command = execute.call_args.args[0]
@@ -1393,7 +1805,8 @@ class RunnerTests(unittest.TestCase):
                     "git_metadata": "read_only",
                 },
             }))
-            with patch("omcp.runner.subprocess.run", return_value=Mock(returncode=0)) as execute:
+            with patch.dict(os.environ, codex_fixture(root), clear=True), \
+                    patch("omcp.runner.subprocess.run", return_value=Mock(returncode=0)) as execute:
                 self.assertEqual(run_worker(spec), 0)
             command = execute.call_args.args[0]
             self.assertNotIn("--sandbox", command)
@@ -1833,7 +2246,7 @@ class StdioIntegrationTests(unittest.TestCase):
                  "params": {"name": "bridge_status", "arguments": {}}},
             ]) + "\n"
             environment = {
-                **os.environ,
+                **codex_fixture(Path(directory)),
                 "OMCP_TUNNEL_AUTHENTICATED": "1",
                 "OMCP_AUTHENTICATED_CALLER": "chatgpt:test",
             }

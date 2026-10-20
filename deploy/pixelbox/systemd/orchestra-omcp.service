@@ -1,0 +1,41 @@
+[Unit]
+Description=Orchestra OMCP coordinator (PixelBox)
+Documentation=file:/opt/orchestra/current/docs/PIXELBOX-MIGRATION.md
+After=network-online.target
+Wants=network-online.target orchestra-github-dispatch.service
+After=orchestra-github-dispatch.service
+# These units do not manage or restart Tailscale Serve or the Nextcloud stack.
+Conflicts=shutdown.target
+
+[Service]
+Type=simple
+User=hamed
+Group=hamed
+WorkingDirectory=/opt/orchestra/current
+EnvironmentFile=/etc/orchestra/omcp.env
+ExecStartPre=/usr/bin/test -r /etc/orchestra/omcp.json
+ExecStart=/usr/bin/python3 -m omcp.server --config /etc/orchestra/omcp.json --socket /home/hamed/orchestra-migration/state/mcp.sock
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+KillMode=control-group
+UMask=0077
+
+# Defence in depth.  Worker worktrees and owner state are the only writable
+# locations; the repository checkout is read-write only because Git creates
+# worktree metadata there.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/hamed/orchestra-migration/state
+ReadWritePaths=-/home/hamed/orchestra-migration/checkout
+ReadWritePaths=-/home/hamed/.codex
+ReadWritePaths=-/home/hamed/.codex-ina
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

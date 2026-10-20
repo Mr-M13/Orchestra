@@ -44,8 +44,10 @@ The first runtime component is the opt-in Mac Bridge v1. Its implementation and 
 - [Mac Bridge v1](docs/MAC-BRIDGE-V1.md) — a local outbound-only GitHub issue dispatcher for scoped worker execution.
 - [ADR-001: Local outbound worker bridge](docs/decisions/ADR-001-mac-bridge-v1.md) — records the queue, trust boundary, credential, and recovery decisions for the first runtime component.
 - [OMCP task control v1](docs/OMCP.md) — direct MCP tools for durable submission, status, results, availability, cancellation and approvals.
+- [PixelBox migration](docs/PIXELBOX-MIGRATION.md) — Linux ARM64 coordinator, GitHub Actions workers, systemd, health, cutover and recovery runbook.
 - [Execution policies and operator runbook](docs/EXECUTION-POLICIES.md) — distinguishes deployed prompt-free worker scheduling from the proposed, not-yet-active automatic merge/deploy policy.
 - [ADR-002: Local MCP task-control adapter](docs/decisions/ADR-002-omcp-task-control.md) — records the direct-control transport, authority and recovery boundary.
+- [ADR-004: PixelBox coordinator and GitHub Actions workers](docs/decisions/ADR-004-pixelbox-linux-actions-workers.md) — records the Linux sandbox, remote-worker, artifact and cutover decisions.
 
 The lessons audit remains open to new evidence throughout development; completing the initial audit does not freeze what Orchestra can learn.
 
@@ -58,3 +60,5 @@ Orchestra should increase human capability rather than obscure the system behind
 **Status:** Foundation  
 **Repository:** Private  
 **Initialised:** 27 September 2026
+
+**PixelBox migration:** implementation and portable release-staging logic are locally tested; Linux ARM64 staging, live deployment verification and production cutover have not been performed and require explicit owner approval. See [docs/PIXELBOX-MIGRATION.md](docs/PIXELBOX-MIGRATION.md).

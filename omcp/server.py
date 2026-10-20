@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import signal
+import socket
 import sys
 import threading
 from pathlib import Path
@@ -15,6 +16,7 @@ from omcp.local_control import LocalApprovalServer
 
 
 PROTOCOL_VERSION = "2025-06-18"
+MAX_MCP_LINE_BYTES = 4 * 1024 * 1024
 
 
 def _object(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
@@ -193,28 +195,122 @@ class MCPServer:
                 "isError": True,
             })
 
-    def run(self) -> int:
+    def _start_auxiliary(self) -> tuple[LocalApprovalServer, threading.Thread]:
         local_approval = LocalApprovalServer(self.controller, self.controller_lock)
         local_approval.start()
         ticker = threading.Thread(target=self._tick_loop, name="omcp-reconciler", daemon=True)
         ticker.start()
+        return local_approval, ticker
+
+    def _stop_auxiliary(self, local_approval: LocalApprovalServer,
+                        ticker: threading.Thread) -> None:
+        self.stop_event.set()
+        ticker.join(timeout=2)
+        local_approval.stop()
+
+    def _stdio_response(self, line: str) -> dict[str, Any] | None:
+        try:
+            return self.handle(json.loads(line))
+        except json.JSONDecodeError:
+            return self._error(None, -32700, "Parse error")
+
+    def run(self) -> int:
+        local_approval, ticker = self._start_auxiliary()
         try:
             for line in sys.stdin:
                 if self.stopping:
                     break
-                try:
-                    request = json.loads(line)
-                    response = self.handle(request)
-                except json.JSONDecodeError:
-                    response = self._error(None, -32700, "Parse error")
+                response = self._stdio_response(line)
                 if response is not None:
                     sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
                     sys.stdout.flush()
             return 0
         finally:
-            self.stop_event.set()
-            ticker.join(timeout=2)
-            local_approval.stop()
+            self._stop_auxiliary(local_approval, ticker)
+
+    def run_socket(self, socket_path: Path) -> int:
+        """Serve JSON-RPC over an owner-only Unix socket.
+
+        The tunnel client owns a small stdio proxy, while this process remains
+        the persistent coordinator.  This keeps the scheduler, approval socket
+        and task state alive across individual tunnel connections.
+        """
+        socket_path = socket_path.expanduser().resolve()
+        socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(socket_path.parent, 0o700)
+        socket_path.unlink(missing_ok=True)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(socket_path))
+        os.chmod(socket_path, 0o600)
+        listener.listen(8)
+        listener.settimeout(0.5)
+        local_approval, ticker = self._start_auxiliary()
+        connections: list[threading.Thread] = []
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    connection, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    if self.stop_event.is_set():
+                        break
+                    continue
+                worker = threading.Thread(
+                    target=self._serve_connection, args=(connection,),
+                    name="omcp-mcp-connection", daemon=True,
+                )
+                worker.start()
+                connections.append(worker)
+                connections = [item for item in connections if item.is_alive()]
+            return 0
+        finally:
+            self._stop_auxiliary(local_approval, ticker)
+            listener.close()
+            socket_path.unlink(missing_ok=True)
+            for worker in connections:
+                worker.join(timeout=1)
+
+    def _serve_connection(self, connection: socket.socket) -> None:
+        connection.settimeout(1.0)
+        buffer = b""
+        with connection:
+            while not self.stop_event.is_set():
+                try:
+                    chunk = connection.recv(65_536)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                buffer += chunk
+                if len(buffer) > MAX_MCP_LINE_BYTES:
+                    self._send_connection(connection, self._error(
+                        None, -32600, "Request too large",
+                    ))
+                    return
+                while b"\n" in buffer:
+                    raw, buffer = buffer.split(b"\n", 1)
+                    try:
+                        line = raw.decode("utf-8")
+                    except UnicodeDecodeError:
+                        self._send_connection(connection, self._error(
+                            None, -32700, "Parse error",
+                        ))
+                        continue
+                    response = self._stdio_response(line)
+                    if response is not None:
+                        self._send_connection(connection, response)
+
+    @staticmethod
+    def _send_connection(connection: socket.socket, response: dict[str, Any]) -> None:
+        try:
+            connection.sendall(
+                json.dumps(response, separators=(",", ":")).encode() + b"\n"
+            )
+        except OSError:
+            return
 
     def _tick_loop(self) -> None:
         while not self.stop_event.wait(1):
@@ -231,6 +327,10 @@ class MCPServer:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Orchestra MCP task-control server")
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument(
+        "--socket", type=Path,
+        help="serve JSON-RPC on an owner-only Unix socket instead of stdio",
+    )
     args = parser.parse_args(argv)
     config = Config.load(args.config)
     if os.environ.get("OMCP_TUNNEL_AUTHENTICATED") != "1":
@@ -247,6 +347,8 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     try:
+        if args.socket is not None:
+            return server.run_socket(args.socket)
         return server.run()
     finally:
         controller.close()

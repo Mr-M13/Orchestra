@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Orchestra PixelBox health check every two minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Persistent=true
+Unit=orchestra-health.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,19 @@
+[Unit]
+Description=Orchestra PixelBox health check
+Documentation=file:/opt/orchestra/current/docs/PIXELBOX-MIGRATION.md
+After=orchestra-omcp.service
+
+[Service]
+Type=oneshot
+User=hamed
+Group=hamed
+WorkingDirectory=/opt/orchestra/current
+EnvironmentFile=/etc/orchestra/omcp.env
+ExecStartPre=/usr/bin/test -r /etc/orchestra/omcp.json
+ExecStart=/usr/bin/python3 -m omcp.health --config /etc/orchestra/omcp.json --json
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=/home/hamed/orchestra-migration

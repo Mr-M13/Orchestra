@@ -1,0 +1,30 @@
+name: Orchestra security verification
+
+# Manual-only so this repository does not consume Actions minutes on every
+# push.  Run it when reviewing the remote-worker boundary or ARM64 changes.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arm64:
+    name: Python tests on Linux ARM64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - name: Check out source without retaining a token
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.11"
+
+      - name: Compile and run the full standard-library suite
+        run: |
+          python -m compileall -q omcp scripts tests
+          python -m unittest discover -s tests -v
