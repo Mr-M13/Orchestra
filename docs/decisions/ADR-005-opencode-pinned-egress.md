@@ -1,4 +1,4 @@
-# ADR-004: Endpoint-pinned OpenCode provider egress
+# ADR-005: Endpoint-pinned OpenCode provider egress
 
 Status: candidate; activation requires independent target-Mac verification.
 

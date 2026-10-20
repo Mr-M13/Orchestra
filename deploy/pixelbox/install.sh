@@ -85,7 +85,8 @@ validate_source_commit() {
     omcp/server.py \
     omcp/health.py \
     .github/workflows/orchestra-worker.yml \
-    deploy/pixelbox/systemd/orchestra-omcp.service; do
+    deploy/pixelbox/systemd/orchestra-omcp.service \
+    deploy/pixelbox/systemd/orchestra-github-dispatch.service; do
     git -C "$SOURCE_ROOT" cat-file -e "$RELEASE_SHA:$required" 2>/dev/null \
       || fail "release commit is missing reviewed file: $required"
   done
@@ -182,7 +183,9 @@ validate_release_tree() {
     .github/workflows/orchestra-worker.yml \
     deploy/pixelbox/install.sh \
     deploy/pixelbox/verify.sh \
-    deploy/pixelbox/systemd/orchestra-omcp.service; do
+    deploy/pixelbox/systemd/orchestra-omcp.service \
+    deploy/pixelbox/systemd/orchestra-github-dispatch.service \
+    deploy/pixelbox/github-dispatch.example.json; do
     sudo test -r "$release_root/$required" \
       || fail "staged release is missing reviewed file: $required"
   done
@@ -252,8 +255,9 @@ stage_configuration() {
       STAGED_ONLY=1
     fi
   done
-  if [[ ! -f "$CONFIG_ROOT/secrets/github-actions.token" ]]; then
-    echo "Create $CONFIG_ROOT/secrets/github-actions.token with mode 0600 before activation."
+  if [[ ! -f "$CONFIG_ROOT/github-dispatch/config.json" \
+      || ! -f "$CONFIG_ROOT/github-dispatch/github-actions.token" ]]; then
+    echo "Dedicated GitHub broker identity/configuration is not installed. Follow the reviewed migration runbook after separate approval."
     STAGED_ONLY=1
   fi
 }
@@ -281,7 +285,7 @@ release_sha_from_link() {
 
 install_units() {
   local release_root="$1" unit
-  for unit in orchestra-omcp.service orchestra-tunnel.service \
+  for unit in orchestra-omcp.service orchestra-github-dispatch.service orchestra-tunnel.service \
               orchestra-health.service orchestra-health.timer; do
     sudo install -m 0644 "$release_root/deploy/pixelbox/systemd/$unit" \
       "/etc/systemd/system/$unit"
@@ -289,7 +293,7 @@ install_units() {
 }
 
 preflight_activation() {
-  local release_root="$RELEASES_ROOT/$RELEASE_SHA" mode
+  local release_root="$RELEASES_ROOT/$RELEASE_SHA" mode coordinator_uid broker_uid
   [[ "$(uname -s)" == "Linux" ]] || fail "activation is supported only on Linux"
   [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]] \
     || fail "--apply requires a Linux ARM64 host"
@@ -304,16 +308,31 @@ preflight_activation() {
   command -v systemctl >/dev/null || fail "systemctl is required"
   [[ -x /usr/bin/python3 ]] || fail "/usr/bin/python3 is required by the systemd units"
   validate_release_tree "$release_root"
-  for file in omcp.json omcp.env tunnel.env secrets/github-actions.token; do
+  for file in omcp.json omcp.env tunnel.env; do
     [[ -f "$CONFIG_ROOT/$file" ]] || fail "required owner configuration is missing: $CONFIG_ROOT/$file"
     mode="$(stat -c '%a' "$CONFIG_ROOT/$file")"
     [[ "$mode" == "600" ]] || fail "$CONFIG_ROOT/$file must have mode 0600"
   done
-  if ! PYTHONPATH="$release_root" /usr/bin/python3 -c \
-    'import sys; from pathlib import Path; from omcp.controller import Config; Config.load(Path(sys.argv[1]))' \
-    "$CONFIG_ROOT/omcp.json"; then
-    fail "configuration preflight failed; active release was not changed"
-  fi
+  id orchestra-github >/dev/null 2>&1 || fail "dedicated orchestra-github account is missing"
+  getent group orchestra-ipc >/dev/null 2>&1 || fail "orchestra-ipc group is missing"
+  coordinator_uid="$(id -u "$SERVICE_USER")"
+  broker_uid="$(id -u orchestra-github)"
+  [[ "$coordinator_uid" != "$broker_uid" ]] || fail "GitHub broker must use a different UID"
+  for file in github-dispatch/config.json github-dispatch/github-actions.token; do
+    [[ -f "$CONFIG_ROOT/$file" ]] || fail "broker configuration is missing: $CONFIG_ROOT/$file"
+    [[ "$(stat -c '%a' "$CONFIG_ROOT/$file")" == "600" ]] \
+      || fail "$CONFIG_ROOT/$file must have mode 0600"
+    [[ "$(stat -c '%u' "$CONFIG_ROOT/$file")" == "$broker_uid" ]] \
+      || fail "$CONFIG_ROOT/$file must be owned by orchestra-github"
+  done
+  [[ "$(stat -c '%a' "$CONFIG_ROOT/github-dispatch")" == "700" ]] \
+    || fail "$CONFIG_ROOT/github-dispatch must have mode 0700"
+  [[ "$(stat -c '%u' "$CONFIG_ROOT/github-dispatch")" == "$broker_uid" ]] \
+    || fail "$CONFIG_ROOT/github-dispatch must be owned by orchestra-github"
+  sudo -u orchestra-github PYTHONPATH="$release_root" /usr/bin/python3 -c \
+    'import sys; from pathlib import Path; from omcp.github_dispatch_service import ServiceConfig; ServiceConfig.load(Path(sys.argv[1]))' \
+    "$CONFIG_ROOT/github-dispatch/config.json" \
+    || fail "dispatch broker configuration preflight failed"
 }
 
 activate_release() {
@@ -329,7 +348,12 @@ activate_release() {
   sudo systemctl daemon-reload
   atomic_symlink "releases/$RELEASE_SHA" "$CURRENT_LINK"
 
-  if sudo systemctl enable orchestra-omcp.service \
+  if sudo systemctl enable --now orchestra-github-dispatch.service \
+      && sudo systemctl is-active --quiet orchestra-github-dispatch.service \
+      && PYTHONPATH="$release_root" /usr/bin/python3 -c \
+        'import sys; from pathlib import Path; from omcp.controller import Config; Config.load(Path(sys.argv[1]))' \
+        "$CONFIG_ROOT/omcp.json" \
+      && sudo systemctl enable orchestra-omcp.service \
       && sudo systemctl enable --now orchestra-health.timer \
       && sudo systemctl restart orchestra-omcp.service \
       && sudo systemctl is-active --quiet orchestra-omcp.service \
@@ -347,13 +371,14 @@ activate_release() {
     atomic_symlink "releases/$old_sha" "$CURRENT_LINK"
     install_units "$old_root"
     sudo systemctl daemon-reload
+    sudo systemctl restart orchestra-github-dispatch.service || true
     sudo systemctl restart orchestra-omcp.service || true
     sudo systemctl start orchestra-health.timer || true
     fail "activation failed; current was restored to $old_sha"
   fi
   sudo unlink "$CURRENT_LINK" 2>/dev/null || true
-  sudo systemctl stop orchestra-omcp.service orchestra-health.timer || true
-  sudo systemctl disable orchestra-omcp.service orchestra-health.timer || true
+  sudo systemctl stop orchestra-omcp.service orchestra-github-dispatch.service orchestra-health.timer || true
+  sudo systemctl disable orchestra-omcp.service orchestra-github-dispatch.service orchestra-health.timer || true
   fail "first activation failed; no prior managed release was available"
 }
 

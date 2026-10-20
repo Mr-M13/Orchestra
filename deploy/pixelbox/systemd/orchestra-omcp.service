@@ -2,7 +2,8 @@
 Description=Orchestra OMCP coordinator (PixelBox)
 Documentation=file:/opt/orchestra/current/docs/PIXELBOX-MIGRATION.md
 After=network-online.target
-Wants=network-online.target
+Wants=network-online.target orchestra-github-dispatch.service
+After=orchestra-github-dispatch.service
 # These units do not manage or restart Tailscale Serve or the Nextcloud stack.
 Conflicts=shutdown.target
 

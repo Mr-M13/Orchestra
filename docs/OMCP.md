@@ -52,7 +52,7 @@ OpenCode is independent. Its only accepted executable is the reviewed absolute O
 
 OpenCode has no remote socket permission and cannot read the provider credential. Its generated provider base URL is a one-task, random capability URL on a second runner-selected `localhost` port; the synthetic API key accepted there has no provider authority. The trusted runner validates an exact `/v1/chat/completions` request, request size, JSON shape and selected model, then injects the owner-only credential and opens verified TLS to the code-owned provider host and path. Redirects, CONNECT, arbitrary destinations, forwarded request headers, transfer encoding, content encoding, model changes, oversized bodies and more than 64 requests fail closed. Provider responses are streamed with a per-response bound and only JSON or event-stream content types. Separate Seatbelt profiles allow the V2 server to bind/inbound only on its exact port and connect only to the exact gateway port, while the CLI client can connect only to the exact V2 server port. Neither profile contains a wildcard loopback rule, remote hostname rule or `*:443` rule. Other same-user processes are outside this boundary, so the V2 server also uses a random task password and the gateway requires both an unguessable path capability and the fixed synthetic authorization header; both exist only for the task lifetime.
 
-OpenCode cannot receive standing authorization. Provider output and raw diagnostics are discarded; failures expose only an allowlisted category, optional integer HTTP status, and process-exit cause. Setup, gateway, TLS or provider failures fail closed rather than falling back or claiming success. See [ADR-004](decisions/ADR-004-opencode-pinned-egress.md) for the boundary and remaining host-verification gate.
+OpenCode cannot receive standing authorization. Provider output and raw diagnostics are discarded; failures expose only an allowlisted category, optional integer HTTP status, and process-exit cause. Setup, gateway, TLS or provider failures fail closed rather than falling back or claiming success. See [ADR-005](decisions/ADR-005-opencode-pinned-egress.md) for the boundary and remaining host-verification gate.
 
 The state directory and its files are owner-only. State updates are atomic. `audit.jsonl` is append-only and fsynced for each event; it records principal, authentication context, action, outcome and safe metadata, but not task instructions or worker output. Result retrieval is size-bounded.
 
@@ -94,25 +94,28 @@ This operation is acceptance evidence only. It does not merge, push, deploy, con
 
 A `github_actions` worker is another owner-configured adapter. It does not accept
 a task-supplied repository, workflow, ref, command, model, container or
-credential. The owner-only worker object binds:
+credential. The coordinator-side worker object contains only the bounded broker
+socket and its dedicated UID:
 
 ```json
 {
   "adapter": "github_actions",
   "agent": "codex",
   "model": "gpt-5-codex",
-  "github_repository": "Mr-M13/Orchestra",
-  "workflow": "orchestra-worker.yml",
-  "workflow_ref": "main",
-  "poll_seconds": 10,
-  "credential_file": "/etc/orchestra/secrets/github-actions.token"
+  "github_dispatch_socket": "/run/orchestra-github-dispatch/dispatch.sock",
+  "github_service_uid": 991,
+  "poll_seconds": 10
 }
 ```
 
-`agent` is `codex` or `deepseek`. The GitHub token is owner-only and should be a
-fine-grained token for the one repository with Actions read/write, Contents read
-and Metadata read. It is sent only in an HTTPS `Authorization` header. It is not
-written to the task spec, state, audit, logs or a command line.
+`agent` is `codex` or `deepseek`. A separate `orchestra-github` service owns the
+repository, workflow, ref, exact SHA, agent/model allowlist and fine-grained
+token. The coordinator and detached runner cannot read that config directory or
+token. The broker authenticates the coordinator UID on its Unix socket and
+offers only dispatch, exact-run lookup/status/cancel and task-bound artifact
+download. It has no generic HTTP or caller-selected target operation. The token
+is sent only in an HTTPS `Authorization` header and never enters a task spec,
+state, audit event, log, environment, command line or worktree.
 
 The coordinator creates the normal fresh worktree, then starts a detached runner
 that dispatches `.github/workflows/orchestra-worker.yml`. The workflow has
@@ -244,7 +247,7 @@ OPENCODE_CLI='/Users/hamed/Library/Application Support/ai.opencode.desktop/cli/2
 python3 -c 'from pathlib import Path; from omcp.controller import Config; Config.load(Path("/absolute/path/to/omcp-candidate.json")); print("candidate configuration valid")'
 ```
 
-The expected CLI version is `2.0.32`; help must show `run`, `--server`, `--format`, `--file`, `serve`, `--hostname`, and `--port`. Its configuration uses singular `provider` / `npm` / `options` fields, plus `permissions`, `snapshots`, and top-level `policies`. First run the unit suite and the noncredentialed host checks in [ADR-004](decisions/ADR-004-opencode-pinned-egress.md). Confirm both generated Seatbelt profiles compile on the target Mac and that a synthetic-key run reaches only the local gateway and produces a neutral provider failure. Inspect the generated policy before cleanup and confirm it contains the random local URL and synthetic key but no credential value or remote endpoint.
+The expected CLI version is `2.0.32`; help must show `run`, `--server`, `--format`, `--file`, `serve`, `--hostname`, and `--port`. Its configuration uses singular `provider` / `npm` / `options` fields, plus `permissions`, `snapshots`, and top-level `policies`. First run the unit suite and the noncredentialed host checks in [ADR-005](decisions/ADR-005-opencode-pinned-egress.md). Confirm both generated Seatbelt profiles compile on the target Mac and that a synthetic-key run reaches only the local gateway and produces a neutral provider failure. Inspect the generated policy before cleanup and confirm it contains the random local URL and synthetic key but no credential value or remote endpoint.
 
 Do not issue a credentialed provider request against a production worktree as a validation step. A real provider test requires a fresh local approval. In a disposable local clone with separate temporary state, start a separate candidate server, submit a harmless explicitly approved task to the OpenCode DeepSeek worker, and confirm that it either completes or reports an allowlisted failure category. Check that `runner.json`, `state.json`, `audit.jsonl`, process arguments, process environment and result contain no credential value; OpenCode stream output is reduced in memory and discarded, so no `worker.log` is created for it. Independently verify from the target host that OpenCode has no non-loopback socket access and the gateway uses verified TLS for `api.deepseek.com:443`. Only after those checks pass may the local operator manually merge the reviewed candidate worker object into a stopped service configuration and start a new service process. This change does not authorize a deployment, push, live tunnel modification, or production activation.
 

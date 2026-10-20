@@ -161,6 +161,7 @@ class Worker:
     poll_seconds: int = 10
     workflow_sha: str | None = None
     github_service_uid: int | None = None
+    github_dispatch_socket: str | None = None
 
 
 @dataclass(frozen=True)
@@ -278,6 +279,7 @@ class Config:
                 poll_seconds=value.get("poll_seconds", 10),
                 workflow_sha=value.get("workflow_sha"),
                 github_service_uid=value.get("github_service_uid"),
+                github_dispatch_socket=value.get("github_dispatch_socket"),
             )
         if not workers:
             raise ValueError("at least one worker is required")
@@ -299,6 +301,7 @@ class Config:
                     worker.provider, worker.model, worker.credential_file,
                     worker.github_repository, worker.workflow, worker.workflow_ref,
                     worker.agent, worker.workflow_sha, worker.github_service_uid,
+                    worker.github_dispatch_socket,
                 )):
                     raise ValueError("Codex workers may not configure a provider or credential file")
                 canonical = canonical_codex_executable(worker.command[0])
@@ -313,36 +316,29 @@ class Config:
                     raise ValueError(
                         "GitHub Actions worker agent must be codex or deepseek"
                     )
-                repository_name = worker.github_repository or repository
-                if not isinstance(repository_name, str) or not re.fullmatch(
-                    r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository_name,
-                ):
-                    raise ValueError("GitHub Actions repository must be owner/name")
-                workflow = worker.workflow or ACTIONS_WORKFLOW
-                if not isinstance(workflow, str) or not re.fullmatch(
-                    r"[A-Za-z0-9_.-]+\.ya?ml", workflow,
-                ):
-                    raise ValueError("GitHub Actions workflow must be a workflow file name")
-                workflow_ref = worker.workflow_ref or "main"
-                if (not isinstance(workflow_ref, str)
-                        or not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", workflow_ref)
-                        or ".." in workflow_ref.split("/")
-                        or workflow_ref.startswith("-")):
-                    raise ValueError("GitHub Actions workflow_ref is not a safe ref")
-                workflow_sha = worker.workflow_sha
-                if (not isinstance(workflow_sha, str)
-                        or not re.fullmatch(r"[0-9a-fA-F]{40}", workflow_sha)):
+                if any(value is not None for value in (
+                    worker.github_repository, worker.workflow, worker.workflow_ref,
+                    worker.workflow_sha, worker.credential_file,
+                )):
                     raise ValueError(
-                        "GitHub Actions workflow_sha must be a full commit SHA"
+                        "GitHub Actions target and credential belong only in the dispatch broker"
                     )
                 github_service_uid = worker.github_service_uid
                 if (not isinstance(github_service_uid, int)
                         or isinstance(github_service_uid, bool)
                         or github_service_uid < 0
-                        or github_service_uid != os.geteuid()):
+                        or github_service_uid == os.geteuid()):
                     raise ValueError(
-                        "GitHub Actions github_service_uid must match the service identity"
+                        "GitHub Actions github_service_uid must be a dedicated identity"
                     )
+                if not isinstance(worker.github_dispatch_socket, str):
+                    raise ValueError("GitHub Actions workers require github_dispatch_socket")
+                dispatch_socket = Path(worker.github_dispatch_socket).expanduser()
+                from omcp.github_dispatch_service import ensure_dispatch_socket
+                try:
+                    ensure_dispatch_socket(dispatch_socket, github_service_uid)
+                except PermissionError as exc:
+                    raise ValueError("GitHub dispatch broker socket is unavailable or unsafe") from exc
                 model = worker.model or (
                     "deepseek/deepseek-chat" if worker.agent == "deepseek" else "gpt-5-codex"
                 )
@@ -352,22 +348,10 @@ class Config:
                     raise ValueError("GitHub Actions worker model is invalid")
                 if worker.provider is not None:
                     raise ValueError("GitHub Actions workers may not configure a provider")
-                if not isinstance(worker.credential_file, str) or not worker.credential_file:
-                    raise ValueError("GitHub Actions workers require an owner-only token file")
-                credential_file = Path(worker.credential_file).expanduser().resolve(strict=True)
-                from omcp.github_actions import ensure_service_credential
-                try:
-                    ensure_service_credential(credential_file, github_service_uid)
-                except PermissionError as exc:
-                    raise ValueError(
-                        "credential_file and its directory must be private to the "
-                        "GitHub adapter service identity"
-                    ) from exc
                 workers[worker.name] = Worker(
                     worker.name, (), None, "github_actions", None, model,
-                    str(credential_file), None, repository_name, workflow,
-                    workflow_ref, worker.agent, worker.poll_seconds,
-                    workflow_sha.lower(), github_service_uid,
+                    None, None, None, None, None, worker.agent, worker.poll_seconds,
+                    None, github_service_uid, str(dispatch_socket),
                 )
                 continue
             if worker.codex_home is not None:
@@ -375,6 +359,7 @@ class Config:
             if any(value is not None for value in (
                 worker.github_repository, worker.workflow, worker.workflow_ref,
                 worker.agent, worker.workflow_sha, worker.github_service_uid,
+                worker.github_dispatch_socket,
             )):
                 raise ValueError("only GitHub Actions workers may configure remote fields")
             if worker.adapter == "deepseek":
@@ -1552,12 +1537,10 @@ class TaskController:
                 "branch": branch,
             }
             if worker.adapter == "github_actions":
+                spec.pop("credential_file", None)
                 spec.update({
-                    "github_repository": worker.github_repository,
-                    "workflow": worker.workflow,
-                    "workflow_ref": worker.workflow_ref,
-                    "workflow_sha": worker.workflow_sha,
                     "github_service_uid": worker.github_service_uid,
+                    "github_dispatch_socket": worker.github_dispatch_socket,
                     "agent": worker.agent,
                     "poll_seconds": worker.poll_seconds,
                     "artifact_name": "omcp-" + task_id,

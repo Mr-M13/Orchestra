@@ -9,6 +9,7 @@ import urllib.request
 import warnings
 import zipfile
 import zlib
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -22,6 +23,7 @@ from omcp.github_actions import (
     encode_instructions,
 )
 from omcp.github_runner import run as run_github_worker
+from omcp.github_dispatch_service import DispatchService, ServiceConfig
 from scripts.orchestra_actions_worker import (
     decode_payload,
     main as worker_main,
@@ -313,18 +315,89 @@ class RunnerHardeningTests(unittest.TestCase):
                 "completion_path": str(task / "completion.json"),
                 "result_path": str(task / "result.txt"),
                 "workspace": str(workspace),
+                "github_dispatch_socket": str(task / "dispatch.sock"),
+                "github_service_uid": os.geteuid() + 1,
                 "lease_id": "22222222-2222-2222-2222-222222222222",
                 "lease_path": str(task / "lease.json"),
             }))
             client = Mock()
             client.find_run.return_value = None
-            with patch("omcp.github_runner.client_from_spec", return_value=client):
+            with patch("omcp.github_runner.DispatchClient", return_value=client):
                 self.assertEqual(run_github_worker(spec_path), 130)
             client.dispatch.assert_not_called()
             self.assertEqual(
                 json.loads((task / "completion.json").read_text())["runner_error"],
                 "Cancelled",
             )
+
+
+class DispatchBrokerBoundaryTests(unittest.TestCase):
+    def service(self):
+        service = object.__new__(DispatchService)
+        service.config = SimpleNamespace(
+            allowed_models={"codex": frozenset({"gpt-5-codex"})},
+        )
+        service.github = Mock()
+        return service
+
+    def request(self, action, **values):
+        return {
+            "version": 1, "action": action,
+            "identity": {
+                "task_id": TASK_ID, "request_id": "request-1",
+                "dispatch_id": DISPATCH_ID, "dispatched_at": DISPATCHED_AT,
+            },
+            **values,
+        }
+
+    def test_dispatch_api_rejects_caller_selected_target_fields(self):
+        service = self.service()
+        request = self.request(
+            "dispatch", agent="codex", model="gpt-5-codex",
+            instructions="bounded task", github_repository="attacker/repo",
+        )
+        with self.assertRaisesRegex(ValueError, "fields are invalid"):
+            service.handle(request)
+        service.github.dispatch.assert_not_called()
+
+    def test_dispatch_api_enforces_model_allowlist(self):
+        service = self.service()
+        with self.assertRaisesRegex(ValueError, "not allowlisted"):
+            service.handle(self.request(
+                "dispatch", agent="codex", model="unreviewed",
+                instructions="bounded task",
+            ))
+        service.github.dispatch.assert_not_called()
+
+    def test_artifact_name_is_derived_from_task_identity(self):
+        service = self.service()
+        service.github.status.return_value = Mock()
+        with self.assertRaisesRegex(ValueError, "not bound to this task"):
+            service.handle(self.request("artifact", run_id=7, name="other"))
+        service.github.download_artifact.assert_not_called()
+
+    def test_broker_config_rejects_symlink_even_when_target_is_private(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            token = root / "token"
+            token.write_text("secret-token\n")
+            token.chmod(0o600)
+            real = root / "config.json"
+            real.write_text(json.dumps({
+                "github_repository": "owner/repo",
+                "workflow": "orchestra-worker.yml",
+                "workflow_ref": "main",
+                "workflow_sha": TASK_SHA,
+                "credential_file": str(token),
+                "service_uid": os.geteuid(),
+                "coordinator_uid": os.geteuid() + 1,
+                "allowed_models": {"codex": ["gpt-5-codex"]},
+            }))
+            real.chmod(0o600)
+            link = root / "linked-config.json"
+            link.symlink_to(real)
+            with self.assertRaisesRegex(PermissionError, "service-owner-only"):
+                ServiceConfig.load(link)
 
 
 class WorkerArtifactTests(unittest.TestCase):

@@ -124,12 +124,8 @@ class GitHubConfigTests(unittest.TestCase):
     def config(self, directory: Path, worker: dict, **extra):
         root = directory / "project"
         root.mkdir(exist_ok=True)
-        token = directory / "github.token"
-        token.write_text("never-print-this\n")
-        token.chmod(0o600)
-        worker.setdefault("credential_file", str(token))
-        worker.setdefault("workflow_sha", WORKFLOW_SHA)
-        worker.setdefault("github_service_uid", os.geteuid())
+        worker.setdefault("github_dispatch_socket", str(directory / "dispatch.sock"))
+        worker.setdefault("github_service_uid", os.geteuid() + 1)
         raw = {
             "repository": "owner/repo", "project_root": str(root),
             "state_dir": str(directory / "state"),
@@ -146,18 +142,19 @@ class GitHubConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = self.config(Path(directory), {
                 "agent": "deepseek", "model": "deepseek-chat",
-                "workflow": "orchestra-worker.yml", "workflow_ref": "main",
             })
-            config = Config.load(path)
+            with patch("omcp.github_dispatch_service.ensure_dispatch_socket"):
+                config = Config.load(path)
         worker = config.workers["actions"]
         self.assertEqual(worker.adapter, "github_actions")
         self.assertEqual(worker.agent, "deepseek")
         self.assertEqual(worker.model, "deepseek-chat")
         self.assertEqual(worker.command, ())
-        self.assertEqual(worker.github_repository, "owner/repo")
-        self.assertEqual(worker.workflow_ref, "main")
-        self.assertEqual(worker.workflow_sha, WORKFLOW_SHA)
-        self.assertEqual(worker.github_service_uid, os.geteuid())
+        self.assertIsNone(worker.github_repository)
+        self.assertIsNone(worker.workflow_ref)
+        self.assertIsNone(worker.workflow_sha)
+        self.assertEqual(worker.github_service_uid, os.geteuid() + 1)
+        self.assertTrue(worker.github_dispatch_socket.endswith("dispatch.sock"))
 
     def test_github_actions_worker_rejects_local_commands_and_unsafe_refs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -167,19 +164,19 @@ class GitHubConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "may not configure a local command"):
                 Config.load(path)
             path = self.config(Path(directory), {
-                "agent": "codex", "workflow_ref": "../main",
+                "agent": "codex", "workflow_ref": "main",
             })
-            with self.assertRaisesRegex(ValueError, "workflow_ref"):
+            with self.assertRaisesRegex(ValueError, "belong only in the dispatch broker"):
                 Config.load(path)
             path = self.config(Path(directory), {
                 "agent": "codex", "workflow_sha": "main",
             })
-            with self.assertRaisesRegex(ValueError, "workflow_sha"):
+            with self.assertRaisesRegex(ValueError, "belong only in the dispatch broker"):
                 Config.load(path)
             path = self.config(Path(directory), {
-                "agent": "codex", "github_service_uid": os.geteuid() + 1,
+                "agent": "codex", "github_service_uid": os.geteuid(),
             })
-            with self.assertRaisesRegex(ValueError, "github_service_uid"):
+            with self.assertRaisesRegex(ValueError, "dedicated identity"):
                 Config.load(path)
             path = self.config(Path(directory), {"agent": "shell"})
             with self.assertRaisesRegex(ValueError, "agent must be codex or deepseek"):
@@ -191,8 +188,9 @@ class GitHubConfigTests(unittest.TestCase):
                 "id": "routine", "consequence_class": "routine_development",
                 "repository_profiles": ["default"], "workers": ["actions"],
             }])
-            with self.assertRaisesRegex(ValueError, "only name Codex workers"):
-                Config.load(path)
+            with patch("omcp.github_dispatch_service.ensure_dispatch_socket"):
+                with self.assertRaisesRegex(ValueError, "only name Codex workers"):
+                    Config.load(path)
 
 
 class GitHubActionsClientTests(unittest.TestCase):
@@ -302,12 +300,11 @@ class GitHubActionsClientTests(unittest.TestCase):
             "dispatched_at": self.identity.dispatched_at,
         }))
         (task / "github-actions.json").write_text(json.dumps({
-            "github_repository": "owner/repo", "workflow": "orchestra-worker.yml",
-            "workflow_ref": "main", "workflow_sha": WORKFLOW_SHA,
-            "github_service_uid": os.geteuid(), "credential_file": str(self.token),
+            "github_service_uid": os.geteuid() + 1,
+            "github_dispatch_socket": str(Path(self.temp.name) / "dispatch.sock"),
         }))
         client = Mock()
-        with patch("omcp.github_actions.client_from_spec", return_value=client):
+        with patch("omcp.github_dispatch_service.DispatchClient", return_value=client):
             result = cancel_task_run(task, reason="operator withdrew it")
         self.assertEqual(result["run_id"], 41)
         client.cancel.assert_called_once_with(41, self.identity)
@@ -339,18 +336,13 @@ class GitHubControllerTests(unittest.TestCase):
             base = Path(directory)
             root = base / "project"
             root.mkdir()
-            token = base / "github.token"
-            token.write_text("never-log-this-token\n")
-            token.chmod(0o600)
             config = Config(
                 "owner/repo", root, base / "state", "origin/main",
                 {"actions": Worker(
                     "actions", (), adapter="github_actions",
-                    credential_file=str(token), github_repository="owner/repo",
-                    workflow="orchestra-worker.yml", workflow_ref="main",
                     agent="codex", model="gpt-5-codex",
-                    workflow_sha=WORKFLOW_SHA,
-                    github_service_uid=os.geteuid(),
+                    github_service_uid=os.geteuid() + 1,
+                    github_dispatch_socket="/run/orchestra-github-dispatch/dispatch.sock",
                 )},
                 Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
             )
@@ -375,13 +367,12 @@ class GitHubControllerTests(unittest.TestCase):
                     (base / "state/tasks" / submitted["task_id"] / "github-actions.json").read_text()
                 )
                 self.assertEqual(spec["agent"], "codex")
-                self.assertEqual(spec["github_repository"], "owner/repo")
-                self.assertEqual(spec["workflow"], "orchestra-worker.yml")
-                self.assertEqual(spec["workflow_ref"], "main")
-                self.assertEqual(spec["workflow_sha"], WORKFLOW_SHA)
-                self.assertEqual(spec["github_service_uid"], os.geteuid())
-                self.assertNotIn("never-log-this-token", json.dumps(spec))
-                self.assertNotIn("never-log-this-token", (base / "state/audit.jsonl").read_text())
+                self.assertEqual(spec["github_service_uid"], os.geteuid() + 1)
+                self.assertEqual(spec["github_dispatch_socket"],
+                                 "/run/orchestra-github-dispatch/dispatch.sock")
+                self.assertNotIn("credential", json.dumps(spec))
+                self.assertNotIn("github_repository", spec)
+                self.assertNotIn("workflow", spec)
                 self.assertEqual(approved["remote_artifact"], "omcp-" + submitted["task_id"])
             finally:
                 controller.close()
@@ -401,16 +392,14 @@ class GitHubRunnerTests(unittest.TestCase):
             subprocess.run(["git", "commit", "-qm", "base"], cwd=workspace, check=True)
             task = base / "task"
             task.mkdir()
-            token = base / "token"
-            token.write_text("not-printed\n")
-            token.chmod(0o600)
             prompt = task / "prompt.txt"
             prompt.write_text("task")
             spec = task / "github-actions.json"
             spec.write_text(json.dumps({
-                "github_repository": "owner/repo", "workflow": "orchestra-worker.yml",
-                "workflow_ref": "main", "agent": "codex", "model": "gpt-5-codex",
-                "credential_file": str(token), "task_id": "11111111-1111-1111-1111-111111111111",
+                "agent": "codex", "model": "gpt-5-codex",
+                "github_service_uid": os.geteuid() + 1,
+                "github_dispatch_socket": str(base / "dispatch.sock"),
+                "task_id": "11111111-1111-1111-1111-111111111111",
                 "request_id": "request-1", "prompt_path": str(prompt),
                 "log_path": str(task / "worker.log"), "completion_path": str(task / "completion.json"),
                 "result_path": str(task / "result.txt"), "workspace": str(workspace),
@@ -430,13 +419,12 @@ class GitHubRunnerTests(unittest.TestCase):
             fake.download_artifact.return_value = {
                 "result.txt": b"remote result\n", "patch.diff": patch_text,
             }
-            with patch("omcp.github_runner.client_from_spec", return_value=fake):
+            with patch("omcp.github_runner.DispatchClient", return_value=fake):
                 self.assertEqual(run_github_worker(spec), 0)
             self.assertEqual((workspace / "file.txt").read_text(), "after\n")
             self.assertEqual((task / "result.txt").read_text(), "remote result\n")
             completion = json.loads((task / "completion.json").read_text())
             self.assertEqual(completion["exit_code"], 0)
-            self.assertNotIn("not-printed", (task / "completion.json").read_text())
 
 
 class PersistentSocketTests(unittest.TestCase):
@@ -502,6 +490,20 @@ class DeploymentAssetTests(unittest.TestCase):
         self.assertIn("execstart=/usr/bin/python3 -m omcp.server", unit.lower())
         self.assertNotIn("docker", unit.lower())
         self.assertNotIn("systemctl", unit.lower())
+        broker = (
+            root / "deploy/pixelbox/systemd/orchestra-github-dispatch.service"
+        ).read_text()
+        self.assertIn("User=orchestra-github", broker)
+        self.assertIn("Group=orchestra-ipc", broker)
+        self.assertIn("github_dispatch_service", broker)
+        for worker_name in ("actions-codex", "actions-deepseek"):
+            worker = example["workers"][worker_name]
+            self.assertNotIn("credential_file", worker)
+            self.assertNotIn("github_repository", worker)
+            self.assertEqual(
+                worker["github_dispatch_socket"],
+                "/run/orchestra-github-dispatch/dispatch.sock",
+            )
         # Workflow implementation is Ina-owned and may be absent from a scoped
         # deployment-review worktree. Validate it when present without making
         # this suite create or alter it.

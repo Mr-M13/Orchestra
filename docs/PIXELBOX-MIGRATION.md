@@ -101,7 +101,9 @@ Keep the deployed source, checkout and state separate:
   omcp.json                             owner-only configuration
   omcp.env                              fixed-principal tunnel assertions
   tunnel.env                            tunnel runtime key
-  secrets/github-actions.token          fine-grained GitHub token
+  github-dispatch/                     0700, owned by orchestra-github only
+    config.json                        fixed target and allowlist policy
+    github-actions.token               fine-grained GitHub token
 ```
 
 `state_dir` must remain outside `project_root`. OMCP enforces this and refuses a
@@ -153,7 +155,7 @@ dispatch, the coordinator reads this environment through the GitHub API and
 fails closed unless it has at least one required reviewer, prevents self-review,
 and permits deployments only from protected branches.
 
-### Fine-grained GitHub token for the coordinator
+### Credential-isolated GitHub dispatch broker
 
 Create a fine-grained token scoped to the single configured repository with:
 
@@ -161,17 +163,28 @@ Create a fine-grained token scoped to the single configured repository with:
 - Contents: read (workflow metadata and checkout);
 - Metadata: read (mandatory).
 
-Store it at `/etc/orchestra/secrets/github-actions.token`, owned by `hamed`,
-mode `0600`. Never put it in `omcp.json`, a task, a command line, an audit
-record or Git. The coordinator sends it only in the HTTPS `Authorization`
-header. Its immediate `secrets` directory must be owned by the same service
-identity with mode `0700`; symlinked files or directories are rejected.
+The coordinator must not own or read this token. A `0600` file under the same
+UID is not isolation. After a separate owner approval, create a locked
+`orchestra-github` system identity and an `orchestra-ipc` group, add only the
+coordinator identity to that group, and install the broker directory as
+`0700 orchestra-github:orchestra-github`. Install both
+`github-dispatch/config.json` and `github-actions.token` there as `0600` owned
+by `orchestra-github`. Never put the token in `omcp.json`, a task, argv, an
+environment variable, a log, an audit record, a worktree or Git.
+
+The service binds `/run/orchestra-github-dispatch/dispatch.sock` as the
+dedicated UID with group-only coordinator access. It also checks Linux peer
+credentials. Its protocol allows only a fixed configured target, allowlisted
+agent/model pairs, exact run identity operations and the artifact name derived
+from the task UUID. There is no generic URL, header, repository, workflow, ref,
+SHA or credential request field. Bubblewrap/Seatbelt worker policies do not
+mount or allow this socket; do not grant the IPC group to a worker identity.
 
 ### Workflow ref
 
-`workflow_ref` must name a protected branch that contains the reviewed workflow;
-tags, raw commit IDs and other refs are rejected. Use `main` only after the
-workflow and worker script are merged. Until then, use a protected reviewed
+Broker `workflow_ref` must name a protected branch that contains the reviewed
+workflow; tags, raw commit IDs and other refs are rejected. Use `main` only after
+the workflow and worker script are merged. Until then, use a protected reviewed
 feature branch for staging and record that choice. The
 workflow file cannot be selected by a task; it comes from owner-only
 configuration. `workflow_sha` must be the full 40-character commit currently at
@@ -185,14 +198,13 @@ secrets. The checkout is pinned to that SHA. Run adoption checks both ref and
 SHA, the workflow-dispatch event, and the persisted dispatch identity and time,
 so a stale same-name run is rejected.
 
-`github_service_uid` must be the numeric UID of the Unix identity that runs the
-coordinator and detached GitHub adapter. For the reviewed unit this is the
-dedicated `hamed` service identity; obtain the value locally with `id -u hamed`
-and record it in both GitHub worker entries. Configuration loading fails unless
-the running effective UID, configured UID, token owner, and private token
-directory owner all match. The example deliberately contains invalid
-placeholders: replace them during owner-only configuration review. This change
-does not create an account or credential.
+`github_service_uid` in `omcp.json` must be the numeric UID of
+`orchestra-github`, and must differ from the coordinator effective UID. The
+broker config separately binds both `service_uid` and `coordinator_uid`.
+Configuration loading fails closed unless the live socket is owned by the
+dedicated UID and is not world-accessible. The example deliberately contains
+invalid placeholders. This code change does not create an account, group,
+credential, config, socket, service activation or cutover.
 
 ## 5. Configuration
 
@@ -203,34 +215,53 @@ production settings:
   policy;
 - `max_parallel_tasks: 2` initially;
 - `sandbox_backend: "bubblewrap"` on PixelBox;
-- each `github_actions` worker points at one reviewed workflow and one agent;
-- each `github_actions` worker binds `workflow_ref`, its exact `workflow_sha`,
-  and `github_service_uid` to the reviewed service identity;
+- each `github_actions` worker points only at the reviewed broker socket and
+  binds its dedicated `github_service_uid`; target/SHA/token policy stays in
+  the broker's private config;
 - no standing authorization for GitHub Actions workers;
 - `repository_profiles` binds each allowlisted checkout and base ref.
 
 Install owner-only files:
 
 ```sh
-sudo install -d -m 0700 -o hamed -g hamed /etc/orchestra /etc/orchestra/secrets
+sudo install -d -m 0700 -o hamed -g hamed /etc/orchestra
 sudo install -m 0600 -o hamed -g hamed omcp.example.json /etc/orchestra/omcp.json
 sudo install -m 0600 -o hamed -g hamed omcp.env.example /etc/orchestra/omcp.env
 sudo install -m 0600 -o hamed -g hamed tunnel.env.example /etc/orchestra/tunnel.env
 ```
 
+Do not run the following migration without explicit future approval. The exact
+commands are intentionally illustrative: the owner must review local UID/GID
+allocation and existing account/group state first.
+
+```sh
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin orchestra-github
+sudo groupadd --system orchestra-ipc
+sudo usermod -a -G orchestra-ipc hamed
+sudo usermod -a -G orchestra-ipc orchestra-github
+sudo install -d -m 0700 -o orchestra-github -g orchestra-github /etc/orchestra/github-dispatch
+sudo install -m 0600 -o orchestra-github -g orchestra-github github-dispatch.example.json /etc/orchestra/github-dispatch/config.json
+# Enter the token locally without argv, shell history, chat, issue, PR, or log exposure.
+sudo systemctl enable --now orchestra-github-dispatch.service
+```
+
 Edit the files locally. Do not paste secret values into a chat, issue, pull
-request or log.
+request or log. Verify the broker first; only then validate/start the
+coordinator. Account/group creation, unit installation, activation and cutover
+remain separate approval gates.
 
 Validate without starting the service:
 
 ```sh
 cd /opt/orchestra/current
-python3 -c 'from pathlib import Path; from omcp.controller import Config; Config.load(Path("/etc/orchestra/omcp.json")); print("configuration valid")'
+sudo -u orchestra-github python3 -c 'from pathlib import Path; from omcp.github_dispatch_service import ServiceConfig; ServiceConfig.load(Path("/etc/orchestra/github-dispatch/config.json")); print("broker configuration valid")'
+python3 -c 'from pathlib import Path; from omcp.controller import Config; Config.load(Path("/etc/orchestra/omcp.json")); print("coordinator configuration and live broker socket valid")'
 ```
 
 `Config.load` checks owner-only mode, repository profile IDs, worker allowlists,
-credential-file permissions, workflow names and refs, bound approvals and
-concurrency limits. It does not print secret values.
+broker socket ownership, bound approvals and concurrency limits. Broker config
+validation checks dedicated UID separation, private credential ownership,
+target/ref/SHA syntax and model allowlists. Neither prints secret values.
 
 ## 6. Authenticated MCP tunnel
 
@@ -324,16 +355,18 @@ ORCHESTRA_DEPLOY_APPROVED=1 ORCHESTRA_CUTOVER_APPROVED=1 \
 ```
 
 Activation is refused unless the host is Linux ARM64 and the reviewed PixelBox
-paths and service user are in use. Configuration validation completes before
-any systemd state changes. The installer then installs units that point at
-`/opt/orchestra/current`, replaces that symlink with one atomic rename, and
-restarts only the coordinator and health timer. A failed activation restores
-the prior symlink and unit files. It does not touch Nextcloud, Docker, Tailscale,
-the Mac coordinator, or the tunnel. Enable the tunnel separately only after its
-profile is verified.
+paths and service user are in use. Static broker configuration and ownership
+validation completes before any systemd state changes. The installer then
+installs units that point at `/opt/orchestra/current`, replaces that symlink
+with one atomic rename, starts the broker, validates the coordinator against the
+live owner-checked socket, and only then restarts the coordinator and health
+timer. A failed activation restores the prior symlink and unit files and
+restarts the prior broker/coordinator. It does not touch Nextcloud, Docker,
+Tailscale, the Mac coordinator, or the tunnel. Enable the tunnel separately
+only after its profile is verified.
 
 `--apply` stages and activates in one invocation for compatibility. If it
-creates templates or finds the GitHub token absent, it exits with status `3`
+creates templates or finds the dedicated broker config/token absent, it exits with status `3`
 without changing systemd or the active symlink.
 
 Common commands:
@@ -534,8 +567,10 @@ Routing rollback remains a separate, explicitly approved operation:
 
 - Never commit credentials. Never print a token, API key or capability value in
   a command, log, issue or task.
-- The GitHub token is owner-only and repository-scoped. Rotate it after suspected
-  exposure and update `/etc/orchestra/secrets/github-actions.token`.
+- The GitHub token is repository-scoped and readable only by the dedicated
+  `orchestra-github` UID. Rotate it after suspected exposure and update
+  `/etc/orchestra/github-dispatch/github-actions.token` without exposing it to
+  the coordinator.
 - The workflow receives provider keys through the `orchestra-workers`
   environment. Treat that environment's membership and reviewer rules as part of
   the trust boundary.

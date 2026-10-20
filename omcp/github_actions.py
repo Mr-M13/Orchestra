@@ -588,18 +588,6 @@ def load_spec(task_dir: Path) -> dict[str, Any]:
     return value
 
 
-def client_from_spec(spec: dict[str, Any]) -> GitHubActionsClient:
-    service_uid = spec.get("github_service_uid")
-    if not isinstance(service_uid, int) or isinstance(service_uid, bool):
-        raise ValueError("github_service_uid must bind the GitHub adapter identity")
-    return GitHubActionsClient(
-        str(spec["github_repository"]), str(spec["workflow"]),
-        str(spec["workflow_ref"]), str(spec["workflow_sha"]),
-        Path(str(spec["credential_file"])), service_uid=service_uid,
-        api_url=str(spec.get("github_api_url") or DEFAULT_API_URL),
-    )
-
-
 def cancel_task_run(task_dir: Path, reason: str = "task cancelled") -> dict[str, Any] | None:
     """Best-effort cancellation using persisted run identity only."""
     task_dir = Path(task_dir)
@@ -609,7 +597,10 @@ def cancel_task_run(task_dir: Path, reason: str = "task cancelled") -> dict[str,
     except (FileNotFoundError, ValueError, KeyError):
         return None
     run_id = state.get("run_id") if isinstance(state, dict) else None
-    client = client_from_spec(spec)
+    from omcp.github_dispatch_service import DispatchClient
+    client = DispatchClient(
+        Path(str(spec["github_dispatch_socket"])), int(spec["github_service_uid"]),
+    )
     if not isinstance(state, dict):
         return None
     try:
