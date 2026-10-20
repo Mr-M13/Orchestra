@@ -125,6 +125,13 @@ class SandboxPolicy:
     environment: dict[str, str] = field(default_factory=dict)
 
     def normalized(self) -> "SandboxPolicy":
+        environment = dict(self.environment)
+        if not all(
+            isinstance(key, str) and key and "=" not in key and "\x00" not in key
+            and isinstance(value, str) and "\x00" not in value
+            for key, value in environment.items()
+        ):
+            raise ValueError("sandbox environment must contain valid strings")
         return SandboxPolicy(
             read_paths=tuple(Path(value).resolve() for value in self.read_paths),
             read_files=tuple(Path(value).resolve() for value in self.read_files),
@@ -132,7 +139,7 @@ class SandboxPolicy:
             network_hosts=tuple(self.network_hosts),
             backend=self.backend,
             workdir=Path(self.workdir).resolve() if self.workdir else None,
-            environment=dict(self.environment),
+            environment=environment,
         )
 
 
@@ -158,6 +165,11 @@ def _bubblewrap_command(policy: SandboxPolicy, command: Sequence[str]) -> list[s
         bwrap,
         "--die-with-parent",
         "--new-session",
+        # Isolate every namespace first. A provider adapter may deliberately
+        # re-share only the network namespace below.
+        "--unshare-all",
+        # Do not leak the coordinator/service environment into a worker.
+        "--clearenv",
         # A private, disposable view of the host.  Only explicit paths below are
         # visible to the worker.
         "--tmpfs", "/",
@@ -180,6 +192,12 @@ def _bubblewrap_command(policy: SandboxPolicy, command: Sequence[str]) -> list[s
         "--ro-bind-try", "/etc/passwd", "/etc/passwd",
         "--ro-bind-try", "/etc/group", "/etc/group",
     ]
+    child_environment = {
+        "PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/tmp", "TMPDIR": "/tmp",
+        **policy.environment,
+    }
+    for name, value in sorted(child_environment.items()):
+        args.extend(["--setenv", name, value])
     write_paths = set(policy.write_paths)
     for path in policy.read_paths:
         if not path.exists():

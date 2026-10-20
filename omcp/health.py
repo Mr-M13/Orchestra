@@ -35,7 +35,9 @@ def _iso_age_seconds(value: object) -> float | None:
         return None
     if then.tzinfo is None:
         then = then.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - then).total_seconds()
+    age = (datetime.now(timezone.utc) - then).total_seconds()
+    # A future heartbeat must not prove liveness. Permit only small clock skew.
+    return age if age >= -5 else None
 
 
 def _tunnel_check(url: str | None) -> dict[str, Any]:
@@ -121,7 +123,10 @@ def collect_health(config_path: Path, tunnel_url: str | None = None) -> dict[str
         pid = heartbeat.get("pid")
         alive = isinstance(pid, int) and _pid_alive(pid)
         checks["coordinator"] = {
-            "ok": bool(alive and age is not None and age <= max(30, 4 * config.heartbeat_seconds)),
+            "ok": bool(
+                alive and age is not None
+                and -5 <= age <= max(30, 4 * config.heartbeat_seconds)
+            ),
             "pid": pid, "age_seconds": round(age, 1) if age is not None else None,
             "active_tasks": heartbeat.get("active_tasks"),
             "execution_limit": heartbeat.get("execution_limit"),

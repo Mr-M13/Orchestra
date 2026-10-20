@@ -104,7 +104,18 @@ def run(spec_path: Path) -> int:
         # A crash after dispatch but before recording the run ID is recovered by
         # adopting the deterministic run name rather than dispatching twice.
         run_state = client.find_run(task_id)
+        if _cancelled(task_dir):
+            # A queued runner can start after the coordinator has already
+            # recorded cancellation.  Adopt and cancel an existing run, but do
+            # not create a new remote side effect for a cancelled task.
+            exit_code, error_type = 130, "Cancelled"
+            _cancel_quietly(client, run_state, state_path)
+            return exit_code
         if run_state is None:
+            # Close the cancellation race as near as possible to dispatch.
+            if _cancelled(task_dir):
+                exit_code, error_type = 130, "Cancelled"
+                return exit_code
             client.dispatch(
                 task_id, str(spec.get("request_id", task_id)),
                 str(spec["agent"]), str(spec["model"]),
@@ -141,7 +152,7 @@ def run(spec_path: Path) -> int:
                         # dispatch a replacement.
                         if attempt == 11:
                             raise
-                        time.sleep(5)
+                        client.sleep(5)
                 assert files is not None
                 _write_remote_artifact(task_dir, files)
                 patch = files.get("patch.diff", b"")

@@ -61,4 +61,4 @@ Orchestra should increase human capability rather than obscure the system behind
 **Repository:** Private  
 **Initialised:** 27 September 2026
 
-**PixelBox migration:** implementation and Linux ARM64 staging verification complete; production cutover pending explicit owner approval. See [docs/PIXELBOX-MIGRATION.md](docs/PIXELBOX-MIGRATION.md).
+**PixelBox migration:** implementation and Linux ARM64 staging verification complete; live deployment verification and production cutover remain unproven and require explicit owner approval. See [docs/PIXELBOX-MIGRATION.md](docs/PIXELBOX-MIGRATION.md).

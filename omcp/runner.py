@@ -176,6 +176,7 @@ def opencode_command(executable: str, workspace: Path, prompt_path: Path, creden
         write_paths=(workspace, runtime_dir),
         network_hosts=(endpoint_host,),
         workdir=workspace,
+        environment=opencode_environment(runtime_dir),
     )
     return sandbox_command(policy, [
         executable, "run", "--standalone", "--format", "json",

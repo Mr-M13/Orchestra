@@ -11,15 +11,31 @@ import argparse
 import os
 import selectors
 import socket
+import stat
 import sys
 import time
 from pathlib import Path
+
+
+def _validate_socket_path(path: Path) -> None:
+    """Fail closed if the coordinator endpoint is not this user's socket."""
+    metadata = path.lstat()
+    if not stat.S_ISSOCK(metadata.st_mode):
+        raise ConnectionError("OMCP coordinator endpoint is not a Unix socket")
+    if metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+        raise PermissionError("OMCP coordinator socket must be owner-only")
 
 
 def connect(path: Path, timeout: float = 30.0) -> socket.socket:
     deadline = time.monotonic() + timeout
     last_error: OSError | None = None
     while time.monotonic() < deadline:
+        try:
+            _validate_socket_path(path)
+        except FileNotFoundError as exc:
+            last_error = exc
+            time.sleep(0.25)
+            continue
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             connection.connect(str(path))

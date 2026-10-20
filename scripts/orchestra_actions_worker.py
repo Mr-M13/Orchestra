@@ -14,6 +14,7 @@ own isolated worktree.
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import os
 import re
@@ -27,6 +28,7 @@ from typing import NoReturn
 MAX_RESULT_BYTES = 65_536
 MAX_PATCH_BYTES = 1_048_576
 MAX_PAYLOAD_CHARS = 60_000
+MAX_WORKER_FILE_BYTES = 16 * 1024 * 1024
 
 
 def fail(message: str, code: int = 1) -> NoReturn:
@@ -38,8 +40,19 @@ def decode_payload(value: str) -> str:
     if not isinstance(value, str) or not value or len(value) > MAX_PAYLOAD_CHARS:
         fail("invalid payload")
     try:
-        raw = zlib.decompress(base64.urlsafe_b64decode(value.encode("ascii")))
-    except Exception:
+        compressed = base64.b64decode(
+            value.encode("ascii"), altchars=b"-_", validate=True,
+        )
+        decompressor = zlib.decompressobj()
+        raw = decompressor.decompress(compressed, 65_537)
+        if len(raw) > 65_536 or decompressor.unconsumed_tail:
+            fail("payload size is outside the configured bound")
+        raw += decompressor.flush(65_537 - len(raw))
+        if len(raw) > 65_536:
+            fail("payload size is outside the configured bound")
+        if not decompressor.eof or decompressor.unused_data:
+            fail("payload is not valid encoded task input")
+    except (UnicodeEncodeError, binascii.Error, zlib.error):
         fail("payload is not valid encoded task input")
     try:
         text = raw.decode("utf-8")
@@ -59,7 +72,9 @@ def write_text(path: Path, text: str) -> None:
     os.chmod(path, 0o600)
 
 
-def deepseek_opencode_runtime(runtime: Path, model: str) -> tuple[Path, Path]:
+def deepseek_opencode_runtime(
+    runtime: Path, model: str,
+) -> tuple[Path, tuple[Path, Path, Path]]:
     """Create a private OpenCode config for the DeepSeek coding agent.
 
     The provider key and session directories live outside the artifact output
@@ -113,8 +128,26 @@ def deepseek_opencode_runtime(runtime: Path, model: str) -> tuple[Path, Path]:
     return home, (config_home, data_home, state_home)
 
 
-def git_patch(workspace: Path, output: Path) -> None:
-    environment = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+def redact_file(path: Path, secrets: tuple[str, ...], maximum: int) -> None:
+    """Bound an artifact text file and remove exact credential values."""
+    if not path.exists():
+        return
+    overlap = max((len(secret.encode("utf-8")) for secret in secrets), default=0)
+    with path.open("rb") as source:
+        data = source.read(maximum + overlap + 1)
+    for secret in secrets:
+        if secret:
+            data = data.replace(secret.encode("utf-8"), b"[REDACTED]")
+    write_text(path, data[:maximum].decode("utf-8", "replace"))
+
+
+def git_patch(workspace: Path, output: Path, secrets: tuple[str, ...] = ()) -> None:
+    # Git filters and helpers must never inherit either provider credential.
+    environment = {
+        key: os.environ[key] for key in ("PATH", "HOME", "LANG", "LC_ALL")
+        if key in os.environ
+    }
+    environment["GIT_TERMINAL_PROMPT"] = "0"
     added = subprocess.run(
         ["git", "-C", str(workspace), "add", "-A"], capture_output=True,
         text=True, check=False, env=environment,
@@ -129,6 +162,8 @@ def git_patch(workspace: Path, output: Path) -> None:
         fail("could not collect worker changes")
     if len(diff.stdout) > MAX_PATCH_BYTES:
         fail("worker patch exceeded the configured bound")
+    if any(secret and secret.encode("utf-8") in diff.stdout for secret in secrets):
+        fail("worker patch contained a credential value")
     write_text(output / "patch.diff", diff.stdout.decode("utf-8", "replace"))
 
 
@@ -140,7 +175,10 @@ def main() -> int:
     payload = os.environ.get("ORCHESTRA_PAYLOAD", "")
     output_raw = os.environ.get("ORCHESTRA_OUTPUT_DIR", "")
     runtime_raw = os.environ.get("ORCHESTRA_RUNTIME_DIR", "")
-    if not re.fullmatch(r"[0-9a-f-]{36}", task_id):
+    if not re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        task_id,
+    ):
         fail("invalid task id")
     if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id):
         fail("invalid request id")
@@ -172,7 +210,12 @@ def main() -> int:
     }
     environment["GIT_TERMINAL_PROMPT"] = "0"
     command = [
-        "codex", "--ask-for-approval", "never", "exec",
+        "codex", "--ask-for-approval", "never", "exec", "--ephemeral",
+        "--ignore-user-config",
+        "--config", "shell_environment_policy.inherit=core",
+        "--config", "shell_environment_policy.ignore_default_excludes=false",
+        "--config", "sandbox_workspace_write.network_access=false",
+        "--model", model,
         "--sandbox", "workspace-write", "--cd", str(workspace),
         "--output-last-message", str(output / "result.txt"), "-",
     ]
@@ -195,22 +238,37 @@ def main() -> int:
             "Read the attached task instructions and work only in the current workspace.",
         ]
     else:
-        environment["OPENAI_API_KEY"] = os.environ.get("OPENAI_API_KEY", "")
+        openai_key = os.environ.get("OPENAI_API_KEY", "")
+        if not openai_key or len(openai_key) > 8192 or any(
+                character.isspace() for character in openai_key):
+            fail("OPENAI_API_KEY is unavailable")
+        environment["OPENAI_API_KEY"] = openai_key
     try:
+        def limit_worker_file_size() -> None:
+            import resource
+
+            resource.setrlimit(
+                resource.RLIMIT_FSIZE,
+                (MAX_WORKER_FILE_BYTES, MAX_WORKER_FILE_BYTES),
+            )
+
         with prompt.open("rb") as input_file, (output / "worker.log").open("wb") as log:
             completed = subprocess.run(
                 command, cwd=workspace, env=environment, stdin=input_file,
                 stdout=log, stderr=subprocess.STDOUT, check=False, timeout=10_800,
+                preexec_fn=limit_worker_file_size,
             )
     except subprocess.TimeoutExpired:
         write_text(output / "worker.log", "Worker exceeded the execution deadline.\n")
         completed = subprocess.CompletedProcess(command, 124)
-    git_patch(workspace, output)
+    credential_values = tuple(filter(None, (
+        os.environ.get("OPENAI_API_KEY", "") if agent == "codex" else "",
+        os.environ.get("DEEPSEEK_API_KEY", "") if agent == "deepseek" else "",
+    )))
+    redact_file(output / "worker.log", credential_values, MAX_RESULT_BYTES)
     result_path = output / "result.txt"
     if result_path.exists():
-        raw = result_path.read_bytes()
-        if len(raw) > MAX_RESULT_BYTES:
-            write_text(result_path, raw[:MAX_RESULT_BYTES].decode("utf-8", "replace"))
+        redact_file(result_path, credential_values, MAX_RESULT_BYTES)
     else:
         write_text(result_path, (
             "The worker completed without a retained textual result; inspect the "
@@ -218,6 +276,7 @@ def main() -> int:
             if completed.returncode == 0
             else f"The worker failed with exit {completed.returncode}.\n"
         ))
+    git_patch(workspace, output, credential_values)
     write_text(output / "summary.json", json.dumps({
         "task_id": task_id, "request_id": request_id, "agent": agent,
         "model": model, "exit_code": completed.returncode,

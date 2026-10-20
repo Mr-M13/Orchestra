@@ -14,6 +14,7 @@ audit event or error message.
 from __future__ import annotations
 
 import base64
+import binascii
 import io
 import json
 import os
@@ -34,12 +35,34 @@ from omcp.platform import ensure_owner_only
 DEFAULT_API_URL = "https://api.github.com"
 MAX_HTTP_BYTES = 16 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
+MAX_INSTRUCTION_BYTES = 65_536
 ALLOWED_ARTIFACT_FILES = {"result.txt", "patch.diff", "worker.log", "summary.json"}
 RUN_NAME_PREFIX = "Orchestra "
 
 
 class GitHubActionsError(RuntimeError):
     """A sanitized GitHub Actions failure."""
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow HTTPS redirects without forwarding credentials cross-origin."""
+
+    def redirect_request(self, request: urllib.request.Request, *args: Any,
+                         **kwargs: Any) -> urllib.request.Request | None:
+        redirected = super().redirect_request(request, *args, **kwargs)
+        if redirected is None:
+            return None
+        old = urllib.parse.urlsplit(request.full_url)
+        new = urllib.parse.urlsplit(redirected.full_url)
+        if new.scheme != "https":
+            raise urllib.error.HTTPError(
+                redirected.full_url, 403, "unsafe redirect", {}, None,
+            )
+        old_origin = (old.scheme.lower(), old.hostname, old.port)
+        new_origin = (new.scheme.lower(), new.hostname, new.port)
+        if old_origin != new_origin:
+            redirected.remove_header("Authorization")
+        return redirected
 
 
 def utc_now() -> str:
@@ -72,8 +95,11 @@ def encode_instructions(instructions: str, maximum: int = 48_000) -> str:
         raise ValueError("instructions must be non-empty")
     import zlib
 
+    raw = instructions.encode("utf-8")
+    if len(raw) > MAX_INSTRUCTION_BYTES:
+        raise ValueError("task instructions are too large for a GitHub Actions dispatch")
     encoded = base64.urlsafe_b64encode(
-        zlib.compress(instructions.encode("utf-8"), 9)
+        zlib.compress(raw, 9)
     ).decode("ascii")
     if len(encoded) > maximum:
         raise ValueError(
@@ -88,8 +114,19 @@ def decode_instructions(encoded: str) -> str:
     if not isinstance(encoded, str) or not encoded:
         raise ValueError("encoded instructions are empty")
     try:
-        raw = zlib.decompress(base64.urlsafe_b64decode(encoded.encode("ascii")))
-    except (ValueError, zlib.error) as exc:
+        compressed = base64.b64decode(
+            encoded.encode("ascii"), altchars=b"-_", validate=True,
+        )
+        decompressor = zlib.decompressobj()
+        raw = decompressor.decompress(compressed, MAX_INSTRUCTION_BYTES + 1)
+        if len(raw) > MAX_INSTRUCTION_BYTES or decompressor.unconsumed_tail:
+            raise ValueError("encoded instructions exceed the configured bound")
+        raw += decompressor.flush(MAX_INSTRUCTION_BYTES + 1 - len(raw))
+        if len(raw) > MAX_INSTRUCTION_BYTES:
+            raise ValueError("encoded instructions exceed the configured bound")
+        if not decompressor.eof or decompressor.unused_data:
+            raise ValueError("encoded instructions are invalid")
+    except (UnicodeEncodeError, binascii.Error, zlib.error) as exc:
         raise ValueError("encoded instructions are invalid") from exc
     return raw.decode("utf-8")
 
@@ -140,11 +177,16 @@ class GitHubActionsClient:
         self.ref = ref
         self.api_url = api_url.rstrip("/")
         parsed = urllib.parse.urlparse(self.api_url)
-        if parsed.scheme != "https" and parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        loopback = parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+        if (parsed.scheme not in ({"http", "https"} if loopback else {"https"})
+                or not parsed.hostname or parsed.username or parsed.password
+                or parsed.query or parsed.fragment):
             raise ValueError("GitHub API URL must use HTTPS")
         self.credential_file = Path(credential_file)
         ensure_owner_only(self.credential_file)
-        self._opener = opener or urllib.request.urlopen
+        self._opener = opener or urllib.request.build_opener(
+            _SafeRedirectHandler(),
+        ).open
         self.sleep = sleep
         self._token: str | None = None
 
@@ -205,7 +247,10 @@ class GitHubActionsClient:
     def dispatch(self, task_id: str, request_id: str, agent: str, model: str,
                  instructions: str) -> str:
         """Dispatch one workflow run and return the encoded dispatch marker."""
-        if not isinstance(task_id, str) or not re.fullmatch(r"[0-9a-f-]{36}", task_id):
+        if not isinstance(task_id, str) or not re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            task_id,
+        ):
             raise ValueError("invalid task_id for GitHub dispatch")
         if not isinstance(request_id, str) or not re.fullmatch(
             r"[A-Za-z0-9_.:-]{1,128}", request_id,
@@ -291,7 +336,8 @@ class GitHubActionsClient:
     def download_artifact(self, run_id: int, name: str) -> dict[str, bytes]:
         """Download and validate one named artifact into memory."""
         artifact = next(
-            (item for item in self.list_artifacts(run_id) if item.get("name") == name),
+            (item for item in self.list_artifacts(run_id)
+             if item.get("name") == name and item.get("expired") is not True),
             None,
         )
         if artifact is None:
@@ -310,15 +356,26 @@ class GitHubActionsClient:
             raise GitHubActionsError("GitHub Actions artifact is not a valid zip") from exc
         files: dict[str, bytes] = {}
         with archive:
+            total_size = 0
             for info in archive.infolist():
                 if info.is_dir():
                     continue
                 name_only = Path(info.filename).name
                 if name_only != info.filename or name_only not in ALLOWED_ARTIFACT_FILES:
                     raise GitHubActionsError("GitHub Actions artifact contains an unsafe path")
+                if name_only in files:
+                    raise GitHubActionsError("GitHub Actions artifact contains duplicate files")
+                if info.flag_bits & 0x1:
+                    raise GitHubActionsError("GitHub Actions artifact contains encrypted files")
                 if info.file_size > MAX_ARTIFACT_BYTES:
                     raise GitHubActionsError("GitHub Actions artifact file is too large")
-                files[name_only] = archive.read(info)
+                total_size += info.file_size
+                if total_size > MAX_ARTIFACT_BYTES:
+                    raise GitHubActionsError("GitHub Actions artifact is too large")
+                data = archive.read(info)
+                if len(data) != info.file_size:
+                    raise GitHubActionsError("GitHub Actions artifact file size is invalid")
+                files[name_only] = data
         if "result.txt" not in files and "patch.diff" not in files:
             raise GitHubActionsError("GitHub Actions artifact has no result")
         return files
