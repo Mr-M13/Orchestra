@@ -161,8 +161,15 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
 
     def test_runbook_preserves_staging_evidence_without_claiming_live_cutover(self):
         runbook = (ROOT / "docs" / "PIXELBOX-MIGRATION.md").read_text()
-        self.assertIn("Linux ARM64 staging verification complete", runbook)
-        self.assertIn("live deployment verification and production cutover remain unproven", runbook)
+        readme = (ROOT / "README.md").read_text()
+        self.assertIn(
+            "Linux ARM64 staging, live deployment verification, and production cutover have\n"
+            "not been performed",
+            runbook,
+        )
+        self.assertIn("portable release-staging logic are locally tested", readme)
+        for document in (runbook, readme):
+            self.assertNotIn("Linux ARM64 staging verification complete", document)
         self.assertIn("verify.sh --live", runbook)
 
 

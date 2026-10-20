@@ -32,6 +32,16 @@ class FakeProcess:
     pid = os.getpid()
 
 
+def codex_fixture(directory: Path) -> dict[str, str]:
+    """Return a deterministic PATH containing the executable Config validates."""
+    bin_dir = directory / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    executable = bin_dir / "codex"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    return {**os.environ, "PATH": str(bin_dir)}
+
+
 class ControllerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -1299,7 +1309,8 @@ class RunnerTests(unittest.TestCase):
                 "result_path": str(root / "result"), "completion_path": str(completion),
                 "codex_home": None,
             }))
-            with patch("omcp.runner.subprocess.run", return_value=Mock(returncode=0)) as execute:
+            with patch.dict(os.environ, codex_fixture(root), clear=True), \
+                    patch("omcp.runner.subprocess.run", return_value=Mock(returncode=0)) as execute:
                 self.assertEqual(run_worker(spec), 0)
             self.assertEqual(json.loads(completion.read_text())["exit_code"], 0)
             command = execute.call_args.args[0]
@@ -1393,7 +1404,8 @@ class RunnerTests(unittest.TestCase):
                     "git_metadata": "read_only",
                 },
             }))
-            with patch("omcp.runner.subprocess.run", return_value=Mock(returncode=0)) as execute:
+            with patch.dict(os.environ, codex_fixture(root), clear=True), \
+                    patch("omcp.runner.subprocess.run", return_value=Mock(returncode=0)) as execute:
                 self.assertEqual(run_worker(spec), 0)
             command = execute.call_args.args[0]
             self.assertNotIn("--sandbox", command)
@@ -1833,7 +1845,7 @@ class StdioIntegrationTests(unittest.TestCase):
                  "params": {"name": "bridge_status", "arguments": {}}},
             ]) + "\n"
             environment = {
-                **os.environ,
+                **codex_fixture(Path(directory)),
                 "OMCP_TUNNEL_AUTHENTICATED": "1",
                 "OMCP_AUTHENTICATED_CALLER": "chatgpt:test",
             }

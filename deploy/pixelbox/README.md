@@ -29,3 +29,6 @@ produce that evidence.
 
 Read [docs/PIXELBOX-MIGRATION.md](../../docs/PIXELBOX-MIGRATION.md) before use.
 Never commit a filled environment file, GitHub token or provider key.
+Replace the invalid `workflow_sha` and `github_service_uid` placeholders in the
+example configuration during local owner review; the installer does not create
+an identity or credential.

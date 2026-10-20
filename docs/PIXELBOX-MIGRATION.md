@@ -156,7 +156,8 @@ Create a fine-grained token scoped to the single configured repository with:
 Store it at `/etc/orchestra/secrets/github-actions.token`, owned by `hamed`,
 mode `0600`. Never put it in `omcp.json`, a task, a command line, an audit
 record or Git. The coordinator sends it only in the HTTPS `Authorization`
-header.
+header. Its immediate `secrets` directory must be owned by the same service
+identity with mode `0700`; symlinked files or directories are rejected.
 
 ### Workflow ref
 
@@ -164,7 +165,18 @@ header.
 Use `main` only after the workflow and worker script are merged. Until then,
 use the reviewed feature branch for staging and record that choice. The
 workflow file cannot be selected by a task; it comes from owner-only
-configuration.
+configuration. `workflow_sha` must be the full 40-character commit currently at
+that ref. Run adoption checks both values, the workflow-dispatch event, and the
+persisted dispatch identity and time, so a stale same-name run is rejected.
+
+`github_service_uid` must be the numeric UID of the Unix identity that runs the
+coordinator and detached GitHub adapter. For the reviewed unit this is the
+dedicated `hamed` service identity; obtain the value locally with `id -u hamed`
+and record it in both GitHub worker entries. Configuration loading fails unless
+the running effective UID, configured UID, token owner, and private token
+directory owner all match. The example deliberately contains invalid
+placeholders: replace them during owner-only configuration review. This change
+does not create an account or credential.
 
 ## 5. Configuration
 
@@ -176,6 +188,8 @@ production settings:
 - `max_parallel_tasks: 2` initially;
 - `sandbox_backend: "bubblewrap"` on PixelBox;
 - each `github_actions` worker points at one reviewed workflow and one agent;
+- each `github_actions` worker binds `workflow_ref`, its exact `workflow_sha`,
+  and `github_service_uid` to the reviewed service identity;
 - no standing authorization for GitHub Actions workers;
 - `repository_profiles` binds each allowlisted checkout and base ref.
 

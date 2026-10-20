@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 
 from omcp.controller import Config, Principal, TaskController, Worker
 from omcp.github_actions import (
-    GitHubActionsClient, GitHubActionsError, decode_instructions,
+    DispatchIdentity, GitHubActionsClient, GitHubActionsError, decode_instructions,
     encode_instructions,
 )
 from omcp.github_runner import run as run_github_worker
@@ -29,6 +29,7 @@ ALL_PERMISSIONS = frozenset({
     "workers:read", "tasks:cancel", "approvals:read",
     "host_operations:submit",
 })
+WORKFLOW_SHA = "a" * 40
 
 
 class FakeProcess:
@@ -98,6 +99,8 @@ class GitHubConfigTests(unittest.TestCase):
         token.write_text("never-print-this\n")
         token.chmod(0o600)
         worker.setdefault("credential_file", str(token))
+        worker.setdefault("workflow_sha", WORKFLOW_SHA)
+        worker.setdefault("github_service_uid", os.geteuid())
         raw = {
             "repository": "owner/repo", "project_root": str(root),
             "state_dir": str(directory / "state"),
@@ -123,6 +126,9 @@ class GitHubConfigTests(unittest.TestCase):
         self.assertEqual(worker.model, "deepseek-chat")
         self.assertEqual(worker.command, ())
         self.assertEqual(worker.github_repository, "owner/repo")
+        self.assertEqual(worker.workflow_ref, "main")
+        self.assertEqual(worker.workflow_sha, WORKFLOW_SHA)
+        self.assertEqual(worker.github_service_uid, os.geteuid())
 
     def test_github_actions_worker_rejects_local_commands_and_unsafe_refs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -135,6 +141,16 @@ class GitHubConfigTests(unittest.TestCase):
                 "agent": "codex", "workflow_ref": "../main",
             })
             with self.assertRaisesRegex(ValueError, "workflow_ref"):
+                Config.load(path)
+            path = self.config(Path(directory), {
+                "agent": "codex", "workflow_sha": "main",
+            })
+            with self.assertRaisesRegex(ValueError, "workflow_sha"):
+                Config.load(path)
+            path = self.config(Path(directory), {
+                "agent": "codex", "github_service_uid": os.geteuid() + 1,
+            })
+            with self.assertRaisesRegex(ValueError, "github_service_uid"):
                 Config.load(path)
             path = self.config(Path(directory), {"agent": "shell"})
             with self.assertRaisesRegex(ValueError, "agent must be codex or deepseek"):
@@ -157,6 +173,12 @@ class GitHubActionsClientTests(unittest.TestCase):
         self.token.write_text("secret-token-value\n")
         self.token.chmod(0o600)
         self.requests = []
+        self.identity = DispatchIdentity(
+            "11111111-1111-1111-1111-111111111111",
+            "request-1",
+            "22222222-2222-4222-8222-222222222222",
+            "2026-10-20T00:00:00+00:00",
+        )
 
     def tearDown(self):
         self.temp.cleanup()
@@ -172,12 +194,11 @@ class GitHubActionsClientTests(unittest.TestCase):
 
     def test_dispatch_uses_header_auth_and_encoded_payload(self):
         client = GitHubActionsClient(
-            "owner/repo", "orchestra-worker.yml", "main", self.token,
+            "owner/repo", "orchestra-worker.yml", "main", WORKFLOW_SHA, self.token,
             opener=self.opener([b"{}"]),
         )
         client.dispatch(
-            "11111111-1111-1111-1111-111111111111", "request-1",
-            "deepseek", "deepseek-chat", "Implement the task",
+            self.identity, "deepseek", "deepseek-chat", "Implement the task",
         )
         request = self.requests[0]
         self.assertEqual(request.method, "POST")
@@ -191,27 +212,28 @@ class GitHubActionsClientTests(unittest.TestCase):
     def test_run_discovery_uses_the_deterministic_run_name(self):
         payload = json.dumps({"workflow_runs": [
             {"id": 1, "display_title": "Other", "status": "completed"},
-            {"id": 2, "display_title": "Orchestra 11111111-1111-1111-1111-111111111111",
+            {"id": 2, "display_title": self.identity.run_name,
+             "event": "workflow_dispatch", "head_sha": WORKFLOW_SHA,
+             "head_branch": "main", "created_at": "2026-10-20T00:00:01Z",
              "status": "queued", "html_url": "https://example/run"},
         ]}).encode()
         client = GitHubActionsClient(
-            "owner/repo", "orchestra-worker.yml", "main", self.token,
+            "owner/repo", "orchestra-worker.yml", "main", WORKFLOW_SHA, self.token,
             opener=self.opener([payload]),
         )
-        found = client.find_run("11111111-1111-1111-1111-111111111111")
+        found = client.find_run(self.identity)
         self.assertIsNotNone(found)
         self.assertEqual(found.run_id, 2)
         self.assertEqual(found.status, "queued")
 
     def test_oversized_payload_fails_before_dispatch(self):
         client = GitHubActionsClient(
-            "owner/repo", "orchestra-worker.yml", "main", self.token,
+            "owner/repo", "orchestra-worker.yml", "main", WORKFLOW_SHA, self.token,
             opener=self.opener([]),
         )
         with self.assertRaisesRegex(ValueError, "too large"):
             client.dispatch(
-                "11111111-1111-1111-1111-111111111111", "request-1",
-                "codex", "gpt-5-codex",
+                self.identity, "codex", "gpt-5-codex",
                 base64.b64encode(os.urandom(60_000)).decode("ascii"),
             )
         self.assertEqual(self.requests, [])
@@ -221,16 +243,23 @@ class GitHubActionsClientTests(unittest.TestCase):
 
         task = Path(self.temp.name) / "task"
         task.mkdir()
-        (task / "github-state.json").write_text(json.dumps({"run_id": 41}))
+        (task / "github-state.json").write_text(json.dumps({
+            "run_id": 41,
+            "task_id": self.identity.task_id,
+            "request_id": self.identity.request_id,
+            "dispatch_id": self.identity.dispatch_id,
+            "dispatched_at": self.identity.dispatched_at,
+        }))
         (task / "github-actions.json").write_text(json.dumps({
             "github_repository": "owner/repo", "workflow": "orchestra-worker.yml",
-            "workflow_ref": "main", "credential_file": str(self.token),
+            "workflow_ref": "main", "workflow_sha": WORKFLOW_SHA,
+            "github_service_uid": os.geteuid(), "credential_file": str(self.token),
         }))
         client = Mock()
         with patch("omcp.github_actions.client_from_spec", return_value=client):
             result = cancel_task_run(task, reason="operator withdrew it")
         self.assertEqual(result["run_id"], 41)
-        client.cancel.assert_called_once_with(41)
+        client.cancel.assert_called_once_with(41, self.identity)
 
     def test_artifact_rejects_unsafe_paths(self):
         import io
@@ -244,7 +273,7 @@ class GitHubActionsClientTests(unittest.TestCase):
             "archive_download_url": "https://api.github.com/repos/owner/repo/actions/artifacts/1/zip",
         }]}).encode()
         client = GitHubActionsClient(
-            "owner/repo", "orchestra-worker.yml", "main", self.token,
+            "owner/repo", "orchestra-worker.yml", "main", WORKFLOW_SHA, self.token,
             opener=self.opener([artifact, buffer.getvalue()]),
         )
         with self.assertRaisesRegex(GitHubActionsError, "unsafe path"):
@@ -269,6 +298,8 @@ class GitHubControllerTests(unittest.TestCase):
                     credential_file=str(token), github_repository="owner/repo",
                     workflow="orchestra-worker.yml", workflow_ref="main",
                     agent="codex", model="gpt-5-codex",
+                    workflow_sha=WORKFLOW_SHA,
+                    github_service_uid=os.geteuid(),
                 )},
                 Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
             )
@@ -295,6 +326,9 @@ class GitHubControllerTests(unittest.TestCase):
                 self.assertEqual(spec["agent"], "codex")
                 self.assertEqual(spec["github_repository"], "owner/repo")
                 self.assertEqual(spec["workflow"], "orchestra-worker.yml")
+                self.assertEqual(spec["workflow_ref"], "main")
+                self.assertEqual(spec["workflow_sha"], WORKFLOW_SHA)
+                self.assertEqual(spec["github_service_uid"], os.geteuid())
                 self.assertNotIn("never-log-this-token", json.dumps(spec))
                 self.assertNotIn("never-log-this-token", (base / "state/audit.jsonl").read_text())
                 self.assertEqual(approved["remote_artifact"], "omcp-" + submitted["task_id"])
