@@ -1253,6 +1253,14 @@ class RunnerTests(unittest.TestCase):
 
             server_profile, client_profile = server[2], client[2]
             profiles = server_profile + client_profile
+            self.assertIn(
+                '(allow process-exec (literal "/allowlisted/opencode-cli"))',
+                server_profile,
+            )
+            self.assertIn(
+                '(allow process-exec (literal "/allowlisted/opencode-cli"))',
+                client_profile,
+            )
             self.assertNotIn("api.deepseek.com", profiles)
             self.assertNotIn("*:443", profiles)
             self.assertNotIn("localhost:*", profiles)
@@ -1291,22 +1299,24 @@ class RunnerTests(unittest.TestCase):
                 "http://127.0.0.1:49152/abcdefghijklmnopqrstuvwxyzABCDEFG_123456/v1",
                 49153,
             )
+            baseline = subprocess.run(
+                ["/usr/bin/sandbox-exec", "-p", "(version 1)\n(allow default)",
+                 "/usr/bin/true"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                timeout=10,
+            )
+            if (baseline.returncode != 0
+                    and b"Operation not permitted" in baseline.stderr):
+                self.skipTest("enclosing sandbox blocks sandbox execution")
+            self.assertEqual(
+                baseline.returncode, 0, baseline.stderr.decode("utf-8", "replace"),
+            )
             for command in (server, client):
                 probe = subprocess.run(
                     ["/usr/bin/sandbox-exec", "-p", command[2], "/usr/bin/true"],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
                     timeout=10,
                 )
-                if probe.returncode != 0 and b"Operation not permitted" in probe.stderr:
-                    baseline = subprocess.run(
-                        ["/usr/bin/sandbox-exec", "-p", "(version 1)\n(allow default)",
-                         "/usr/bin/true"],
-                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
-                        timeout=10,
-                    )
-                    if (baseline.returncode != 0
-                            and b"Operation not permitted" in baseline.stderr):
-                        self.skipTest("profiles compile; enclosing sandbox blocks sandbox_apply")
                 self.assertEqual(probe.returncode, 0, probe.stderr.decode("utf-8", "replace"))
 
     def test_pinned_gateway_offline_synthetic_key_probe_uses_no_real_provider(self):
@@ -1325,7 +1335,9 @@ class RunnerTests(unittest.TestCase):
                 raise
             url = urlparse(gateway_url)
             upstream_response = Mock(status=401)
-            upstream_response.getheader.return_value = "application/json"
+            upstream_response.getheader.side_effect = lambda name, default=None: {
+                "Content-Type": "application/json",
+            }.get(name, default)
             upstream_response.read.side_effect = [b'{"error":{"message":"synthetic"}}', b""]
             upstream = Mock()
             upstream.getresponse.return_value = upstream_response
@@ -1379,7 +1391,9 @@ class RunnerTests(unittest.TestCase):
             handler.wfile = io.BytesIO()
             handler.close_connection = False
             response = Mock(status=200)
-            response.getheader.return_value = "text/event-stream"
+            response.getheader.side_effect = lambda name, default=None: {
+                "Content-Type": "text/event-stream",
+            }.get(name, default)
             response.read.side_effect = [b"data: safe\n\n", b""]
             connection = Mock()
             connection.getresponse.return_value = response

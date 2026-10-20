@@ -165,8 +165,11 @@ class SandboxPolicy:
         )
 
 
-def _seatbelt_profile(policy: SandboxPolicy) -> str:
+def _seatbelt_profile(policy: SandboxPolicy, executable: str) -> str:
     rules = ["(version 1)", "(deny default)", '(import "system.sb")']
+    rules.append(
+        f'(allow process-exec (literal "{_seatbelt_quote(executable)}"))'
+    )
     rules.extend(f'(allow file-read* (subpath "{_seatbelt_quote(path)}"))'
                  for path in policy.read_paths)
     rules.extend(f'(allow file-read* (literal "{_seatbelt_quote(path)}"))'
@@ -273,7 +276,10 @@ def sandbox_command(policy: SandboxPolicy, command: Sequence[str]) -> list[str]:
     normalized = policy.normalized()
     backend = sandbox_backend(normalized.backend)
     if backend == "seatbelt":
-        profile = _seatbelt_profile(normalized)
+        executable = Path(command[0])
+        if not executable.is_absolute():
+            raise ValueError("Seatbelt executable must be an absolute path")
+        profile = _seatbelt_profile(normalized, str(executable))
         return [sandbox_executable("seatbelt"), "-p", profile, *command]
     return _bubblewrap_command(normalized, command)
 
