@@ -141,9 +141,17 @@ workflow secrets. The Actions token is available to the workflow automatically
 but is not exported to the agent process; `persist-credentials: false` also
 keeps it out of the checkout.
 
-For stronger separation, add required reviewers to the `orchestra-workers`
-environment. This is optional because the coordinator already owns the approval
-gate; if enabled, it becomes a second, independent approval.
+Configure required reviewers on the `orchestra-workers` environment and enable
+"Prevent self-review". Do not store provider keys as repository or organization
+secrets: they must remain environment secrets so GitHub does not release them to
+the secretless SHA-verification job. Before approving an environment deployment,
+the reviewer must confirm that the run's head SHA is exactly the configured
+`workflow_sha`. Reject the deployment if the ref moved or the SHA is unfamiliar.
+This review is the fail-closed backstop for a protection-rule bypass or a branch
+move in the short interval between the coordinator's lookup and dispatch. Before
+dispatch, the coordinator reads this environment through the GitHub API and
+fails closed unless it has at least one required reviewer, prevents self-review,
+and permits deployments only from protected branches.
 
 ### Fine-grained GitHub token for the coordinator
 
@@ -161,13 +169,21 @@ identity with mode `0700`; symlinked files or directories are rejected.
 
 ### Workflow ref
 
-`workflow_ref` must name a branch or tag that contains the reviewed workflow.
-Use `main` only after the workflow and worker script are merged. Until then,
-use the reviewed feature branch for staging and record that choice. The
+`workflow_ref` must name a protected branch that contains the reviewed workflow;
+tags, raw commit IDs and other refs are rejected. Use `main` only after the
+workflow and worker script are merged. Until then, use a protected reviewed
+feature branch for staging and record that choice. The
 workflow file cannot be selected by a task; it comes from owner-only
 configuration. `workflow_sha` must be the full 40-character commit currently at
-that ref. Run adoption checks both values, the workflow-dispatch event, and the
-persisted dispatch identity and time, so a stale same-name run is rejected.
+that branch. Immediately before dispatch, the coordinator resolves the branch,
+requires GitHub to report it as protected, and compares its current commit with
+`workflow_sha`; it then verifies the environment protections above. No workflow
+is dispatched on a mismatch or missing protection. The expected SHA is also a
+dispatch input. A credential-free job compares it with `github.sha`, and
+only its success allows the environment-gated execution job to request provider
+secrets. The checkout is pinned to that SHA. Run adoption checks both ref and
+SHA, the workflow-dispatch event, and the persisted dispatch identity and time,
+so a stale same-name run is rejected.
 
 `github_service_uid` must be the numeric UID of the Unix identity that runs the
 coordinator and detached GitHub adapter. For the reviewed unit this is the

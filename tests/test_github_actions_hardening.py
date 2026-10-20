@@ -139,6 +139,19 @@ class HttpHardeningTests(unittest.TestCase):
                     "owner/repo", "orchestra-worker.yml", "main", TASK_SHA, link,
                 )
 
+    def test_client_rejects_tag_and_raw_sha_workflow_refs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token = Path(directory) / "token"
+            token.write_text("secret-token\n")
+            token.chmod(0o600)
+            for ref in ("refs/tags/reviewed", TASK_SHA, "refs/heads/"):
+                with self.subTest(ref=ref), self.assertRaisesRegex(
+                    ValueError, "must name a branch",
+                ):
+                    GitHubActionsClient(
+                        "owner/repo", "orchestra-worker.yml", ref, TASK_SHA, token,
+                    )
+
     def test_find_run_rejects_stale_same_name_and_wrong_ref_or_sha(self):
         created = datetime.fromisoformat(DISPATCHED_AT)
         exact = {
@@ -163,6 +176,80 @@ class HttpHardeningTests(unittest.TestCase):
             run = client.find_run(dispatch_identity())
         self.assertIsNotNone(run)
         self.assertEqual(run.run_id, 7)
+
+    def test_dispatch_fails_closed_for_unprotected_ref_before_post(self):
+        requests = []
+
+        def opener(request, **_kwargs):
+            requests.append(request)
+            return Response(json.dumps({
+                "name": "main", "protected": False,
+                "commit": {"sha": TASK_SHA},
+            }).encode())
+
+        with tempfile.TemporaryDirectory() as directory:
+            token = Path(directory) / "token"
+            token.write_text("secret-token\n")
+            token.chmod(0o600)
+            client = GitHubActionsClient(
+                "owner/repo", "orchestra-worker.yml", "main", TASK_SHA, token,
+                opener=opener,
+            )
+            with self.assertRaisesRegex(GitHubActionsError, "protected branch"):
+                client.dispatch(dispatch_identity(), "codex", "gpt-5", "task")
+        self.assertEqual([request.method for request in requests], ["GET"])
+
+    def test_dispatch_fails_closed_when_ref_moved_before_post(self):
+        requests = []
+
+        def opener(request, **_kwargs):
+            requests.append(request)
+            return Response(json.dumps({
+                "name": "main", "protected": True,
+                "commit": {"sha": "b" * 40},
+            }).encode())
+
+        with tempfile.TemporaryDirectory() as directory:
+            token = Path(directory) / "token"
+            token.write_text("secret-token\n")
+            token.chmod(0o600)
+            client = GitHubActionsClient(
+                "owner/repo", "orchestra-worker.yml", "main", TASK_SHA, token,
+                opener=opener,
+            )
+            with self.assertRaisesRegex(GitHubActionsError, "configured SHA"):
+                client.dispatch(dispatch_identity(), "codex", "gpt-5", "task")
+        self.assertEqual([request.method for request in requests], ["GET"])
+
+    def test_dispatch_requires_review_protected_secret_environment(self):
+        requests = []
+        responses = iter((
+            {
+                "name": "main", "protected": True,
+                "commit": {"sha": TASK_SHA},
+            },
+            {
+                "name": "orchestra-workers",
+                "protection_rules": [],
+                "deployment_branch_policy": {"protected_branches": True},
+            },
+        ))
+
+        def opener(request, **_kwargs):
+            requests.append(request)
+            return Response(json.dumps(next(responses)).encode())
+
+        with tempfile.TemporaryDirectory() as directory:
+            token = Path(directory) / "token"
+            token.write_text("secret-token\n")
+            token.chmod(0o600)
+            client = GitHubActionsClient(
+                "owner/repo", "orchestra-worker.yml", "main", TASK_SHA, token,
+                opener=opener,
+            )
+            with self.assertRaisesRegex(GitHubActionsError, "environment"):
+                client.dispatch(dispatch_identity(), "codex", "gpt-5", "task")
+        self.assertEqual([request.method for request in requests], ["GET", "GET"])
 
 
 class ArtifactHardeningTests(unittest.TestCase):
@@ -349,6 +436,22 @@ class WorkerArtifactTests(unittest.TestCase):
         self.assertIn("if: inputs.agent == 'deepseek'", deepseek_step)
         self.assertIn("DEEPSEEK_API_KEY", deepseek_step)
         self.assertNotIn("OPENAI_API_KEY", deepseek_step)
+
+    def test_workflow_verifies_sha_before_environment_can_release_secrets(self):
+        workflow = (
+            Path(__file__).resolve().parents[1]
+            / ".github/workflows/orchestra-worker.yml"
+        ).read_text()
+        verification, execution = workflow.split("  execute:\n", 1)
+        self.assertIn("workflow_sha:", workflow)
+        self.assertIn("verify-workflow-sha:", verification)
+        self.assertIn("ACTUAL_WORKFLOW_SHA: ${{ github.sha }}", verification)
+        self.assertNotIn("environment: orchestra-workers", verification)
+        self.assertNotIn("OPENAI_API_KEY", verification)
+        self.assertNotIn("DEEPSEEK_API_KEY", verification)
+        self.assertIn("needs: verify-workflow-sha", execution)
+        self.assertIn("environment: orchestra-workers", execution)
+        self.assertIn("ref: ${{ inputs.workflow_sha }}", execution)
 
 
 if __name__ == "__main__":

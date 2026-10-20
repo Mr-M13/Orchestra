@@ -38,6 +38,7 @@ MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 MAX_INSTRUCTION_BYTES = 65_536
 ALLOWED_ARTIFACT_FILES = {"result.txt", "patch.diff", "worker.log", "summary.json"}
 RUN_NAME_PREFIX = "Orchestra "
+WORKER_ENVIRONMENT = "orchestra-workers"
 RUN_CREATION_SKEW = timedelta(seconds=30)
 RUN_CREATION_WINDOW = timedelta(minutes=15)
 
@@ -299,6 +300,12 @@ class GitHubActionsClient:
             raise ValueError("GitHub workflow ref is invalid")
         if ".." in ref.split("/") or ref.startswith("-"):
             raise ValueError("GitHub workflow ref is unsafe")
+        if ref.startswith("refs/heads/"):
+            ref = ref.removeprefix("refs/heads/")
+        elif ref.startswith("refs/"):
+            raise ValueError("GitHub workflow ref must name a branch")
+        if not ref or re.fullmatch(r"[0-9a-fA-F]{40}", ref):
+            raise ValueError("GitHub workflow ref must name a branch")
         self.ref = ref
         if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", head_sha):
             raise ValueError("GitHub workflow head SHA must be a full commit SHA")
@@ -371,7 +378,13 @@ class GitHubActionsClient:
 
     def dispatch(self, identity: DispatchIdentity, agent: str, model: str,
                  instructions: str) -> str:
-        """Dispatch one workflow run and return the encoded dispatch marker."""
+        """Verify the protected ref, then dispatch one SHA-bound workflow run.
+
+        The workflow performs the same SHA comparison in a credential-free job
+        before its environment-gated execution job can receive provider keys.
+        This second comparison closes the ref-move window between this lookup
+        and GitHub accepting the dispatch.
+        """
         _validate_dispatch_identity(identity)
         if agent not in {"codex", "deepseek"}:
             raise ValueError("unsupported GitHub Actions agent")
@@ -380,6 +393,8 @@ class GitHubActionsClient:
         ):
             raise ValueError("unsupported GitHub Actions model")
         encoded = encode_instructions(instructions)
+        self._verify_protected_ref()
+        self._verify_secret_environment()
         self._request("POST", self._workflow_path + "/dispatches", {
             "ref": self.ref,
             "inputs": {
@@ -389,10 +404,56 @@ class GitHubActionsClient:
                 "dispatched_at": identity.dispatched_at,
                 "agent": agent,
                 "model": model,
+                "workflow_sha": self.head_sha,
                 "payload": encoded,
             },
         })
         return encoded
+
+    def _verify_protected_ref(self) -> None:
+        """Fail closed unless the configured branch is protected at its exact SHA."""
+        branch = urllib.parse.quote(self.ref, safe="")
+        result = self._request(
+            "GET", f"/repos/{self.repository}/branches/{branch}",
+        )
+        commit = result.get("commit") if isinstance(result, dict) else None
+        resolved_sha = commit.get("sha") if isinstance(commit, dict) else None
+        protected = result.get("protected") if isinstance(result, dict) else None
+        if protected is not True:
+            raise GitHubActionsError("GitHub workflow ref is not a protected branch")
+        if (not isinstance(resolved_sha, str)
+                or resolved_sha.lower() != self.head_sha):
+            raise GitHubActionsError("GitHub workflow ref does not match configured SHA")
+
+    def _verify_secret_environment(self) -> None:
+        """Require the external approval boundary that guards provider keys."""
+        environment = urllib.parse.quote(WORKER_ENVIRONMENT, safe="")
+        result = self._request(
+            "GET", f"/repos/{self.repository}/environments/{environment}",
+        )
+        rules = result.get("protection_rules") if isinstance(result, dict) else None
+        reviewer_rule = next(
+            (
+                rule for rule in rules
+                if isinstance(rule, dict) and rule.get("type") == "required_reviewers"
+            ),
+            None,
+        ) if isinstance(rules, list) else None
+        reviewers = (
+            reviewer_rule.get("reviewers") if isinstance(reviewer_rule, dict) else None
+        )
+        policy = (
+            result.get("deployment_branch_policy")
+            if isinstance(result, dict) else None
+        )
+        if (not isinstance(reviewer_rule, dict)
+                or reviewer_rule.get("prevent_self_review") is not True
+                or not isinstance(reviewers, list) or not reviewers
+                or not isinstance(policy, dict)
+                or policy.get("protected_branches") is not True):
+            raise GitHubActionsError(
+                "GitHub worker environment does not enforce protected-branch review"
+            )
 
     def _run_state(self, run: object, identity: DispatchIdentity) -> RunState | None:
         if not isinstance(run, dict):

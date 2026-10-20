@@ -195,17 +195,39 @@ class GitHubActionsClientTests(unittest.TestCase):
     def test_dispatch_uses_header_auth_and_encoded_payload(self):
         client = GitHubActionsClient(
             "owner/repo", "orchestra-worker.yml", "main", WORKFLOW_SHA, self.token,
-            opener=self.opener([b"{}"]),
+            opener=self.opener([
+                json.dumps({
+                    "name": "main", "protected": True,
+                    "commit": {"sha": WORKFLOW_SHA},
+                }).encode(),
+                json.dumps({
+                    "name": "orchestra-workers",
+                    "protection_rules": [{
+                        "type": "required_reviewers",
+                        "prevent_self_review": True,
+                        "reviewers": [{"type": "User", "reviewer": {"id": 1}}],
+                    }],
+                    "deployment_branch_policy": {"protected_branches": True},
+                }).encode(),
+                b"{}",
+            ]),
         )
         client.dispatch(
             self.identity, "deepseek", "deepseek-chat", "Implement the task",
         )
-        request = self.requests[0]
+        verification = self.requests[0]
+        self.assertEqual(verification.method, "GET")
+        self.assertIn("/branches/main", verification.full_url)
+        environment = self.requests[1]
+        self.assertEqual(environment.method, "GET")
+        self.assertIn("/environments/orchestra-workers", environment.full_url)
+        request = self.requests[2]
         self.assertEqual(request.method, "POST")
         self.assertIn("/actions/workflows/orchestra-worker.yml/dispatches", request.full_url)
         self.assertEqual(request.get_header("Authorization"), "Bearer secret-token-value")
         body = json.loads(request.data)
         self.assertEqual(body["ref"], "main")
+        self.assertEqual(body["inputs"]["workflow_sha"], WORKFLOW_SHA)
         self.assertEqual(decode_instructions(body["inputs"]["payload"]), "Implement the task")
         self.assertNotIn(b"secret-token-value", request.data)
 
