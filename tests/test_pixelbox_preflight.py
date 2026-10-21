@@ -111,6 +111,37 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
         self.assertIn("--property=PrivateTmp=yes", command)
         self.assertIn("--property=RestrictAddressFamilies=AF_UNIX", command)
 
+    def test_systemd_provider_egress_requires_literal_allowlist(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            with patch("omcp.platform.host_platform", return_value="linux"), patch(
+                "omcp.platform.sandbox_executable", return_value="/usr/bin/systemd-run"
+            ):
+                with self.assertRaisesRegex(SandboxUnavailable, "IP allowlist"):
+                    sandbox_command(SandboxPolicy(
+                        read_paths=(workspace,), network_hosts=("api.deepseek.com",),
+                        backend="systemd", workdir=workspace,
+                    ), ["/usr/bin/true"])
+                command = sandbox_command(SandboxPolicy(
+                    read_paths=(workspace,), network_hosts=("api.deepseek.com",),
+                    network_addresses=("203.0.113.8",), backend="systemd", workdir=workspace,
+                ), ["/usr/bin/true"])
+        self.assertIn("--property=IPAddressDeny=any", command)
+        self.assertIn("--property=IPAddressAllow=203.0.113.8/32", command)
+
+    def test_systemd_launcher_runs_workers_as_a_dedicated_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            with patch("omcp.platform.host_platform", return_value="linux"), patch(
+                "omcp.platform.sandbox_executable", return_value="/usr/bin/systemd-run"
+            ):
+                command = sandbox_command(SandboxPolicy(
+                    read_paths=(workspace,), backend="systemd", workdir=workspace,
+                    worker_user="orchestra-worker", worker_group="orchestra-worker",
+                ), ["/usr/bin/true"])
+        self.assertIn("--uid=orchestra-worker", command)
+        self.assertIn("--gid=orchestra-worker", command)
+
     def test_provider_sandbox_reshare_is_limited_to_network_namespace(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)

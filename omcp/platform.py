@@ -12,6 +12,7 @@ validated, owner-configured execution policy into an operating-system command.
 from __future__ import annotations
 
 import os
+import ipaddress
 import re
 import shutil
 import sys
@@ -133,11 +134,14 @@ class SandboxPolicy:
     read_files: tuple[Path, ...] = ()
     write_paths: tuple[Path, ...] = ()
     network_hosts: tuple[str, ...] = ()
+    network_addresses: tuple[str, ...] = ()
     loopback_bind_ports: tuple[int, ...] = ()
     loopback_connect_ports: tuple[int, ...] = ()
     backend: str = "auto"
     workdir: Path | None = None
     environment: dict[str, str] = field(default_factory=dict)
+    worker_user: str | None = None
+    worker_group: str | None = None
 
     def normalized(self) -> "SandboxPolicy":
         environment = dict(self.environment)
@@ -147,6 +151,10 @@ class SandboxPolicy:
             for key, value in environment.items()
         ):
             raise ValueError("sandbox environment must contain valid strings")
+        for identity in (self.worker_user, self.worker_group):
+            if identity is not None and (not isinstance(identity, str)
+                                         or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,31}", identity)):
+                raise ValueError("sandbox worker identity is invalid")
         if not all(
             isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65_535
             for port in (*self.loopback_bind_ports, *self.loopback_connect_ports)
@@ -159,16 +167,25 @@ class SandboxPolicy:
             for host in self.network_hosts
         ):
             raise ValueError("sandbox network hosts must be fixed DNS names or addresses")
+        try:
+            network_addresses = tuple(str(ipaddress.ip_address(value)) for value in self.network_addresses)
+        except ValueError as exc:
+            raise ValueError("sandbox network addresses must be literal IP addresses") from exc
+        if self.network_addresses and not self.network_hosts:
+            raise ValueError("sandbox network addresses require an explicit provider policy")
         return SandboxPolicy(
             read_paths=tuple(Path(value).resolve() for value in self.read_paths),
             read_files=tuple(Path(value).resolve() for value in self.read_files),
             write_paths=tuple(Path(value).resolve() for value in self.write_paths),
             network_hosts=tuple(self.network_hosts),
+            network_addresses=network_addresses,
             loopback_bind_ports=tuple(self.loopback_bind_ports),
             loopback_connect_ports=tuple(self.loopback_connect_ports),
             backend=self.backend,
             workdir=Path(self.workdir).resolve() if self.workdir else None,
             environment=environment,
+            worker_user=self.worker_user,
+            worker_group=self.worker_group,
         )
 
 
@@ -277,6 +294,10 @@ def _systemd_command(policy: SandboxPolicy, command: Sequence[str]) -> list[str]
     """Confine a worker in a transient service when Bubblewrap mounts fail."""
     if policy.loopback_bind_ports or policy.loopback_connect_ports:
         raise SandboxUnavailable("exact loopback-port filtering requires the Seatbelt backend")
+    if policy.network_hosts and not policy.network_addresses:
+        raise SandboxUnavailable(
+            "systemd provider egress requires an owner-configured literal IP allowlist"
+        )
     args = [
         sandbox_executable("systemd"), "--wait", "--collect", "--quiet", "--pipe",
         "--service-type=exec", "--property=NoNewPrivileges=yes",
@@ -284,8 +305,17 @@ def _systemd_command(policy: SandboxPolicy, command: Sequence[str]) -> list[str]
         "--property=ProtectHome=tmpfs", "--property=RestrictSUIDSGID=yes",
         "--property=LockPersonality=yes",
     ]
+    if policy.worker_user is not None:
+        args.append(f"--uid={policy.worker_user}")
+    if policy.worker_group is not None:
+        args.append(f"--gid={policy.worker_group}")
     families = "AF_UNIX" + (" AF_INET AF_INET6" if policy.network_hosts else "")
     args.append(f"--property=RestrictAddressFamilies={families}")
+    if policy.network_hosts:
+        args.append("--property=IPAddressDeny=any")
+        for address in policy.network_addresses:
+            suffix = "/128" if ":" in address else "/32"
+            args.append(f"--property=IPAddressAllow={address}{suffix}")
     for path in policy.read_paths:
         if not path.exists():
             raise SandboxUnavailable(f"sandbox read path does not exist: {path}")

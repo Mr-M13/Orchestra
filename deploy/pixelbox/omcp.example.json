@@ -38,13 +38,15 @@
       "adapter": "deepseek",
       "provider": "deepseek",
       "model": "deepseek/deepseek-chat",
-      "credential_file": "/etc/orchestra/secrets/deepseek-api-key"
+      "credential_file": "/etc/orchestra/secrets/deepseek-api-key",
+      "endpoint_addresses": []
     },
     "deepseek-secondary": {
       "adapter": "deepseek",
       "provider": "deepseek",
       "model": "deepseek/deepseek-chat",
-      "credential_file": "/etc/orchestra/secrets/deepseek-api-key"
+      "credential_file": "/etc/orchestra/secrets/deepseek-api-key",
+      "endpoint_addresses": []
     }
   },
   "max_task_bytes": 65536,

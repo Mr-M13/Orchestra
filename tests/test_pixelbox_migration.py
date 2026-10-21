@@ -145,8 +145,8 @@ class PlatformTests(unittest.TestCase):
             root = Path(directory)
             spec = root / "runner.json"; spec.write_text("{}")
             credential = root / "credential"; credential.write_text("test")
-            command = deepseek_runner_command(spec, root, root, credential, "systemd")
-        self.assertEqual(command[0], "/usr/bin/systemd-run")
+            with self.assertRaisesRegex(SandboxUnavailable, "IP allowlist"):
+                deepseek_runner_command(spec, root, root, credential, "systemd")
 
 
 class GitHubConfigTests(unittest.TestCase):

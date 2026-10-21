@@ -130,7 +130,8 @@ def canonical_opencode_executable(value: str) -> str:
 
 
 def deepseek_runner_command(spec_path: Path, task_dir: Path, workspace: Path,
-                            credential_file: Path, backend: str = "auto") -> list[str]:
+                            credential_file: Path, backend: str = "auto",
+                            endpoint_addresses: tuple[str, ...] = ()) -> list[str]:
     """Run the direct adapter with only its private files and DeepSeek egress."""
     source_root = Path(__file__).resolve().parent.parent
     policy = SandboxPolicy(
@@ -138,7 +139,10 @@ def deepseek_runner_command(spec_path: Path, task_dir: Path, workspace: Path,
         read_files=(spec_path, credential_file),
         write_paths=(task_dir,),
         network_hosts=("api.deepseek.com",),
+        network_addresses=endpoint_addresses,
         backend=backend,
+        worker_user="orchestra-worker" if backend == "systemd" else None,
+        worker_group="orchestra-worker" if backend == "systemd" else None,
     )
     return sandbox_command(
         policy, [sys.executable, "-m", "omcp.runner", "--spec", str(spec_path)],
@@ -163,6 +167,7 @@ class Worker:
     workflow_sha: str | None = None
     github_service_uid: int | None = None
     github_dispatch_socket: str | None = None
+    endpoint_addresses: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -272,6 +277,9 @@ class Config:
                 command = []
             elif not isinstance(command, list):
                 raise ValueError("worker must include a command list")
+            endpoint_addresses = value.get("endpoint_addresses", [])
+            if not isinstance(endpoint_addresses, list):
+                raise ValueError("endpoint_addresses must be a list")
             workers[name] = Worker(
                 name, tuple(command), value.get("codex_home"), adapter, value.get("provider"),
                 value.get("model"), value.get("credential_file"),
@@ -283,6 +291,7 @@ class Config:
                 workflow_sha=value.get("workflow_sha"),
                 github_service_uid=value.get("github_service_uid"),
                 github_dispatch_socket=value.get("github_dispatch_socket"),
+                endpoint_addresses=tuple(endpoint_addresses),
             )
         if not workers:
             raise ValueError("at least one worker is required")
@@ -368,6 +377,8 @@ class Config:
             if worker.adapter == "deepseek":
                 if worker.provider != DEEPSEEK_PROVIDER or worker.model != DEEPSEEK_MODEL:
                     raise ValueError("DeepSeek workers require the fixed DeepSeek provider and model")
+                if not all(isinstance(item, str) for item in worker.endpoint_addresses):
+                    raise ValueError("DeepSeek endpoint_addresses must be a list of literal IP addresses")
             elif (worker.provider not in OPENCODE_PROVIDER_ENDPOINTS
                   or worker.model not in model_allowlist.get(worker.provider, frozenset())):
                 raise ValueError("OpenCode worker provider/model is not in opencode_model_allowlist")
@@ -382,6 +393,7 @@ class Config:
                 workers[worker.name] = Worker(
                     worker.name, (), None, "deepseek", DEEPSEEK_PROVIDER,
                     DEEPSEEK_MODEL, str(credential_file), "api.deepseek.com",
+                    endpoint_addresses=worker.endpoint_addresses,
                 )
                 continue
             canonical = canonical_opencode_executable(worker.command[0])
@@ -1647,7 +1659,7 @@ class TaskController:
             elif worker.adapter == "deepseek":
                 runner_command = deepseek_runner_command(
                     spec_path, task_dir, workspace, Path(worker.credential_file or ""),
-                    self.config.sandbox_backend,
+                    self.config.sandbox_backend, worker.endpoint_addresses,
                 )
             else:
                 runner_command = [sys.executable, "-m", "omcp.runner", "--spec", str(spec_path)]
