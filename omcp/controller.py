@@ -821,7 +821,7 @@ class TaskController:
     def submit_task(
         self, request_id: str, title: str, instructions: str, worker: str,
         requires_approval: bool = True, repository_profile: str | None = None,
-        consequence_class: str = "unclassified",
+        consequence_class: str = "routine_development",
     ) -> dict[str, Any]:
         self._authorize("tasks:submit", "task.submit")
         if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id):
@@ -866,11 +866,13 @@ class TaskController:
             return {**self._public(previous), "acknowledged": True, "idempotent_replay": True}
         task_id = self.id_factory()
         now = utc_now()
-        # Direct provider use always needs a fresh local decision.  In particular,
-        # the global convenience mode must not silently authorize DeepSeek egress.
-        requires_explicit_approval = self.config.workers[worker].adapter == "deepseek"
-        approvals_disabled = (self.config.task_approval_mode == "disabled"
-                              and not requires_explicit_approval)
+        # The owner-selected trusted-development profile applies uniformly to
+        # every configured local lane. Provider egress remains fixed by the
+        # adapter and credential file; task input cannot widen it.
+        approvals_disabled = (
+            self.config.task_approval_mode == "disabled"
+            and consequence_class == "routine_development"
+        )
         status = "accepted" if standing_authorization or approvals_disabled else "approval_required"
         task = {
             "task_id": task_id, "request_id": request_id, "request_digest": digest,
@@ -1280,7 +1282,7 @@ class TaskController:
             if task.get("status") != "approval_required":
                 continue
             if (task.get("kind") == "host_operation"
-                    or self.config.workers[task["worker"]].adapter == "deepseek"):
+                    or task.get("consequence_class") != "routine_development"):
                 self._expire_approval(task)
                 continue
             task["status"] = "accepted"

@@ -608,8 +608,10 @@ class DeploymentAssetTests(unittest.TestCase):
         example = json.loads((root / "deploy/pixelbox/omcp.example.json").read_text())
         self.assertEqual(example["sandbox_backend"], "systemd")
         self.assertEqual(example["max_parallel_tasks"], 2)
-        self.assertIn("actions-codex", example["workers"])
-        self.assertIn("actions-deepseek", example["workers"])
+        self.assertEqual(set(example["workers"]), {
+            "ina-codex", "hamed-codex", "deepseek-primary", "deepseek-secondary",
+        })
+        self.assertEqual(example["task_approval_mode"], "disabled")
         self.assertNotEqual(
             Path(example["state_dir"]), Path(example["project_root"]),
         )
@@ -620,20 +622,10 @@ class DeploymentAssetTests(unittest.TestCase):
         self.assertIn("execstart=/usr/bin/python3 -m omcp.server", unit.lower())
         self.assertNotIn("docker", unit.lower())
         self.assertNotIn("systemctl", unit.lower())
-        broker = (
-            root / "deploy/pixelbox/systemd/orchestra-github-dispatch.service"
-        ).read_text()
-        self.assertIn("User=orchestra-github", broker)
-        self.assertIn("Group=orchestra-ipc", broker)
-        self.assertIn("github_dispatch_service", broker)
-        for worker_name in ("actions-codex", "actions-deepseek"):
-            worker = example["workers"][worker_name]
-            self.assertNotIn("credential_file", worker)
-            self.assertNotIn("github_repository", worker)
-            self.assertEqual(
-                worker["github_dispatch_socket"],
-                "/run/orchestra-github-dispatch/dispatch.sock",
-            )
+        self.assertTrue(all(
+            worker.get("adapter") != "github_actions"
+            for worker in example["workers"].values()
+        ))
         # Workflow implementation is Ina-owned and may be absent from a scoped
         # deployment-review worktree. Validate it when present without making
         # this suite create or alter it.

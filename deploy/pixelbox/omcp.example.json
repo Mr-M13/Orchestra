@@ -26,29 +26,25 @@
   },
   "default_profile": "orchestra",
   "workers": {
-    "ina": {
+    "ina-codex": {
       "command": ["codex"],
       "codex_home": "/home/hamed/.codex-ina"
     },
-    "codex": {
+    "hamed-codex": {
       "command": ["codex"],
-      "codex_home": "/home/hamed/.codex"
+      "codex_home": "/home/hamed/.codex-hamed"
     },
-    "actions-codex": {
-      "adapter": "github_actions",
-      "agent": "codex",
-      "model": "gpt-5-codex",
-      "github_service_uid": -1,
-      "github_dispatch_socket": "/run/orchestra-github-dispatch/dispatch.sock",
-      "poll_seconds": 10
-    },
-    "actions-deepseek": {
-      "adapter": "github_actions",
-      "agent": "deepseek",
+    "deepseek-primary": {
+      "adapter": "deepseek",
+      "provider": "deepseek",
       "model": "deepseek/deepseek-chat",
-      "github_service_uid": -1,
-      "github_dispatch_socket": "/run/orchestra-github-dispatch/dispatch.sock",
-      "poll_seconds": 10
+      "credential_file": "/etc/orchestra/secrets/deepseek-api-key"
+    },
+    "deepseek-secondary": {
+      "adapter": "deepseek",
+      "provider": "deepseek",
+      "model": "deepseek/deepseek-chat",
+      "credential_file": "/etc/orchestra/secrets/deepseek-api-key"
     }
   },
   "max_task_bytes": 65536,
@@ -59,6 +55,6 @@
   "startup_lease_seconds": 30,
   "heartbeat_seconds": 15,
   "sandbox_backend": "systemd",
-  "task_approval_mode": "required",
+  "task_approval_mode": "disabled",
   "standing_authorizations": []
 }
