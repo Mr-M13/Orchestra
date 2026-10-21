@@ -103,6 +103,17 @@ class ControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different task content"):
             self.controller.submit_task("request-1", "Other", "Other work", "ina")
 
+    def test_local_worker_refreshes_base_ref_before_workspace_creation(self):
+        workspace_preparer = Mock(return_value=self.root)
+        self.controller.workspace_preparer = workspace_preparer
+
+        submitted = self.submit("local-refresh")
+
+        workspace_preparer.assert_called_once_with(
+            submitted["task_id"], "omcp/task-11111111",
+            self.config.profile("default"), True,
+        )
+
     def test_opencode_failure_exposes_only_allowlisted_diagnostic_fields(self):
         self.controller.close()
         self.controller = TaskController(

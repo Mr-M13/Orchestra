@@ -112,6 +112,15 @@ actual checkout before activation; the installer does not clone a repository
 or infer a production revision. Every mutating command requires the full,
 reviewed 40-character Git commit SHA.
 
+Keep the checkout's `origin` set to the configured repository's canonical
+`https://github.com/<owner>/<repository>.git` URL. For `github_actions`
+workers, synchronise `origin/<branch>` through the reviewed migration/import
+step before activation. The coordinator creates the local worktree from that
+owner-synchronised ref without fetching, so the broker's private GitHub token
+does not cross into the coordinator identity. Local workers still fetch their
+configured base ref and therefore require their own separately reviewed Git
+read credential for a private repository.
+
 ## 4. GitHub Actions worker setup
 
 ### Repository workflow

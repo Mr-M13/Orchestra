@@ -417,8 +417,9 @@ class GitHubControllerTests(unittest.TestCase):
                 Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
             )
             popen = Mock(return_value=FakeProcess())
+            workspace_preparer = Mock(return_value=root)
             controller = TaskController(
-                config, popen=popen, workspace_preparer=lambda *_: root,
+                config, popen=popen, workspace_preparer=workspace_preparer,
                 id_factory=lambda: "11111111-1111-1111-1111-111111111111",
             )
             try:
@@ -445,6 +446,10 @@ class GitHubControllerTests(unittest.TestCase):
                 self.assertNotIn("github_repository", spec)
                 self.assertNotIn("workflow", spec)
                 self.assertEqual(approved["remote_artifact"], "omcp-" + submitted["task_id"])
+                workspace_preparer.assert_called_once_with(
+                    submitted["task_id"], "omcp/task-11111111",
+                    config.profile("default"), False,
+                )
             finally:
                 controller.close()
 
