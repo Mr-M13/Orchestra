@@ -5,15 +5,18 @@ provider integration and cannot issue grants or decide approvals.
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import signal
 import stat
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +32,7 @@ from orchestra.contracts import (
     GrantValidationError, IsolationRequirements, NetworkPolicy, ResourceLimits,
     ResourceUsage, TaskSpec,
 )
+from orchestra.authority import execution_grant_from_dict
 
 ADAPTER_ID = "disposable-coding-worker"
 RUNTIME = "local_process"
@@ -45,12 +49,19 @@ class AuthorityUnavailableError(AdapterExecutionError):
 
 
 @runtime_checkable
-class ExecutionGrantValidator(Protocol):
-    """Future Phase 3A boundary; implementations own authenticated transport."""
+class ExecutionAuthorityClient(Protocol):
+    """Authenticated Phase 3A operations required by this adapter."""
 
     def validate_grant(self, task: TaskSpec, grant: ExecutionGrant, *,
-                       adapter_id: str, runtime: str) -> None:
-        """Return only after authenticated authority validation; otherwise raise."""
+                       adapter_id: str, runtime: str,
+                       request_id: str | None = None) -> dict[str, Any]: ...
+
+    def consume_grant(self, task: TaskSpec, grant: ExecutionGrant, *,
+                      adapter_id: str, runtime: str,
+                      request_id: str | None = None) -> dict[str, Any]: ...
+
+    def request_status(self, target_request_id: str, *,
+                       request_id: str | None = None) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -70,8 +81,8 @@ def _now() -> str:
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    temporary = path.with_name(path.name + "." + secrets.token_hex(8) + ".tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as output:
             json.dump(value, output, sort_keys=True, separators=(",", ":"))
@@ -81,6 +92,11 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
         try: os.close(descriptor)
         except OSError: pass
     temporary.replace(path)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -96,15 +112,16 @@ def _read_json(path: Path) -> dict[str, Any]:
 class DisposableCodingWorkerAdapter:
     """One fixed local-process adapter for a credential-free fake harness."""
 
-    def __init__(self, state_root: Path, authority: ExecutionGrantValidator | None,
+    def __init__(self, state_root: Path, authority: ExecutionAuthorityClient | None,
                  *, harness: DisposableHarnessConfig = DisposableHarnessConfig(),
-                 clock: Any = None) -> None:
+                 clock: Any = None, fault_injector: Any = None) -> None:
         self.state_root = Path(state_root).resolve()
         self.state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.state_root, 0o700)
         self.authority = authority
         self.harness = harness
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.fault_injector = fault_injector
         self._processes: dict[str, subprocess.Popen[bytes]] = {}
 
     def describe(self) -> AgentManifest:
@@ -124,7 +141,7 @@ class DisposableCodingWorkerAdapter:
         )
 
     def _validate(self, task: TaskSpec, grant: ExecutionGrant) -> tuple[str, ...]:
-        checks = ["contract_binding", "fixed_audience", "authority_validation", "no_credentials"]
+        checks = ["contract_binding", "fixed_audience", "authenticated_authority", "no_credentials"]
         manifest = self.describe()
         if task.agent_id != manifest.agent_id or task.model_provider != manifest.model_provider or task.model_id not in manifest.model_ids or task.coding_harness != manifest.coding_harness:
             raise GrantValidationError("adapter_manifest_audience_mismatch")
@@ -144,6 +161,10 @@ class DisposableCodingWorkerAdapter:
             raise AuthorityUnavailableError("execution authority validation failed") from exc
         return tuple(checks)
 
+    def _fault(self, stage: str, record: dict[str, Any]) -> None:
+        if self.fault_injector is not None:
+            self.fault_injector(stage, dict(record))
+
     def preflight(self, task: TaskSpec, grant: ExecutionGrant) -> PreflightResult:
         try:
             return PreflightResult(True, checks=self._validate(task, grant))
@@ -156,34 +177,119 @@ class DisposableCodingWorkerAdapter:
             raise AdapterExecutionError("unsafe attempt id")
         return self.state_root / attempt_id
 
+    @contextmanager
+    def _attempt_lock(self, attempt_id: str):
+        lock_path = self.state_root / ("." + attempt_id + ".lock")
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(lock_path, flags, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
     def dispatch(self, task: TaskSpec, grant: ExecutionGrant) -> DispatchReceipt:
-        checks = self._validate(task, grant)
-        del checks
+        with self._attempt_lock(grant.attempt_id):
+            return self._dispatch_locked(task, grant)
+
+    def _dispatch_locked(self, task: TaskSpec,
+                         grant: ExecutionGrant) -> DispatchReceipt:
         job = self._job_dir(grant.attempt_id)
         record_path = job / "job.json"
         if record_path.exists():
             record = _read_json(record_path)
             if record.get("proposal_digest") != task.digest or record.get("grant_id") != grant.grant_id:
                 raise AdapterExecutionError("attempt id already names another execution")
+            durable_grant = execution_grant_from_dict(_read_json(job / "grant.json"))
+            if durable_grant.to_dict() != grant.to_dict():
+                raise AdapterExecutionError("grant differs from durable execution intent")
+            if record.get("state") in {"intent_prepared", "consumed"}:
+                recovery = self._recover_locked(task, grant.attempt_id)
+                if recovery.state != "recovered":
+                    raise AdapterExecutionError(recovery.detail or "execution recovery failed")
+            elif record.get("state") == "launching":
+                record["state"] = "unknown"; _atomic_json(record_path, record)
+                raise AdapterExecutionError("launch outcome is unknown")
+            elif record.get("state") == "unknown":
+                raise AdapterExecutionError(
+                    "execution outcome is unknown; automatic retry is forbidden"
+                )
             return self._receipt(record)
-        job.mkdir(mode=0o700)
-        workspace = job / "workspace"; workspace.mkdir(mode=0o700)
-        spec_path = job / "harness.json"; result_path = job / "result.json"
+        self._validate(task, grant)
+        try:
+            job.mkdir(mode=0o700)
+        except FileExistsError:
+            raise AdapterExecutionError("concurrent adapter intent exists") from None
         provider_run_id = "local-" + hashlib.sha256(grant.attempt_id.encode()).hexdigest()[:24]
         dispatched_at = _now()
         record = {"version": 1, "attempt_id": grant.attempt_id,
             "provider_run_id": provider_run_id, "adapter_id": ADAPTER_ID, "runtime": RUNTIME,
             "proposal_digest": task.digest, "grant_id": grant.grant_id,
-            "task_id": task.task_id, "state": "queued", "dispatched_at": dispatched_at,
+            "task_id": task.task_id, "state": "intent_prepared", "dispatched_at": dispatched_at,
+            "consume_request_id": "consume-" + secrets.token_hex(16),
+            "consume_receipt": None,
             "started_at": None, "deadline": time.time() + task.resource_limits.max_runtime_seconds,
             "pid": None, "pid_start": None, "max_output_bytes": task.resource_limits.max_output_bytes}
+        _atomic_json(job / "grant.json", grant.to_dict())
         _atomic_json(record_path, record)
+        self._fault("after_intent", record)
+        record = self._consume(task, grant, record_path, record)
+        self._fault("after_consume", record)
+        return self._launch(task, grant, record_path, record)
+
+    def _consume(self, task: TaskSpec, grant: ExecutionGrant, record_path: Path,
+                 record: dict[str, Any]) -> dict[str, Any]:
+        if self.authority is None:
+            raise AuthorityUnavailableError("authenticated execution authority is unavailable")
+        try:
+            receipt = self.authority.consume_grant(task, grant, adapter_id=ADAPTER_ID,
+                runtime=RUNTIME, request_id=record["consume_request_id"])
+        except Exception as exc:
+            raise AuthorityUnavailableError("atomic authority grant consumption failed") from exc
+        self._validate_consume_receipt(task, grant, receipt)
+        record["consume_receipt"] = receipt
+        record["state"] = "consumed"
+        _atomic_json(record_path, record)
+        return record
+
+    @staticmethod
+    def _validate_consume_receipt(task: TaskSpec, grant: ExecutionGrant,
+                                  receipt: Any) -> None:
+        if (not isinstance(receipt, dict)
+                or receipt.get("grant_id") != grant.grant_id
+                or receipt.get("attempt_id") != grant.attempt_id
+                or receipt.get("proposal_digest") != task.digest
+                or not isinstance(receipt.get("consumed_at"), str)
+                or not receipt.get("consumed_at")):
+            raise AuthorityUnavailableError(
+                "authority returned an invalid consume receipt"
+            )
+
+    def _launch(self, task: TaskSpec, grant: ExecutionGrant, record_path: Path,
+                record: dict[str, Any]) -> DispatchReceipt:
+        job = record_path.parent
+        workspace = job / "workspace"
+        try:
+            workspace.mkdir(mode=0o700)
+        except FileExistsError:
+            metadata = workspace.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise AdapterExecutionError("workspace recovery path is unsafe")
+            os.chmod(workspace, 0o700)
+        self._fault("after_workspace", record)
+        spec_path = job / "harness.json"; result_path = job / "result.json"
         _atomic_json(spec_path, {"version": 1, "attempt_id": grant.attempt_id,
             "task_id": task.task_id, "proposal_digest": task.digest,
             "instructions": task.instructions, "workspace": str(workspace),
             "result_path": str(result_path), "behavior": self.harness.behavior,
             "delay_seconds": self.harness.delay_seconds,
             "max_output_bytes": task.resource_limits.max_output_bytes})
+        self._fault("after_spec", record)
+        record["state"] = "launching"
+        _atomic_json(record_path, record)
+        self._fault("after_launch_intent", record)
         environment = {"PYTHONPATH": str(Path(__file__).resolve().parent.parent),
             "PYTHONDONTWRITEBYTECODE": "1", "LANG": "C.UTF-8"}
         process = subprocess.Popen([sys.executable, "-m", "orchestra.disposable_coding_harness",
@@ -194,6 +300,7 @@ class DisposableCodingWorkerAdapter:
             "pid_start": self._pid_start(process.pid), "started_at": _now()})
         _atomic_json(record_path, record)
         self._processes[grant.attempt_id] = process
+        self._fault("after_process_start", record)
         return self._receipt(record)
 
     @staticmethod
@@ -343,10 +450,73 @@ class DisposableCodingWorkerAdapter:
             "test_evidence": (),})
 
     def recover(self, task: TaskSpec, attempt_id: str) -> RecoveryResult:
+        with self._attempt_lock(attempt_id):
+            return self._recover_locked(task, attempt_id)
+
+    def _recover_locked(self, task: TaskSpec, attempt_id: str) -> RecoveryResult:
         path = self._job_dir(attempt_id) / "job.json"
         if not path.exists(): return RecoveryResult("not_found", "no durable adapter job")
         record = _read_json(path)
         if record.get("proposal_digest") != task.digest: return RecoveryResult("failed", "proposal binding mismatch")
+        state = record.get("state")
+        if state in {"intent_prepared", "consumed"}:
+            try:
+                grant = execution_grant_from_dict(_read_json(path.parent / "grant.json"))
+                if (grant.grant_id != record.get("grant_id")
+                        or grant.attempt_id != record.get("attempt_id")):
+                    return RecoveryResult("failed", "durable grant binding mismatch")
+                if self.authority is None:
+                    raise AuthorityUnavailableError(
+                        "authenticated execution authority is unavailable"
+                    )
+                status = self.authority.request_status(
+                    record["consume_request_id"],
+                    request_id="status-" + secrets.token_hex(16),
+                )
+                if status.get("status") in {"unknown", "in_progress"}:
+                    return RecoveryResult(
+                        "ambiguous", "grant consumption outcome is unknown",
+                    )
+                if status.get("status") == "succeeded":
+                    if status.get("operation") != "consume_grant":
+                        return RecoveryResult(
+                            "failed", "request was not grant consumption",
+                        )
+                    response = status.get("response") or {}
+                    if response.get("ok") is not True:
+                        return RecoveryResult(
+                            "failed", "grant consumption was refused",
+                        )
+                    receipt = response.get("result")
+                    self._validate_consume_receipt(task, grant, receipt)
+                    if state == "intent_prepared":
+                        record["consume_receipt"] = receipt; record["state"] = "consumed"
+                        _atomic_json(path, record)
+                    elif record.get("consume_receipt") != receipt:
+                        return RecoveryResult(
+                            "failed", "durable consume receipt mismatch",
+                        )
+                elif status.get("status") == "not_found":
+                    if state == "intent_prepared":
+                        record = self._consume(task, grant, path, record)
+                    else:
+                        return RecoveryResult(
+                            "failed", "authority does not recognise consume receipt",
+                        )
+                else:
+                    return RecoveryResult(
+                        "failed", "grant consumption was refused",
+                    )
+                self._validate_consume_receipt(
+                    task, grant, record.get("consume_receipt"),
+                )
+                self._launch(task, grant, path, record)
+                return RecoveryResult("recovered", "running")
+            except Exception as exc:
+                return RecoveryResult("failed", type(exc).__name__)
+        if state == "launching":
+            record["state"] = "unknown"; _atomic_json(path, record)
+            return RecoveryResult("ambiguous", "process launch outcome is unknown")
         receipt = self._receipt(record); state = self.status(receipt)
         if state.state == "unknown": return RecoveryResult("ambiguous", "external outcome is unknown; automatic retry is forbidden")
         return RecoveryResult("recovered", state.state)

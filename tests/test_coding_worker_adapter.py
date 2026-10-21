@@ -1,6 +1,7 @@
 import json
 import os
 import signal
+import stat
 import tempfile
 import time
 import unittest
@@ -20,10 +21,25 @@ from orchestra.contracts import (
 
 
 class MockAuthority:
-    def __init__(self, error=None): self.calls, self.error = [], error
+    def __init__(self, error=None):
+        self.calls, self.error, self.requests, self.receipts = [], error, {}, {}
     def validate_grant(self, task, grant, *, adapter_id, runtime):
         self.calls.append((task.digest, grant.grant_id, adapter_id, runtime))
         if self.error: raise self.error
+        return {"grant_id":grant.grant_id}
+    def consume_grant(self, task, grant, *, adapter_id, runtime, request_id=None):
+        if self.error: raise self.error
+        if grant.grant_id in self.requests.values(): raise GrantValidationError("grant_replay")
+        self.requests[request_id]=grant.grant_id
+        receipt={"grant_id":grant.grant_id,"attempt_id":grant.attempt_id,
+            "proposal_digest":task.digest,"consumed_at":datetime.now(timezone.utc).isoformat()}
+        self.receipts[request_id]=receipt
+        return receipt
+    def request_status(self, target_request_id, *, request_id=None):
+        grant_id=self.requests.get(target_request_id)
+        if grant_id is None: return {"status":"not_found","response":None}
+        return {"status":"succeeded","operation":"consume_grant",
+            "response":{"ok":True,"result":self.receipts[target_request_id]}}
 
 
 def task(*, instructions="Create a bounded disposable result.", seconds=5):
@@ -159,7 +175,9 @@ class CodingWorkerAdapterTests(unittest.TestCase):
         content="\n".join(path.read_text(errors="replace") for path in (self.root/issued.attempt_id).glob("*.json"))
         for secret_name in ("API_KEY","TOKEN","PASSWORD","credential_file","/etc/orchestra","/home/hamed"):
             self.assertNotIn(secret_name,content)
-        self.assertEqual(set(self.root.iterdir()),{self.root/issued.attempt_id})
+        lock=self.root/f".{issued.attempt_id}.lock"
+        self.assertEqual(set(self.root.iterdir()),{self.root/issued.attempt_id,lock})
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode),0o600)
         self.adapter.collect(receipt)
 
     def test_failure_produces_structured_untrusted_report(self):

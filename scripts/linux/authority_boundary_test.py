@@ -49,6 +49,7 @@ from orchestra.contracts import (  # noqa: E402
 
 BASE_COMMIT = "a" * 40
 ADAPTER = "fake-local-adapter"
+CODING_ADAPTER = "disposable-coding-worker"
 RUNTIME = "local_process"
 
 CLIENTS_GROUP = "orchestra-clients"
@@ -83,6 +84,8 @@ DB_PATH = STATE_DIR / "authority.sqlite3"
 SOCKET_PATH = RUNTIME_DIR / "authority.sock"
 LOCK_PATH = RUNTIME_DIR / "authority.lock"
 SERVICE_LOG = Path("/tmp/orchestra-authority-boundary.log")
+ADAPTER_INPUT_DIR = Path("/tmp/orchestra-authority-adapter-input")
+ADAPTER_STATE_DIR = Path("/tmp/orchestra-authority-adapter-state")
 PYTHON = sys.executable
 PASSED: list[str] = []
 
@@ -195,7 +198,10 @@ def copy_source() -> None:
 
 
 def setup_directories() -> None:
-    for path in (STATE_DIR, RUNTIME_DIR, CONFIG_DIR):
+    for path in (
+        STATE_DIR, RUNTIME_DIR, CONFIG_DIR, ADAPTER_INPUT_DIR,
+        ADAPTER_STATE_DIR,
+    ):
         if path.exists():
             shutil.rmtree(path)
     STATE_DIR.mkdir(mode=0o700, parents=True)
@@ -206,6 +212,9 @@ def setup_directories() -> None:
     os.chmod(STATE_DIR, 0o700)
     os.chmod(RUNTIME_DIR, 0o750)
     os.chmod(CONFIG_DIR, 0o755)
+    ADAPTER_INPUT_DIR.mkdir(mode=0o755)
+    ADAPTER_STATE_DIR.mkdir(mode=0o700)
+    os.chown(ADAPTER_STATE_DIR, COORDINATOR_UID, CLIENTS_GID)
 
 
 def make_task_object(task_id: str, request_id: str) -> TaskSpec:
@@ -234,6 +243,37 @@ def make_task_object(task_id: str, request_id: str) -> TaskSpec:
         approval_class="routine",
         consequence_class="routine_development",
         instructions=f"Disposable Linux boundary task {task_id}.",
+    )
+
+
+def make_coding_task_object(task_id: str, request_id: str) -> TaskSpec:
+    return TaskSpec(
+        task_id=task_id,
+        request_id=request_id,
+        repository="owner/linux-boundary",
+        base_commit=BASE_COMMIT,
+        agent_id="disposable-coding-agent",
+        model_provider="fake-provider",
+        model_id="fake-model",
+        coding_harness="disposable-harness",
+        permitted_runtimes=(RUNTIME,),
+        authorized_operations=(
+            "read_repository", "edit_workspace", "run_tests",
+        ),
+        file_scope=FileScope(read_paths=(".",), write_paths=("src",)),
+        network=NetworkPolicy("denied"),
+        isolation=IsolationRequirements(
+            filesystem="ephemeral_workspace",
+            credentials="broker_only",
+            git_metadata="read_only",
+            sandbox="ephemeral_runner",
+        ),
+        resource_limits=ResourceLimits(
+            max_runtime_seconds=30, max_output_bytes=4096,
+        ),
+        approval_class="routine",
+        consequence_class="routine_development",
+        instructions="Create the bounded disposable authority-adapter result.",
     )
 
 
@@ -301,6 +341,15 @@ def config_payload() -> dict:
         model_id=probe.model_id,
         coding_harness=probe.coding_harness,
     )
+    coding_probe = make_coding_task_object("coding-audience", "coding-audience")
+    coding_audience = ExecutionAudience(
+        adapter_id=CODING_ADAPTER,
+        runtime=RUNTIME,
+        agent_id=coding_probe.agent_id,
+        model_provider=coding_probe.model_provider,
+        model_id=coding_probe.model_id,
+        coding_harness=coding_probe.coding_harness,
+    )
     config = ServiceConfig(
         authority_id="authority:linux-boundary",
         service_uid=SERVICE_UID,
@@ -314,7 +363,7 @@ def config_payload() -> dict:
             PeerIdentity(WORKER_UID, "worker", "worker"),
             PeerIdentity(OPERATOR_UID, "operator", "operator"),
         ),
-        audiences=(audience,),
+        audiences=(audience, coding_audience),
         standing_authorizations=(),
         grant_ttl_seconds=120,
         approval_ttl_seconds=300,
@@ -415,6 +464,40 @@ def probe(uid: int, operation: str, payload: dict | None = None,
             f"probe uid={uid} op={operation} produced invalid JSON: {lines[-1]}"
         ) from None
     return response
+
+
+def adapter_probe(task: TaskSpec, grant: dict) -> dict:
+    task_path = ADAPTER_INPUT_DIR / "task.json"
+    grant_path = ADAPTER_INPUT_DIR / "grant.json"
+    task_path.write_text(json.dumps(task.to_dict(), sort_keys=True))
+    grant_path.write_text(json.dumps(grant, sort_keys=True))
+    os.chmod(task_path, 0o644)
+    os.chmod(grant_path, 0o644)
+    result = run_as_uid(
+        COORDINATOR_UID,
+        [
+            PYTHON,
+            str(INSTALL_DIR / "scripts" / "linux" / "authority_adapter_probe.py"),
+            "--socket", str(SOCKET_PATH),
+            "--state-root", str(ADAPTER_STATE_DIR),
+            "--task", str(task_path),
+            "--grant", str(grant_path),
+        ],
+        timeout=40,
+    )
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    if result.returncode != 0 or not lines:
+        raise BoundaryFailure(
+            "adapter probe failed: "
+            f"rc={result.returncode} stdout={result.stdout[-1000:]} "
+            f"stderr={result.stderr[-1000:]}"
+        )
+    try:
+        return json.loads(lines[-1])
+    except json.JSONDecodeError:
+        raise BoundaryFailure(
+            f"adapter probe produced invalid JSON: {lines[-1]}"
+        ) from None
 
 
 def expect_ok(response: dict, name: str):
@@ -867,6 +950,114 @@ def run_boundary_checks() -> None:
             "coordinator can read the final verified attempt",
         )
         check("verified attempt is durable", final_b["verified"] is True)
+
+        # -- Phase 3C authority-to-adapter execution ---------------------
+        coding_task = make_coding_task_object("task-coding", "request-coding")
+        coding_payload = coding_task.to_dict()
+        coding_proposal = expect_ok(
+            probe(
+                COORDINATOR_UID, "propose", {"task": coding_payload},
+                "coding-propose",
+            ),
+            "coding proposal registered by the coordinator uid",
+        )
+        expect_ok(
+            probe(
+                APPROVER_UID, "decide_approval",
+                {"proposal_digest": coding_proposal["proposal_digest"],
+                 "decision": "approved"},
+                "coding-approve",
+            ),
+            "coding proposal approved by the separate approver uid",
+        )
+        coding_issued = expect_ok(
+            probe(
+                COORDINATOR_UID, "request_execution",
+                {"task": coding_payload, "adapter_id": CODING_ADAPTER,
+                 "runtime": RUNTIME, "idempotency_key": "coding-execution"},
+                "coding-issue",
+            ),
+            "authority issues the disposable adapter grant",
+        )
+        coding_result = adapter_probe(coding_task, coding_issued["grant"])
+        coding_receipt = coding_result["receipt"]
+        coding_report = coding_result["report"]
+        check(
+            "coordinator uid consumes before disposable process completion",
+            coding_result["status"]["state"] == "succeeded"
+            and coding_receipt["attempt_id"]
+            == coding_issued["attempt"]["attempt_id"],
+            json.dumps(coding_result, sort_keys=True)[:1200],
+        )
+        coding_job = ADAPTER_STATE_DIR / coding_receipt["attempt_id"] / "job.json"
+        coding_job_data = json.loads(coding_job.read_text())
+        check(
+            "adapter persists the consumed receipt and execution intent",
+            coding_job_data["consume_receipt"]["grant_id"]
+            == coding_issued["grant"]["grant_id"]
+            and coding_job_data["consume_receipt"]["consumed_at"] is not None,
+            json.dumps(coding_job_data, sort_keys=True)[:1000],
+        )
+        check(
+            "adapter state remains owned by the unprivileged coordinator uid",
+            coding_job.stat().st_uid == COORDINATOR_UID
+            and stat.S_IMODE(coding_job.stat().st_mode) == 0o600,
+            f"uid={coding_job.stat().st_uid} "
+            f"mode={oct(stat.S_IMODE(coding_job.stat().st_mode))}",
+        )
+        expect_ok(
+            probe(
+                WORKER_UID, "record_dispatch",
+                {"attempt_id": coding_receipt["attempt_id"],
+                 "provider_run_id": coding_receipt["provider_run_id"],
+                 "adapter_id": CODING_ADAPTER, "runtime": RUNTIME},
+                "coding-dispatch",
+            ),
+            "separate worker uid records the disposable process identity",
+        )
+        coding_recorded = expect_ok(
+            probe(
+                WORKER_UID, "record_report", {"report": coding_report},
+                "coding-report",
+            ),
+            "separate worker uid records the adapter report",
+        )
+        check(
+            "successful adapter exit remains independently unverified",
+            coding_recorded["state"] == "reported"
+            and coding_recorded["verified"] is False
+            and coding_result["completion_verified"] is False,
+            json.dumps(coding_recorded, sort_keys=True),
+        )
+        coding_artifact = coding_report["artifacts"][0]
+        coding_verification = VerificationRecord(
+            verification_id="verification-task-coding",
+            task_id=coding_task.task_id,
+            proposal_digest=coding_task.digest,
+            attempt_id=coding_receipt["attempt_id"],
+            verifier_id=f"uid:{VERIFIER_UID}",
+            method="independent-artifact-binding",
+            evidence_checked=(EvidenceReference(
+                "artifact", coding_artifact["uri"], coding_artifact["sha256"],
+            ),),
+            outcomes=(ValidationOutcome(
+                "disposable artifact digest independently accepted", "pass",
+            ),),
+            status="pass",
+            verified_at="2026-10-21T00:00:06+00:00",
+        ).to_dict()
+        coding_verified = expect_ok(
+            probe(
+                VERIFIER_UID, "record_verification",
+                {"verification": coding_verification}, "coding-verify",
+            ),
+            "separate verifier uid records independent verification",
+        )
+        check(
+            "authority verifies only after the independent verifier decision",
+            coding_verified["final_state"] == "verified",
+            json.dumps(coding_verified, sort_keys=True),
+        )
 
         # -- interrupted request recovery ---------------------------------
         task_c = make_task_object("task-c", "request-c")
