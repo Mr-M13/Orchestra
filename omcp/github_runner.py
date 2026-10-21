@@ -1,13 +1,14 @@
 """Detached runner for one GitHub Actions worker task.
 
 The coordinator starts this process in a new session, exactly like local worker
-runners.  It publishes a startup lease, dispatches or adopts one deterministic
-workflow run, persists remote identity before polling, downloads a bounded
+runners.  It publishes a startup lease, dispatches one authenticated workflow
+run or resumes its persisted returned run ID, downloads a bounded
 artifact and records a completion file even on cancellation or failure.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -19,7 +20,7 @@ from typing import Any
 
 from omcp.github_actions import (
     DispatchIdentity, GitHubActionsError, RunState,
-    load_or_create_dispatch_identity, write_state,
+    encode_instructions, load_or_create_dispatch_identity, write_state,
 )
 from omcp.github_dispatch_service import DispatchClient
 from omcp.runner import (
@@ -127,15 +128,28 @@ def run(spec_path: Path) -> int:
             Path(str(spec["github_dispatch_socket"])),
             int(spec["github_service_uid"]),
         )
+        if _cancelled(task_dir) and not state_path.exists():
+            exit_code, error_type = 130, "Cancelled"
+            return exit_code
         request_id = str(spec.get("request_id", task_id))
         source_sha = str(spec["source_sha"])
+        agent = str(spec["agent"])
+        model = str(spec["model"])
+        instructions = prompt.read_text(encoding="utf-8")
+        encoded = encode_instructions(instructions)
+        payload_sha256 = hashlib.sha256(encoded.encode("ascii")).hexdigest()
         identity, resumed = load_or_create_dispatch_identity(
             state_path, task_id, request_id, source_sha,
+            agent, model, payload_sha256,
         )
-        # A restart may adopt only the exact pre-persisted nonce, dispatch time,
-        # configured ref, workflow SHA and source SHA. If it is not visible,
-        # fail closed rather than dispatching a possible duplicate.
-        run_state = client.find_run(identity)
+        persisted = json.loads(state_path.read_text(encoding="utf-8"))
+        persisted_run_id = persisted.get("run_id") if isinstance(persisted, dict) else None
+        if isinstance(persisted_run_id, int) and not isinstance(persisted_run_id, bool):
+            if persisted.get("phase") != "adopted":
+                raise ValueError("GitHub run ID is not in adopted state")
+            run_state = client.status(persisted_run_id, identity)
+        elif persisted.get("phase") != "prepared":
+            raise ValueError("GitHub dispatch state has no authenticated run ID")
         if _cancelled(task_dir):
             # A queued runner can start after the coordinator has already
             # recorded cancellation.  Adopt and cancel an existing run, but do
@@ -152,11 +166,7 @@ def run(spec_path: Path) -> int:
             if _cancelled(task_dir):
                 exit_code, error_type = 130, "Cancelled"
                 return exit_code
-            client.dispatch(
-                identity, str(spec["agent"]), str(spec["model"]),
-                prompt.read_text(encoding="utf-8"),
-            )
-            run_state = client.wait_for_run(identity)
+            run_state = client.dispatch(identity, agent, model, instructions)
         write_state(state_path, run_state, identity)
         started = time.monotonic()
         while True:
@@ -240,11 +250,6 @@ def _cancel_quietly(client: DispatchClient | None,
     if client is None or identity is None:
         return
     try:
-        if run_state is None:
-            # SIGTERM can arrive after dispatch but before the run ID was
-            # persisted.  Adopt the deterministic run and cancel it rather than
-            # leaving an orphan executing in GitHub.
-            run_state = client.find_run(identity)
         if run_state is None:
             return
         client.cancel(run_state.run_id, identity)

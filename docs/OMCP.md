@@ -125,11 +125,14 @@ agent on an ephemeral `ubuntu-latest` runner and uploads a bounded artifact name
 paths and oversized files, verifies that `patch.diff` applies, and records the
 result. Nothing is pushed or merged by the workflow.
 
-The runner uses the deterministic workflow run name `Orchestra <task_id>` to
-adopt an existing run after a crash instead of dispatching twice. It persists the
-run ID before polling. Cancellation writes a durable request, signals the local
-runner and asks GitHub to cancel the exact run. An orphaned run whose runner has
-disappeared is cancelled during reconciliation when its run ID is known.
+The broker requests authenticated run details from the dispatch API and the
+runner persists GitHub's returned run ID before polling. Recovery, cancellation,
+status and artifact retrieval use only that persisted ID; a prepared state with
+no returned ID fails closed and never discovers a run by its caller-reproducible
+title. The immutable local identity also binds request ID, source SHA, agent,
+model and the exact encoded-payload digest. The broker requires the run's actor
+and triggering actor to match its owner-only `dispatch_actor`, rejects reruns,
+and verifies the artifact summary against the same identity.
 
 The workflow needs an `orchestra-workers` environment containing
 `OPENAI_API_KEY` and/or `DEEPSEEK_API_KEY`; do not add tunnel, approval or GitHub

@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import os
 import signal
@@ -207,6 +208,9 @@ class GitHubActionsClientTests(unittest.TestCase):
             "22222222-2222-4222-8222-222222222222",
             "2026-10-20T00:00:00+00:00",
             WORKFLOW_SHA,
+            "deepseek", "deepseek-chat", hashlib.sha256(
+                encode_instructions("Implement the task").encode("ascii")
+            ).hexdigest(),
         )
 
     def tearDown(self):
@@ -238,8 +242,22 @@ class GitHubActionsClientTests(unittest.TestCase):
                     }],
                     "deployment_branch_policy": {"protected_branches": True},
                 }).encode(),
-                b"{}",
+                json.dumps({
+                    "workflow_run_id": 7,
+                    "run_url": "https://api.github.com/repos/owner/repo/actions/runs/7",
+                    "html_url": "https://github.com/owner/repo/actions/runs/7",
+                }).encode(),
+                json.dumps({
+                    "id": 7, "display_title": self.identity.run_name,
+                    "event": "workflow_dispatch", "head_sha": WORKFLOW_SHA,
+                    "head_branch": "main", "created_at": "2026-10-20T00:00:01Z",
+                    "path": ".github/workflows/orchestra-worker.yml@main",
+                    "run_attempt": 1, "actor": {"login": "orchestra-bot"},
+                    "triggering_actor": {"login": "orchestra-bot"},
+                    "status": "queued", "html_url": "https://example/run",
+                }).encode(),
             ]),
+            dispatch_actor="orchestra-bot",
         )
         client.dispatch(
             self.identity, "deepseek", "deepseek-chat", "Implement the task",
@@ -258,25 +276,11 @@ class GitHubActionsClientTests(unittest.TestCase):
         self.assertEqual(body["ref"], "main")
         self.assertEqual(body["inputs"]["workflow_sha"], WORKFLOW_SHA)
         self.assertEqual(body["inputs"]["source_sha"], WORKFLOW_SHA)
+        self.assertEqual(body["inputs"]["dispatch_binding"], self.identity.binding_sha256)
+        self.assertTrue(body["return_run_details"])
+        self.assertEqual(body["inputs"]["payload_sha256"], self.identity.payload_sha256)
         self.assertEqual(decode_instructions(body["inputs"]["payload"]), "Implement the task")
         self.assertNotIn(b"secret-token-value", request.data)
-
-    def test_run_discovery_uses_the_deterministic_run_name(self):
-        payload = json.dumps({"workflow_runs": [
-            {"id": 1, "display_title": "Other", "status": "completed"},
-            {"id": 2, "display_title": self.identity.run_name,
-             "event": "workflow_dispatch", "head_sha": WORKFLOW_SHA,
-             "head_branch": "main", "created_at": "2026-10-20T00:00:01Z",
-             "status": "queued", "html_url": "https://example/run"},
-        ]}).encode()
-        client = GitHubActionsClient(
-            "owner/repo", "orchestra-worker.yml", "main", WORKFLOW_SHA, self.token,
-            opener=self.opener([payload]),
-        )
-        found = client.find_run(self.identity)
-        self.assertIsNotNone(found)
-        self.assertEqual(found.run_id, 2)
-        self.assertEqual(found.status, "queued")
 
     def test_oversized_payload_fails_before_dispatch(self):
         client = GitHubActionsClient(
@@ -285,7 +289,7 @@ class GitHubActionsClientTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "too large"):
             client.dispatch(
-                self.identity, "codex", "gpt-5-codex",
+                self.identity, "deepseek", "deepseek-chat",
                 base64.b64encode(os.urandom(60_000)).decode("ascii"),
             )
         self.assertEqual(self.requests, [])
@@ -296,12 +300,17 @@ class GitHubActionsClientTests(unittest.TestCase):
         task = Path(self.temp.name) / "task"
         task.mkdir()
         (task / "github-state.json").write_text(json.dumps({
+            "schema_version": 4,
+            "phase": "adopted",
             "run_id": 41,
             "task_id": self.identity.task_id,
             "request_id": self.identity.request_id,
             "dispatch_id": self.identity.dispatch_id,
             "dispatched_at": self.identity.dispatched_at,
             "source_sha": self.identity.source_sha,
+            "agent": self.identity.agent,
+            "model": self.identity.model,
+            "payload_sha256": self.identity.payload_sha256,
         }))
         (task / "github-actions.json").write_text(json.dumps({
             "github_service_uid": os.geteuid() + 1,
@@ -335,6 +344,54 @@ class GitHubActionsClientTests(unittest.TestCase):
 
 
 class GitHubControllerTests(unittest.TestCase):
+    def test_restart_blocks_rollout_when_legacy_run_cannot_be_drained(self):
+        with tempfile.TemporaryDirectory() as directory:
+            task_id = "11111111-1111-1111-1111-111111111111"
+            base = Path(directory)
+            root = base / "project"
+            root.mkdir()
+            state_dir = base / "state"
+            task_dir = state_dir / "tasks" / task_id
+            task_dir.mkdir(parents=True)
+            task = {
+                "task_id": task_id, "request_id": "legacy-request",
+                "title": "Legacy remote task", "instructions": "old",
+                "worker": "actions", "status": "cancelled",
+                "created_at": "2026-10-20T00:00:00+00:00",
+                "repository": "owner/repo", "repository_profile": "default",
+                "resource_requirements": {
+                    "worker": "actions", "repository": "owner/repo",
+                    "access": "write",
+                },
+            }
+            (state_dir / "state.json").write_text(json.dumps({
+                "schema_version": 1, "tasks": {task_id: task},
+                "requests": {"legacy-request": task_id},
+            }))
+            (task_dir / "github-state.json").write_text(json.dumps({
+                "schema_version": 2, "phase": "adopted", "run_id": 41,
+                "task_id": task_id, "request_id": "legacy-request",
+                "dispatch_id": "22222222-2222-4222-8222-222222222222",
+                "dispatched_at": "2026-10-20T00:00:00+00:00",
+            }))
+            (task_dir / "github-actions.json").write_text("{}")
+            config = Config(
+                "owner/repo", root, state_dir, "origin/main",
+                {"actions": Worker(
+                    "actions", (), adapter="github_actions", agent="codex",
+                    github_service_uid=os.geteuid() + 1,
+                    github_dispatch_socket=str(base / "dispatch.sock"),
+                )},
+                Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+            )
+            with patch(
+                "omcp.github_actions.drain_legacy_task_run",
+                side_effect=GitHubActionsError("broker unavailable"),
+            ), self.assertRaisesRegex(RuntimeError, "must be drained"):
+                TaskController(config)
+            audit = (state_dir / "audit.jsonl").read_text()
+            self.assertIn('"outcome":"blocked"', audit)
+
     def test_controller_dispatches_actions_worker_without_exposing_token(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
@@ -453,7 +510,9 @@ class GitHubRunnerTests(unittest.TestCase):
                 "@@ -1 +1 @@\n-before\n+after\n"
             ).encode()
             fake = Mock()
-            fake.find_run.return_value = Mock(run_id=7, status="queued", conclusion=None, url="u")
+            fake.dispatch.return_value = Mock(
+                run_id=7, status="queued", conclusion=None, url="u",
+            )
             fake.status.side_effect = [Mock(run_id=7, status="completed", conclusion="success", url="u")]
             fake.download_artifact.return_value = {
                 "result.txt": b"remote result\n", "patch.diff": patch_text,

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import os
 import re
@@ -185,6 +186,7 @@ def main() -> int:
     agent = os.environ.get("ORCHESTRA_AGENT", "")
     model = os.environ.get("ORCHESTRA_MODEL", "")
     payload = os.environ.get("ORCHESTRA_PAYLOAD", "")
+    payload_sha256 = os.environ.get("ORCHESTRA_PAYLOAD_SHA256", "")
     output_raw = os.environ.get("ORCHESTRA_OUTPUT_DIR", "")
     runtime_raw = os.environ.get("ORCHESTRA_RUNTIME_DIR", "")
     if not re.fullmatch(
@@ -211,6 +213,9 @@ def main() -> int:
         fail("unsupported agent")
     if not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,128}", model):
         fail("unsupported model")
+    if (not re.fullmatch(r"[0-9a-f]{64}", payload_sha256)
+            or hashlib.sha256(payload.encode("ascii")).hexdigest() != payload_sha256):
+        fail("payload identity mismatch")
     if not output_raw:
         fail("missing output directory")
     output = Path(output_raw)
@@ -313,7 +318,9 @@ def main() -> int:
     write_text(output / "summary.json", json.dumps({
         "task_id": task_id, "request_id": request_id, "agent": agent,
         "dispatch_id": dispatch_id, "dispatched_at": dispatched_at,
-        "model": model, "exit_code": completed.returncode,
+        "source_sha": os.environ.get("ORCHESTRA_SOURCE_SHA", ""),
+        "model": model, "payload_sha256": payload_sha256,
+        "exit_code": completed.returncode,
     }, sort_keys=True) + "\n")
     return completed.returncode
 

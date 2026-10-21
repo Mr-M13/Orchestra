@@ -633,6 +633,19 @@ class TaskController:
         self.started_at = utc_now()
         self._last_heartbeat = 0.0
         self.state = self._load()
+        try:
+            self._drain_legacy_github_runs()
+        except Exception as exc:
+            # Do not start reconciliation or scheduling while a schema-v2 run
+            # may still be executing remotely.  Only the safe exception type is
+            # retained; task content and broker diagnostics are not logged.
+            self._audit("service.migrate.github_legacy", None, "blocked", {
+                "error_type": type(exc).__name__,
+            })
+            self.lock_file.close()
+            raise RuntimeError(
+                "legacy GitHub Actions runs must be drained before startup"
+            ) from None
         self._save()
         self._audit("service.start", None, "allowed", {"authentication": config.principal.authentication})
         self.reconcile()
@@ -708,6 +721,37 @@ class TaskController:
 
     def _save(self) -> None:
         _atomic_json(self.state_path, self.state)
+
+    def _drain_legacy_github_runs(self) -> None:
+        """Migrate every persisted schema-v2 remote run before startup."""
+        from omcp.github_actions import drain_legacy_task_run
+
+        tasks_root = self.config.state_dir / "tasks"
+        for task_id in sorted(self.state["tasks"]):
+            task_dir = tasks_root / task_id
+            state_path = task_dir / "github-state.json"
+            spec_path = task_dir / "github-actions.json"
+            if not state_path.exists():
+                continue
+            try:
+                remote = json.loads(state_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise RuntimeError("GitHub Actions state is unreadable") from exc
+            if not isinstance(remote, dict):
+                raise RuntimeError("GitHub Actions state is invalid")
+            schema_version = remote.get("schema_version")
+            if schema_version == 4:
+                continue
+            if schema_version != 2:
+                raise RuntimeError("GitHub Actions state schema is unsupported")
+            # A legacy state record without its fixed runner spec cannot be
+            # safely routed to the credential broker for draining.
+            if not spec_path.is_file():
+                raise RuntimeError("legacy GitHub Actions state has no runner spec")
+            result = drain_legacy_task_run(task_dir)
+            self._audit("service.migrate.github_legacy", task_id, "allowed", {
+                "run_id": result["run_id"], "outcome": result["outcome"],
+            })
 
     def _audit(self, action: str, task_id: str | None, outcome: str, details: dict[str, Any]) -> None:
         entry = {
