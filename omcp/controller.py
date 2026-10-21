@@ -610,7 +610,7 @@ class TaskController:
         self,
         config: Config,
         popen: Callable[..., Any] = subprocess.Popen,
-        workspace_preparer: Callable[[str, str], Path] | None = None,
+        workspace_preparer: Callable[[str, str, RepositoryProfile, bool], Path] | None = None,
         host_workspace_preparer: Callable[[str, RepositoryProfile, str], Path] | None = None,
         id_factory: Callable[[], str] | None = None,
     ):
@@ -1539,8 +1539,15 @@ class TaskController:
         task.update({"branch": branch})
         self._save()
         try:
-            workspace = self.workspace_preparer(task_id, branch, profile)
             worker = self.config.workers[task["worker"]]
+            # GitHub Actions checks out the exact source SHA remotely.  Its local
+            # worktree is prepared from the owner-synchronised tracking ref so
+            # the coordinator never needs the broker's private GitHub token.
+            # Local workers still refresh their base ref before creating a
+            # worktree because they execute from that checkout directly.
+            workspace = self.workspace_preparer(
+                task_id, branch, profile, worker.adapter != "github_actions",
+            )
             source_sha: str | None = None
             if worker.adapter == "github_actions":
                 source_code, source_sha = self._git(
@@ -1781,12 +1788,19 @@ class TaskController:
             raise ValueError("target_commit is not an exact local commit in the configured repository")
         return resolved
 
-    def _prepare_workspace(self, task_id: str, branch: str, profile: RepositoryProfile) -> Path:
+    def _prepare_workspace(
+        self, task_id: str, branch: str, profile: RepositoryProfile,
+        refresh_base_ref: bool = True,
+    ) -> Path:
         workspace = self.config.state_dir / "worktrees" / profile.profile_id / task_id
         if workspace.exists():
             raise RuntimeError("task workspace already exists")
         self._verify_profile_origin(profile)
-        self._git(profile.project_root, "fetch", "--no-tags", "origin", profile.base_ref.split("/", 1)[1])
+        if refresh_base_ref:
+            self._git(
+                profile.project_root, "fetch", "--no-tags", "origin",
+                profile.base_ref.split("/", 1)[1],
+            )
         exists, _ = self._git(profile.project_root, "show-ref", "--verify", "--quiet",
                               "refs/heads/" + branch, allow_failure=True)
         if exists != 1:
