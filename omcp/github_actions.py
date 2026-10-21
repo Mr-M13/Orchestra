@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import io
 import json
 import os
@@ -41,6 +42,7 @@ RUN_NAME_PREFIX = "Orchestra "
 WORKER_ENVIRONMENT = "orchestra-workers"
 RUN_CREATION_SKEW = timedelta(seconds=30)
 RUN_CREATION_WINDOW = timedelta(minutes=15)
+GITHUB_API_VERSION = "2026-03-10"
 
 
 class GitHubActionsError(RuntimeError):
@@ -230,60 +232,122 @@ class DispatchIdentity:
     dispatch_id: str
     dispatched_at: str
     source_sha: str
+    agent: str
+    model: str
+    payload_sha256: str
 
     @property
     def run_name(self) -> str:
         return (
             RUN_NAME_PREFIX + self.task_id + " " + self.dispatch_id
-            + " " + self.source_sha
+            + " " + self.binding_sha256
         )
 
+    @property
+    def binding_sha256(self) -> str:
+        fields = (
+            self.task_id, self.request_id, self.dispatch_id, self.dispatched_at,
+            self.source_sha, self.agent, self.model, self.payload_sha256,
+        )
+        return hashlib.sha256("\0".join(fields).encode("utf-8")).hexdigest()
 
-def _validate_dispatch_identity(identity: DispatchIdentity) -> DispatchIdentity:
+
+@dataclass(frozen=True)
+class LegacyDispatchIdentity:
+    """Exact cancellation identity persisted by schema v2."""
+
+    task_id: str
+    request_id: str
+    dispatch_id: str
+    dispatched_at: str
+
+    @property
+    def run_name(self) -> str:
+        return RUN_NAME_PREFIX + self.task_id + " " + self.dispatch_id
+
+
+def _validate_identity_fields(
+    task_id: str, request_id: str, dispatch_id: str, dispatched_at: str,
+) -> None:
     if not re.fullmatch(
         r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-        identity.task_id,
+        task_id,
     ):
         raise ValueError("invalid task_id for GitHub dispatch")
-    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", identity.request_id):
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id):
         raise ValueError("invalid request_id for GitHub dispatch")
     if not re.fullmatch(
         r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
-        identity.dispatch_id,
+        dispatch_id,
     ):
         raise ValueError("invalid GitHub dispatch identity")
-    _parse_utc(identity.dispatched_at)
+    _parse_utc(dispatched_at)
+
+
+def _validate_legacy_dispatch_identity(
+    identity: LegacyDispatchIdentity,
+) -> LegacyDispatchIdentity:
+    _validate_identity_fields(
+        identity.task_id, identity.request_id, identity.dispatch_id,
+        identity.dispatched_at,
+    )
+    return identity
+
+
+def _validate_dispatch_identity(identity: DispatchIdentity) -> DispatchIdentity:
+    _validate_identity_fields(
+        identity.task_id, identity.request_id, identity.dispatch_id,
+        identity.dispatched_at,
+    )
     if not re.fullmatch(r"[0-9a-f]{40}", identity.source_sha):
         raise ValueError("invalid GitHub source SHA")
+    if identity.agent not in {"codex", "deepseek"}:
+        raise ValueError("unsupported GitHub Actions agent")
+    if not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,128}", identity.model):
+        raise ValueError("unsupported GitHub Actions model")
+    if not re.fullmatch(r"[0-9a-f]{64}", identity.payload_sha256):
+        raise ValueError("invalid GitHub Actions payload digest")
     return identity
 
 
 def load_or_create_dispatch_identity(
     path: Path, task_id: str, request_id: str, source_sha: str,
+    agent: str, model: str, payload_sha256: str,
 ) -> tuple[DispatchIdentity, bool]:
     """Persist identity and dispatch time before any remote side effect."""
     if path.exists():
         value = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(value, dict):
             raise ValueError("invalid GitHub dispatch state")
+        if value.get("schema_version") != 4 or value.get("phase") not in {
+            "prepared", "adopted",
+        }:
+            raise ValueError("unsupported GitHub dispatch state")
         identity = DispatchIdentity(
             str(value.get("task_id", "")), str(value.get("request_id", "")),
             str(value.get("dispatch_id", "")), str(value.get("dispatched_at", "")),
             str(value.get("source_sha", "")),
+            str(value.get("agent", "")), str(value.get("model", "")),
+            str(value.get("payload_sha256", "")),
         )
         _validate_dispatch_identity(identity)
         if (identity.task_id != task_id or identity.request_id != request_id
-                or identity.source_sha != source_sha):
+                or identity.source_sha != source_sha or identity.agent != agent
+                or identity.model != model
+                or identity.payload_sha256 != payload_sha256):
             raise ValueError("GitHub dispatch state does not match this task")
         return identity, True
     identity = _validate_dispatch_identity(DispatchIdentity(
         task_id, request_id, str(uuid4()), utc_now(), source_sha,
+        agent, model, payload_sha256,
     ))
     _atomic_json(path, {
-        "schema_version": 3, "phase": "prepared",
+        "schema_version": 4, "phase": "prepared",
         "task_id": identity.task_id, "request_id": identity.request_id,
         "dispatch_id": identity.dispatch_id, "dispatched_at": identity.dispatched_at,
         "source_sha": identity.source_sha,
+        "agent": identity.agent, "model": identity.model,
+        "payload_sha256": identity.payload_sha256,
     })
     return identity, False
 
@@ -299,6 +363,7 @@ class GitHubActionsClient:
         head_sha: str,
         credential_file: Path,
         service_uid: int | None = None,
+        dispatch_actor: str | None = None,
         api_url: str = DEFAULT_API_URL,
         opener: Callable[..., Any] | None = None,
         sleep: Callable[[float], None] = time.sleep,
@@ -328,6 +393,11 @@ class GitHubActionsClient:
             raise ValueError("GitHub API URL must use HTTPS")
         self.credential_file = Path(credential_file)
         self.service_uid = os.geteuid() if service_uid is None else service_uid
+        if dispatch_actor is not None and not re.fullmatch(
+            r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\[bot\])?", dispatch_actor,
+        ):
+            raise ValueError("GitHub dispatch actor is invalid")
+        self.dispatch_actor = dispatch_actor
         ensure_service_credential(self.credential_file, self.service_uid)
         self._opener = opener or urllib.request.build_opener(
             _SafeRedirectHandler(),
@@ -352,7 +422,7 @@ class GitHubActionsClient:
         headers = {
             "Authorization": "Bearer " + self._credential(),
             "Accept": accept,
-            "X-GitHub-Api-Version": "2022-11-28",
+            "X-GitHub-Api-Version": GITHUB_API_VERSION,
             "User-Agent": "orchestra-omcp",
         }
         if payload is not None:
@@ -386,7 +456,7 @@ class GitHubActionsClient:
         return f"/repos/{self.repository}/actions/workflows/{workflow}"
 
     def dispatch(self, identity: DispatchIdentity, agent: str, model: str,
-                 instructions: str) -> str:
+                 instructions: str) -> RunState:
         """Verify the protected ref, then dispatch one SHA-bound workflow run.
 
         The workflow performs the same SHA comparison in a credential-free job
@@ -395,17 +465,16 @@ class GitHubActionsClient:
         and GitHub accepting the dispatch.
         """
         _validate_dispatch_identity(identity)
-        if agent not in {"codex", "deepseek"}:
-            raise ValueError("unsupported GitHub Actions agent")
-        if not isinstance(model, str) or not re.fullmatch(
-            r"[A-Za-z0-9_.:/-]{1,128}", model,
-        ):
-            raise ValueError("unsupported GitHub Actions model")
+        if agent != identity.agent or model != identity.model:
+            raise ValueError("GitHub dispatch parameters do not match identity")
         encoded = encode_instructions(instructions)
+        if hashlib.sha256(encoded.encode("ascii")).hexdigest() != identity.payload_sha256:
+            raise ValueError("GitHub dispatch payload does not match identity")
         self._verify_protected_ref(identity.source_sha)
         self._verify_secret_environment()
-        self._request("POST", self._workflow_path + "/dispatches", {
+        result = self._request("POST", self._workflow_path + "/dispatches", {
             "ref": self.ref,
+            "return_run_details": True,
             "inputs": {
                 "task_id": identity.task_id,
                 "request_id": identity.request_id,
@@ -415,10 +484,20 @@ class GitHubActionsClient:
                 "model": model,
                 "workflow_sha": self.head_sha,
                 "source_sha": identity.source_sha,
+                "dispatch_binding": identity.binding_sha256,
+                "payload_sha256": identity.payload_sha256,
                 "payload": encoded,
             },
         })
-        return encoded
+        run_id = result.get("workflow_run_id") if isinstance(result, dict) else None
+        expected_url = (
+            f"{self.api_url}/repos/{self.repository}/actions/runs/{run_id}"
+            if isinstance(run_id, int) and not isinstance(run_id, bool) else None
+        )
+        if (not isinstance(run_id, int) or isinstance(run_id, bool) or run_id <= 0
+                or result.get("run_url") != expected_url):
+            raise GitHubActionsError("GitHub dispatch did not return a valid run identity")
+        return self.status(run_id, identity)
 
     def _verify_protected_ref(self, source_sha: str) -> None:
         """Fail closed unless the configured branch is protected at its exact SHA."""
@@ -467,21 +546,43 @@ class GitHubActionsClient:
                 "GitHub worker environment does not enforce protected-branch review"
             )
 
-    def _run_state(self, run: object, identity: DispatchIdentity) -> RunState | None:
+    def _run_state_for_name(
+        self, run: object, run_name: str, dispatched_at: str,
+        *, require_current_head: bool, require_first_attempt: bool,
+    ) -> RunState | None:
         if not isinstance(run, dict):
             return None
-        if (run.get("display_title") != identity.run_name
-                or run.get("event") != "workflow_dispatch"
-                or str(run.get("head_sha", "")).lower() != self.head_sha):
+        if (run.get("display_title") != run_name
+                or run.get("event") != "workflow_dispatch"):
+            return None
+        head_sha = str(run.get("head_sha", "")).lower()
+        if (not re.fullmatch(r"[0-9a-f]{40}", head_sha)
+                or require_current_head and head_sha != self.head_sha
+                or require_first_attempt and run.get("run_attempt") != 1):
             return None
         ref_name = self.ref.removeprefix("refs/heads/").removeprefix("refs/tags/")
         if run.get("head_branch") != ref_name:
+            return None
+        workflow_path = str(run.get("path", ""))
+        expected_path = f".github/workflows/{self.workflow}"
+        if workflow_path not in {
+            f"{expected_path}@{self.ref}",
+            f"{expected_path}@refs/heads/{self.ref}",
+        }:
+            return None
+        actor = run.get("actor")
+        triggering_actor = run.get("triggering_actor")
+        if (self.dispatch_actor is None
+                or not isinstance(actor, dict) or not isinstance(triggering_actor, dict)
+                or str(actor.get("login", "")).lower() != self.dispatch_actor.lower()
+                or str(triggering_actor.get("login", "")).lower()
+                != self.dispatch_actor.lower()):
             return None
         try:
             created = _parse_utc(str(run.get("created_at", "")))
         except ValueError:
             return None
-        dispatched = _parse_utc(identity.dispatched_at)
+        dispatched = _parse_utc(dispatched_at)
         if not dispatched - RUN_CREATION_SKEW <= created <= dispatched + RUN_CREATION_WINDOW:
             return None
         run_id = run.get("id")
@@ -495,32 +596,23 @@ class GitHubActionsClient:
             url if isinstance(url, str) or url is None else None,
         )
 
-    def find_run(self, identity: DispatchIdentity) -> RunState | None:
-        """Find only the exact ref/SHA/time-bound dispatch instance."""
-        _validate_dispatch_identity(identity)
-        query = urllib.parse.urlencode({
-            "event": "workflow_dispatch", "branch": self.ref, "per_page": 100,
-        })
-        result = self._request(
-            "GET", self._workflow_path + "/runs?" + query,
+    def _run_state(self, run: object, identity: DispatchIdentity) -> RunState | None:
+        return self._run_state_for_name(
+            run, identity.run_name, identity.dispatched_at,
+            require_current_head=True, require_first_attempt=True,
         )
-        runs = result.get("workflow_runs") if isinstance(result, dict) else None
-        if not isinstance(runs, list):
-            return None
-        for run in runs:
-            state = self._run_state(run, identity)
-            if state is not None:
-                return state
-        return None
 
-    def wait_for_run(self, identity: DispatchIdentity, seconds: int = 90) -> RunState:
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
-            found = self.find_run(identity)
-            if found is not None:
-                return found
-            self.sleep(3)
-        raise GitHubActionsError("GitHub Actions run was not created")
+    def _legacy_run_state(
+        self, run: object, identity: LegacyDispatchIdentity,
+    ) -> RunState | None:
+        # Legacy state predates the source/payload binding, so this verifier is
+        # available only to the cancellation drain. The exact random dispatch
+        # identity, trusted actor, configured workflow/ref and creation window
+        # still have to match; a changed workflow SHA is expected during rollout.
+        return self._run_state_for_name(
+            run, identity.run_name, identity.dispatched_at,
+            require_current_head=False, require_first_attempt=False,
+        )
 
     def status(self, run_id: int, identity: DispatchIdentity) -> RunState:
         result = self._request(
@@ -536,6 +628,41 @@ class GitHubActionsClient:
         self._request(
             "POST", f"/repos/{self.repository}/actions/runs/{int(run_id)}/cancel",
         )
+
+    def drain_legacy(
+        self, identity: LegacyDispatchIdentity, run_id: int | None,
+    ) -> RunState:
+        """Cancel one exact schema-v2 run, or prove it is terminal."""
+        _validate_legacy_dispatch_identity(identity)
+        if run_id is None:
+            query = urllib.parse.urlencode({
+                "event": "workflow_dispatch", "branch": self.ref, "per_page": 100,
+            })
+            result = self._request(
+                "GET", self._workflow_path + "/runs?" + query,
+            )
+            runs = result.get("workflow_runs") if isinstance(result, dict) else None
+            state = next(
+                (candidate for item in runs or []
+                 if (candidate := self._legacy_run_state(item, identity)) is not None),
+                None,
+            )
+            if state is None:
+                raise GitHubActionsError("legacy GitHub Actions run is not drainable")
+        else:
+            if not isinstance(run_id, int) or isinstance(run_id, bool) or run_id <= 0:
+                raise ValueError("legacy GitHub Actions run ID is invalid")
+            result = self._request(
+                "GET", f"/repos/{self.repository}/actions/runs/{run_id}",
+            )
+            state = self._legacy_run_state(result, identity)
+            if state is None or state.run_id != run_id:
+                raise GitHubActionsError("invalid legacy GitHub Actions run response")
+        if state.status != "completed":
+            self._request(
+                "POST", f"/repos/{self.repository}/actions/runs/{state.run_id}/cancel",
+            )
+        return state
 
     def list_artifacts(self, run_id: int) -> list[dict[str, Any]]:
         result = self._request(
@@ -600,36 +727,119 @@ def load_spec(task_dir: Path) -> dict[str, Any]:
     return value
 
 
+def drain_legacy_task_run(
+    task_dir: Path, reason: str = "schema-v2 rollout drain",
+) -> dict[str, Any]:
+    """Drain one schema-v2 dispatch and durably record the migration."""
+    task_dir = Path(task_dir)
+    state_path = task_dir / "github-state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if not isinstance(state, dict) or state.get("schema_version") != 2:
+        raise ValueError("GitHub dispatch state is not schema v2")
+    identity = _validate_legacy_dispatch_identity(LegacyDispatchIdentity(
+        str(state.get("task_id", "")), str(state.get("request_id", "")),
+        str(state.get("dispatch_id", "")), str(state.get("dispatched_at", "")),
+    ))
+    if task_dir.name != identity.task_id:
+        raise ValueError("legacy GitHub dispatch state does not match task directory")
+    run_id = state.get("run_id")
+    if (run_id is not None
+            and (not isinstance(run_id, int) or isinstance(run_id, bool) or run_id <= 0)):
+        raise ValueError("legacy GitHub dispatch run ID is invalid")
+
+    marker_path = task_dir / "github-legacy-drain.json"
+    if marker_path.exists():
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        expected = {
+            "schema_version": 1,
+            "legacy_schema_version": 2,
+            "task_id": identity.task_id,
+            "request_id": identity.request_id,
+            "dispatch_id": identity.dispatch_id,
+            "dispatched_at": identity.dispatched_at,
+            "persisted_run_id": run_id,
+        }
+        resolved_run_id = marker.get("resolved_run_id") if isinstance(marker, dict) else None
+        if (not isinstance(marker, dict)
+                or any(marker.get(key) != value for key, value in expected.items())
+                or marker.get("outcome") not in {
+                    "cancellation_requested", "already_completed",
+                }
+                or not isinstance(resolved_run_id, int)
+                or isinstance(resolved_run_id, bool) or resolved_run_id <= 0
+                or (run_id is not None and resolved_run_id != run_id)
+                or not isinstance(marker.get("drained_at"), str)):
+            raise ValueError("legacy GitHub drain marker is invalid")
+        _parse_utc(marker["drained_at"])
+        return {
+            "run_id": resolved_run_id,
+            "reason": reason[:500],
+            "outcome": marker["outcome"],
+        }
+
+    spec = load_spec(task_dir)
+    if (str(spec.get("task_id", "")) != identity.task_id
+            or str(spec.get("request_id", identity.task_id)) != identity.request_id):
+        raise ValueError("legacy GitHub spec does not match dispatch state")
+    from omcp.github_dispatch_service import DispatchClient
+    client = DispatchClient(
+        Path(str(spec["github_dispatch_socket"])), int(spec["github_service_uid"]),
+    )
+    remote = client.drain_legacy(identity, run_id)
+    outcome = (
+        "already_completed" if remote.status == "completed"
+        else "cancellation_requested"
+    )
+    _atomic_json(marker_path, {
+        "schema_version": 1,
+        "legacy_schema_version": 2,
+        "task_id": identity.task_id,
+        "request_id": identity.request_id,
+        "dispatch_id": identity.dispatch_id,
+        "dispatched_at": identity.dispatched_at,
+        "persisted_run_id": run_id,
+        "resolved_run_id": remote.run_id,
+        "remote_status": remote.status,
+        "outcome": outcome,
+        "drained_at": utc_now(),
+    })
+    return {"run_id": remote.run_id, "reason": reason[:500], "outcome": outcome}
+
+
 def cancel_task_run(task_dir: Path, reason: str = "task cancelled") -> dict[str, Any] | None:
     """Best-effort cancellation using persisted run identity only."""
     task_dir = Path(task_dir)
     try:
         state = json.loads((task_dir / "github-state.json").read_text())
-        spec = load_spec(task_dir)
-    except (FileNotFoundError, ValueError, KeyError):
+    except (FileNotFoundError, ValueError):
         return None
-    run_id = state.get("run_id") if isinstance(state, dict) else None
-    from omcp.github_dispatch_service import DispatchClient
-    client = DispatchClient(
-        Path(str(spec["github_dispatch_socket"])), int(spec["github_service_uid"]),
-    )
-    if not isinstance(state, dict):
+    if isinstance(state, dict) and state.get("schema_version") == 2:
+        return drain_legacy_task_run(task_dir, reason)
+    if not isinstance(state, dict) or state.get("schema_version") != 4:
+        return None
+    try:
+        spec = load_spec(task_dir)
+    except (FileNotFoundError, ValueError):
+        return None
+    run_id = state.get("run_id")
+    if state.get("schema_version") != 4 or state.get("phase") != "adopted":
         return None
     try:
         identity = _validate_dispatch_identity(DispatchIdentity(
             str(state.get("task_id", "")), str(state.get("request_id", "")),
             str(state.get("dispatch_id", "")), str(state.get("dispatched_at", "")),
             str(state.get("source_sha", "")),
+            str(state.get("agent", "")), str(state.get("model", "")),
+            str(state.get("payload_sha256", "")),
         ))
     except ValueError:
         return None
-    if not isinstance(run_id, int):
-        # Adopt only the exact pre-persisted dispatch identity, ref, workflow
-        # SHA and source SHA.
-        found = client.find_run(identity)
-        if found is None:
-            return None
-        run_id = found.run_id
+    if not isinstance(run_id, int) or isinstance(run_id, bool) or run_id <= 0:
+        return None
+    from omcp.github_dispatch_service import DispatchClient
+    client = DispatchClient(
+        Path(str(spec["github_dispatch_socket"])), int(spec["github_service_uid"]),
+    )
     client.cancel(run_id, identity)
     return {"run_id": run_id, "reason": reason[:500]}
 
@@ -637,18 +847,23 @@ def cancel_task_run(task_dir: Path, reason: str = "task cancelled") -> dict[str,
 def write_state(path: Path, run: RunState, identity: DispatchIdentity,
                 **extra: Any) -> None:
     value = {
-        "schema_version": 3,
+        "schema_version": 4,
         "phase": "adopted",
         "task_id": identity.task_id,
         "request_id": identity.request_id,
         "dispatch_id": identity.dispatch_id,
         "dispatched_at": identity.dispatched_at,
         "source_sha": identity.source_sha,
+        "agent": identity.agent,
+        "model": identity.model,
+        "payload_sha256": identity.payload_sha256,
         "run_id": run.run_id,
         "status": run.status,
         "conclusion": run.conclusion,
         "url": run.url,
         "updated_at": utc_now(),
-        **extra,
     }
+    if set(extra) & set(value):
+        raise ValueError("GitHub dispatch state metadata is immutable")
+    value.update(extra)
     _atomic_json(path, value)

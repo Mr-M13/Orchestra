@@ -19,8 +19,9 @@ from pathlib import Path
 from typing import Any
 
 from omcp.github_actions import (
-    DispatchIdentity, GitHubActionsClient, GitHubActionsError, RunState,
-    _validate_dispatch_identity,
+    DispatchIdentity, GitHubActionsClient, GitHubActionsError,
+    LegacyDispatchIdentity, RunState, _validate_dispatch_identity,
+    _validate_legacy_dispatch_identity,
 )
 
 
@@ -35,6 +36,8 @@ def _identity(value: object) -> DispatchIdentity:
         str(value.get("task_id", "")), str(value.get("request_id", "")),
         str(value.get("dispatch_id", "")), str(value.get("dispatched_at", "")),
         str(value.get("source_sha", "")),
+        str(value.get("agent", "")), str(value.get("model", "")),
+        str(value.get("payload_sha256", "")),
     ))
 
 
@@ -43,6 +46,26 @@ def _identity_json(value: DispatchIdentity) -> dict[str, str]:
         "task_id": value.task_id, "request_id": value.request_id,
         "dispatch_id": value.dispatch_id, "dispatched_at": value.dispatched_at,
         "source_sha": value.source_sha,
+        "agent": value.agent, "model": value.model,
+        "payload_sha256": value.payload_sha256,
+    }
+
+
+def _legacy_identity(value: object) -> LegacyDispatchIdentity:
+    if not isinstance(value, dict) or set(value) != {
+        "task_id", "request_id", "dispatch_id", "dispatched_at",
+    }:
+        raise ValueError("legacy dispatch identity is invalid")
+    return _validate_legacy_dispatch_identity(LegacyDispatchIdentity(
+        str(value.get("task_id", "")), str(value.get("request_id", "")),
+        str(value.get("dispatch_id", "")), str(value.get("dispatched_at", "")),
+    ))
+
+
+def _legacy_identity_json(value: LegacyDispatchIdentity) -> dict[str, str]:
+    return {
+        "task_id": value.task_id, "request_id": value.request_id,
+        "dispatch_id": value.dispatch_id, "dispatched_at": value.dispatched_at,
     }
 
 
@@ -123,6 +146,7 @@ class ServiceConfig:
     service_uid: int
     coordinator_uid: int
     allowed_models: dict[str, frozenset[str]]
+    dispatch_actor: str
 
     @classmethod
     def load(cls, path: Path) -> "ServiceConfig":
@@ -156,6 +180,9 @@ class ServiceConfig:
                     or not values or not all(isinstance(item, str) for item in values)):
                 raise ValueError("allowed_models is invalid")
             models[agent] = frozenset(values)
+        dispatch_actor = raw.get("dispatch_actor")
+        if not isinstance(dispatch_actor, str) or not dispatch_actor:
+            raise ValueError("dispatch_actor must identify the trusted GitHub principal")
         credential = Path(str(raw.get("credential_file", "")))
         if (not credential.is_absolute() or ".." in credential.parts):
             raise ValueError("credential_file must be an absolute normalized path")
@@ -164,14 +191,16 @@ class ServiceConfig:
             str(raw.get("github_repository", "")), str(raw.get("workflow", "")),
             str(raw.get("workflow_ref", "")), str(raw.get("workflow_sha", "")),
             credential, service_uid=service_uid,
+            dispatch_actor=dispatch_actor,
         )
         return cls(client.repository, client.workflow, client.ref, client.head_sha,
-                   credential, service_uid, coordinator_uid, models)
+                   credential, service_uid, coordinator_uid, models, dispatch_actor)
 
     def client(self) -> GitHubActionsClient:
         return GitHubActionsClient(
             self.repository, self.workflow, self.workflow_ref, self.workflow_sha,
             self.credential_file, service_uid=self.service_uid,
+            dispatch_actor=self.dispatch_actor,
         )
 
 
@@ -204,15 +233,13 @@ class DispatchClient:
         return response.get("result")
 
     def dispatch(self, identity: DispatchIdentity, agent: str, model: str,
-                 instructions: str) -> str:
+                 instructions: str) -> RunState:
         result = self._call("dispatch", identity=_identity_json(identity),
                             agent=agent, model=model, instructions=instructions)
-        if not isinstance(result, str):
-            raise GitHubActionsError("dispatch broker returned an invalid result")
-        return result
-
-    def find_run(self, identity: DispatchIdentity) -> RunState | None:
-        return _run(self._call("find", identity=_identity_json(identity)))
+        value = _run(result)
+        if value is None:
+            raise GitHubActionsError("dispatch broker returned no run")
+        return value
 
     def status(self, run_id: int, identity: DispatchIdentity) -> RunState:
         value = _run(self._call("status", run_id=run_id,
@@ -223,6 +250,17 @@ class DispatchClient:
 
     def cancel(self, run_id: int, identity: DispatchIdentity) -> None:
         self._call("cancel", run_id=run_id, identity=_identity_json(identity))
+
+    def drain_legacy(
+        self, identity: LegacyDispatchIdentity, run_id: int | None,
+    ) -> RunState:
+        value = _run(self._call(
+            "drain_legacy", run_id=run_id,
+            identity=_legacy_identity_json(identity),
+        ))
+        if value is None:
+            raise GitHubActionsError("dispatch broker did not drain legacy run")
+        return value
 
     def download_artifact(self, run_id: int, name: str,
                           identity: DispatchIdentity) -> dict[str, bytes]:
@@ -252,13 +290,27 @@ class DispatchService:
         action = request.get("action")
         fields = {
             "dispatch": {"version", "action", "identity", "agent", "model", "instructions"},
-            "find": {"version", "action", "identity"},
             "status": {"version", "action", "identity", "run_id"},
             "cancel": {"version", "action", "identity", "run_id"},
             "artifact": {"version", "action", "identity", "run_id", "name"},
+            "drain_legacy": {"version", "action", "identity", "run_id"},
         }.get(action)
         if fields is None or set(request) != fields:
             raise ValueError("dispatch broker request fields are invalid")
+        if action == "drain_legacy":
+            # This narrow migration endpoint accepts only a schema-v2 identity
+            # and can only cancel (or observe terminal state).  It cannot reach
+            # dispatch, status, or artifact operations for schema v4.
+            legacy_identity = _legacy_identity(request.get("identity"))
+            legacy_run_id = request.get("run_id")
+            if (legacy_run_id is not None
+                    and (not isinstance(legacy_run_id, int)
+                         or isinstance(legacy_run_id, bool)
+                         or legacy_run_id <= 0)):
+                raise ValueError("run_id is invalid")
+            return _run_json(self.github.drain_legacy(
+                legacy_identity, legacy_run_id,
+            ))
         identity = _identity(request.get("identity"))
         if action == "dispatch":
             agent, model = request.get("agent"), request.get("model")
@@ -270,8 +322,6 @@ class DispatchService:
                 raise ValueError("instructions must be text")
             return self.github.dispatch(identity, agent, model, instructions)
         run_id = request.get("run_id")
-        if action == "find":
-            return _run_json(self.github.find_run(identity))
         if not isinstance(run_id, int) or isinstance(run_id, bool) or run_id <= 0:
             raise ValueError("run_id is invalid")
         # Bind every run operation to the full persisted dispatch identity.
@@ -286,6 +336,23 @@ class DispatchService:
             if name != "omcp-" + identity.task_id:
                 raise ValueError("artifact is not bound to this task")
             files = self.github.download_artifact(run_id, name)
+            summary = files.get("summary.json")
+            try:
+                metadata = json.loads(summary) if isinstance(summary, bytes) else None
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                metadata = None
+            expected = {
+                "task_id": identity.task_id, "request_id": identity.request_id,
+                "dispatch_id": identity.dispatch_id,
+                "dispatched_at": identity.dispatched_at,
+                "source_sha": identity.source_sha, "agent": identity.agent,
+                "model": identity.model,
+                "payload_sha256": identity.payload_sha256,
+            }
+            if not isinstance(metadata, dict) or any(
+                metadata.get(key) != value for key, value in expected.items()
+            ):
+                raise ValueError("artifact identity does not match dispatch")
             return {key: base64.b64encode(value).decode("ascii")
                     for key, value in files.items()}
         raise ValueError("unsupported dispatch broker action")

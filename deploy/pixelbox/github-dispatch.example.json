@@ -6,6 +6,7 @@
   "credential_file": "/etc/orchestra/github-dispatch/github-actions.token",
   "service_uid": -1,
   "coordinator_uid": -1,
+  "dispatch_actor": "REPLACE_WITH_TOKEN_OWNER_LOGIN",
   "allowed_models": {
     "codex": ["gpt-5-codex"],
     "deepseek": ["deepseek/deepseek-chat"]

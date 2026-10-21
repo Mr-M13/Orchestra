@@ -194,9 +194,13 @@ requires GitHub to report it as protected, and compares its current commit with
 is dispatched on a mismatch or missing protection. The expected SHA is also a
 dispatch input. A credential-free job compares it with `github.sha`, and
 only its success allows the environment-gated execution job to request provider
-secrets. The checkout is pinned to that SHA. Run adoption checks both ref and
-SHA, the workflow-dispatch event, and the persisted dispatch identity and time,
-so a stale same-name run is rejected.
+secrets. The checkout is pinned to that SHA. Returned-run validation checks both
+ref and SHA, the workflow-dispatch event, the first run attempt, and the
+owner-configured `dispatch_actor` in both GitHub actor fields. Dispatch requests
+require GitHub's authenticated returned run ID. Recovery uses only that
+persisted ID and the full immutable identity (including request, agent, model
+and payload digest), so
+a stale or spoofed same-name run is never adopted.
 
 `github_service_uid` in `omcp.json` must be the numeric UID of
 `orchestra-github`, and must differ from the coordinator effective UID. The

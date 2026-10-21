@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import io
 import json
 import os
@@ -18,8 +19,12 @@ from omcp.github_actions import (
     GitHubActionsClient,
     GitHubActionsError,
     DispatchIdentity,
+    LegacyDispatchIdentity,
+    RunState,
     _SafeRedirectHandler,
+    cancel_task_run,
     decode_instructions,
+    drain_legacy_task_run,
     encode_instructions,
     load_or_create_dispatch_identity,
 )
@@ -38,9 +43,13 @@ DISPATCH_ID = "22222222-2222-4222-8222-222222222222"
 DISPATCHED_AT = "2026-10-20T00:00:00+00:00"
 
 
-def dispatch_identity() -> DispatchIdentity:
+def dispatch_identity(instructions="task", agent="codex", model="gpt-5") -> DispatchIdentity:
+    payload_sha256 = hashlib.sha256(
+        encode_instructions(instructions).encode("ascii")
+    ).hexdigest()
     return DispatchIdentity(
         TASK_ID, "request-1", DISPATCH_ID, DISPATCHED_AT, TASK_SHA,
+        agent, model, payload_sha256,
     )
 
 
@@ -59,18 +68,33 @@ class Response:
 
 
 class PayloadHardeningTests(unittest.TestCase):
-    def test_persisted_dispatch_identity_is_bound_to_source_sha(self):
+    def test_persisted_dispatch_identity_binds_source_agent_model_and_payload(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state.json"
             identity, resumed = load_or_create_dispatch_identity(
-                state, TASK_ID, "request-1", TASK_SHA,
+                state, TASK_ID, "request-1", TASK_SHA, "codex", "gpt-5",
+                dispatch_identity().payload_sha256,
             )
             self.assertFalse(resumed)
             self.assertEqual(identity.source_sha, TASK_SHA)
             with self.assertRaisesRegex(ValueError, "does not match"):
                 load_or_create_dispatch_identity(
-                    state, TASK_ID, "request-1", "b" * 40,
+                    state, TASK_ID, "request-1", "b" * 40, "codex", "gpt-5",
+                    dispatch_identity().payload_sha256,
                 )
+            mismatches = (
+                (TASK_SHA, "deepseek", "gpt-5", identity.payload_sha256),
+                (TASK_SHA, "codex", "other-model", identity.payload_sha256),
+                (TASK_SHA, "codex", "gpt-5", "b" * 64),
+            )
+            for source_sha, agent, model, payload_sha256 in mismatches:
+                with self.subTest(agent=agent, model=model), self.assertRaisesRegex(
+                    ValueError, "does not match",
+                ):
+                    load_or_create_dispatch_identity(
+                        state, TASK_ID, "request-1", source_sha, agent, model,
+                        payload_sha256,
+                    )
 
     def test_encode_rejects_compressible_input_over_uncompressed_limit(self):
         with self.assertRaisesRegex(ValueError, "too large"):
@@ -126,6 +150,7 @@ class HttpHardeningTests(unittest.TestCase):
                 client.dispatch(
                     DispatchIdentity(
                         "-" * 36, "request-1", DISPATCH_ID, DISPATCHED_AT, TASK_SHA,
+                        "codex", "gpt-5", dispatch_identity().payload_sha256,
                     ),
                     "codex", "gpt-5", "task",
                 )
@@ -172,30 +197,114 @@ class HttpHardeningTests(unittest.TestCase):
                         "owner/repo", "orchestra-worker.yml", ref, TASK_SHA, token,
                     )
 
-    def test_find_run_rejects_stale_same_name_and_wrong_ref_or_sha(self):
+    def test_status_rejects_spoofed_run_even_with_matching_title_sha_and_time(self):
         created = datetime.fromisoformat(DISPATCHED_AT)
-        exact = {
+        spoof = {
             "id": 7, "display_title": dispatch_identity().run_name,
             "event": "workflow_dispatch", "head_sha": TASK_SHA,
             "head_branch": "main", "created_at": created.isoformat(),
+            "path": ".github/workflows/orchestra-worker.yml@main",
+            "run_attempt": 1,
+            "actor": {"login": "attacker"},
+            "triggering_actor": {"login": "attacker"},
             "status": "queued", "conclusion": None,
             "html_url": "https://github.com/owner/repo/actions/runs/7",
         }
-        stale = {**exact, "id": 6,
-                 "created_at": (created - timedelta(days=1)).isoformat()}
-        wrong_sha = {**exact, "id": 5, "head_sha": "b" * 40}
-        payload = json.dumps({"workflow_runs": [stale, wrong_sha, exact]}).encode()
         with tempfile.TemporaryDirectory() as directory:
             token = Path(directory) / "token"
             token.write_text("secret-token\n")
             token.chmod(0o600)
             client = GitHubActionsClient(
                 "owner/repo", "orchestra-worker.yml", "main", TASK_SHA, token,
-                opener=lambda *_args, **_kwargs: Response(payload),
+                dispatch_actor="orchestra-bot",
+                opener=lambda *_args, **_kwargs: Response(json.dumps(spoof).encode()),
             )
-            run = client.find_run(dispatch_identity())
-        self.assertIsNotNone(run)
-        self.assertEqual(run.run_id, 7)
+            with self.assertRaisesRegex(GitHubActionsError, "invalid .* run"):
+                client.status(7, dispatch_identity())
+
+    def test_legacy_drain_preserves_actor_and_run_id_binding_after_sha_change(self):
+        legacy = LegacyDispatchIdentity(
+            TASK_ID, "request-1", DISPATCH_ID, DISPATCHED_AT,
+        )
+        old_workflow_sha = "b" * 40
+
+        def run_payload(*, run_id=41, actor="orchestra-bot"):
+            return {
+                "id": run_id, "display_title": legacy.run_name,
+                "event": "workflow_dispatch", "head_sha": old_workflow_sha,
+                "head_branch": "main", "created_at": DISPATCHED_AT,
+                "path": ".github/workflows/orchestra-worker.yml@main",
+                "run_attempt": 1, "actor": {"login": actor},
+                "triggering_actor": {"login": actor},
+                "status": "in_progress", "conclusion": None,
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            token = Path(directory) / "token"
+            token.write_text("secret-token\n")
+            token.chmod(0o600)
+            requests = []
+
+            def opener(request, **_kwargs):
+                requests.append(request)
+                return Response(
+                    json.dumps(run_payload()).encode()
+                    if request.method == "GET" else b"{}"
+                )
+
+            client = GitHubActionsClient(
+                "owner/repo", "orchestra-worker.yml", "main", TASK_SHA, token,
+                dispatch_actor="orchestra-bot", opener=opener,
+            )
+            state = client.drain_legacy(legacy, 41)
+            self.assertEqual(state.run_id, 41)
+            self.assertEqual([request.method for request in requests], ["GET", "POST"])
+
+            for payload in (run_payload(actor="attacker"), run_payload(run_id=42)):
+                with self.subTest(payload=payload), self.assertRaisesRegex(
+                    GitHubActionsError, "invalid legacy .* response",
+                ):
+                    GitHubActionsClient(
+                        "owner/repo", "orchestra-worker.yml", "main", TASK_SHA,
+                        token, dispatch_actor="orchestra-bot",
+                        opener=lambda *_args, value=payload, **_kwargs: Response(
+                            json.dumps(value).encode()
+                        ),
+                    ).drain_legacy(legacy, 41)
+
+    def test_prepared_legacy_drain_discovers_only_the_exact_trusted_run(self):
+        legacy = LegacyDispatchIdentity(
+            TASK_ID, "request-1", DISPATCH_ID, DISPATCHED_AT,
+        )
+        exact = {
+            "id": 41, "display_title": legacy.run_name,
+            "event": "workflow_dispatch", "head_sha": "b" * 40,
+            "head_branch": "main", "created_at": DISPATCHED_AT,
+            "path": ".github/workflows/orchestra-worker.yml@main",
+            "run_attempt": 1, "actor": {"login": "orchestra-bot"},
+            "triggering_actor": {"login": "orchestra-bot"},
+            "status": "queued", "conclusion": None,
+        }
+        spoof = {**exact, "id": 99, "actor": {"login": "attacker"}}
+        requests = []
+
+        def opener(request, **_kwargs):
+            requests.append(request)
+            if request.method == "GET":
+                return Response(json.dumps({"workflow_runs": [spoof, exact]}).encode())
+            return Response(b"{}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            token = Path(directory) / "token"
+            token.write_text("secret-token\n")
+            token.chmod(0o600)
+            state = GitHubActionsClient(
+                "owner/repo", "orchestra-worker.yml", "main", TASK_SHA, token,
+                dispatch_actor="orchestra-bot", opener=opener,
+            ).drain_legacy(legacy, None)
+        self.assertEqual(state.run_id, 41)
+        self.assertEqual([request.method for request in requests], ["GET", "POST"])
+        self.assertIn("event=workflow_dispatch", requests[0].full_url)
 
     def test_dispatch_fails_closed_for_unprotected_ref_before_post(self):
         requests = []
@@ -261,6 +370,7 @@ class HttpHardeningTests(unittest.TestCase):
             )
             identity = DispatchIdentity(
                 TASK_ID, "request-1", DISPATCH_ID, DISPATCHED_AT, "b" * 40,
+                "codex", "gpt-5", dispatch_identity().payload_sha256,
             )
             with self.assertRaisesRegex(GitHubActionsError, "source SHA"):
                 client.dispatch(identity, "codex", "gpt-5", "task")
@@ -365,7 +475,6 @@ class RunnerHardeningTests(unittest.TestCase):
                 "source_sha": TASK_SHA,
             }))
             client = Mock()
-            client.find_run.return_value = None
             with patch("omcp.github_runner.DispatchClient", return_value=client):
                 self.assertEqual(run_github_worker(spec_path), 130)
             client.dispatch.assert_not_called()
@@ -373,6 +482,111 @@ class RunnerHardeningTests(unittest.TestCase):
                 json.loads((task / "completion.json").read_text())["runner_error"],
                 "Cancelled",
             )
+
+    def test_restart_recovers_only_the_persisted_returned_run_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            task = Path(directory)
+            workspace = task / "workspace"
+            workspace.mkdir()
+            prompt = task / "prompt.txt"
+            prompt.write_text("task")
+            identity = dispatch_identity("task", "codex", "gpt-5-codex")
+            state = task / "github-state.json"
+            state.write_text(json.dumps({
+                "schema_version": 4, "phase": "adopted", "run_id": 73,
+                "task_id": identity.task_id, "request_id": identity.request_id,
+                "dispatch_id": identity.dispatch_id,
+                "dispatched_at": identity.dispatched_at,
+                "source_sha": identity.source_sha, "agent": identity.agent,
+                "model": identity.model,
+                "payload_sha256": identity.payload_sha256,
+            }))
+            spec_path = task / "github-actions.json"
+            spec_path.write_text(json.dumps({
+                "task_id": TASK_ID, "request_id": "request-1",
+                "agent": "codex", "model": "gpt-5-codex",
+                "prompt_path": str(prompt), "log_path": str(task / "worker.log"),
+                "completion_path": str(task / "completion.json"),
+                "result_path": str(task / "result.txt"),
+                "workspace": str(workspace), "remote_state_path": str(state),
+                "github_dispatch_socket": str(task / "dispatch.sock"),
+                "github_service_uid": os.geteuid() + 1,
+                "lease_id": "22222222-2222-2222-2222-222222222222",
+                "lease_path": str(task / "lease.json"), "source_sha": TASK_SHA,
+            }))
+            completed = Mock(
+                run_id=73, status="completed", conclusion="success", url="u",
+            )
+            client = Mock()
+            client.status.side_effect = [completed, completed]
+            client.download_artifact.return_value = {
+                "result.txt": b"recovered result\n", "patch.diff": b"",
+            }
+            with patch("omcp.github_runner.DispatchClient", return_value=client):
+                self.assertEqual(run_github_worker(spec_path), 0)
+        client.dispatch.assert_not_called()
+        self.assertEqual(client.status.call_args_list[0].args, (73, identity))
+
+
+class LegacyDrainMigrationTests(unittest.TestCase):
+    def test_schema_v2_run_is_drained_and_restart_uses_durable_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            task = Path(directory) / TASK_ID
+            task.mkdir()
+            (task / "github-state.json").write_text(json.dumps({
+                "schema_version": 2, "phase": "adopted", "run_id": 41,
+                "task_id": TASK_ID, "request_id": "request-1",
+                "dispatch_id": DISPATCH_ID, "dispatched_at": DISPATCHED_AT,
+            }))
+            (task / "github-actions.json").write_text(json.dumps({
+                "task_id": TASK_ID, "request_id": "request-1",
+                "github_service_uid": os.geteuid() + 1,
+                "github_dispatch_socket": str(task / "dispatch.sock"),
+            }))
+            client = Mock()
+            client.drain_legacy.return_value = RunState(
+                41, "in_progress", None, "https://example/run/41",
+            )
+            with patch(
+                "omcp.github_dispatch_service.DispatchClient", return_value=client,
+            ):
+                result = cancel_task_run(task)
+            client.drain_legacy.assert_called_once_with(
+                LegacyDispatchIdentity(
+                    TASK_ID, "request-1", DISPATCH_ID, DISPATCHED_AT,
+                ),
+                41,
+            )
+            self.assertEqual(result["outcome"], "cancellation_requested")
+            marker = json.loads((task / "github-legacy-drain.json").read_text())
+            self.assertEqual(marker["resolved_run_id"], 41)
+
+            with patch("omcp.github_dispatch_service.DispatchClient") as constructor:
+                recovered = drain_legacy_task_run(task)
+            constructor.assert_not_called()
+            self.assertEqual(recovered["run_id"], 41)
+
+    def test_prepared_v2_run_that_cannot_be_found_blocks_drain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            task = Path(directory) / TASK_ID
+            task.mkdir()
+            (task / "github-state.json").write_text(json.dumps({
+                "schema_version": 2, "phase": "prepared",
+                "task_id": TASK_ID, "request_id": "request-1",
+                "dispatch_id": DISPATCH_ID, "dispatched_at": DISPATCHED_AT,
+            }))
+            (task / "github-actions.json").write_text(json.dumps({
+                "task_id": TASK_ID, "request_id": "request-1",
+                "github_service_uid": os.geteuid() + 1,
+                "github_dispatch_socket": str(task / "dispatch.sock"),
+            }))
+            client = Mock()
+            client.drain_legacy.side_effect = GitHubActionsError("not drainable")
+            with patch(
+                "omcp.github_dispatch_service.DispatchClient", return_value=client,
+            ), self.assertRaises(GitHubActionsError):
+                drain_legacy_task_run(task)
+            self.assertFalse((task / "github-legacy-drain.json").exists())
 
 
 class DispatchBrokerBoundaryTests(unittest.TestCase):
@@ -391,6 +605,10 @@ class DispatchBrokerBoundaryTests(unittest.TestCase):
                 "task_id": TASK_ID, "request_id": "request-1",
                 "dispatch_id": DISPATCH_ID, "dispatched_at": DISPATCHED_AT,
                 "source_sha": TASK_SHA,
+                "agent": "codex", "model": "gpt-5-codex",
+                "payload_sha256": dispatch_identity(
+                    "bounded task", "codex", "gpt-5-codex"
+                ).payload_sha256,
             },
             **values,
         }
@@ -421,6 +639,46 @@ class DispatchBrokerBoundaryTests(unittest.TestCase):
             service.handle(self.request("artifact", run_id=7, name="other"))
         service.github.download_artifact.assert_not_called()
 
+    def test_artifact_rejects_identity_from_a_substituted_run(self):
+        service = self.service()
+        service.github.status.return_value = Mock()
+        service.github.download_artifact.return_value = {
+            "result.txt": b"attacker output",
+            "summary.json": json.dumps({
+                "task_id": TASK_ID, "request_id": "replayed-request",
+            }).encode(),
+        }
+        with self.assertRaisesRegex(ValueError, "identity does not match"):
+            service.handle(self.request(
+                "artifact", run_id=7, name="omcp-" + TASK_ID,
+            ))
+
+    def test_legacy_identity_is_accepted_only_by_cancellation_drain(self):
+        service = self.service()
+        service.github.drain_legacy.return_value = RunState(
+            41, "in_progress", None, None,
+        )
+        legacy_identity = {
+            "task_id": TASK_ID, "request_id": "request-1",
+            "dispatch_id": DISPATCH_ID, "dispatched_at": DISPATCHED_AT,
+        }
+        result = service.handle({
+            "version": 1, "action": "drain_legacy",
+            "identity": legacy_identity, "run_id": 41,
+        })
+        self.assertEqual(result["run_id"], 41)
+        service.github.drain_legacy.assert_called_once_with(
+            LegacyDispatchIdentity(
+                TASK_ID, "request-1", DISPATCH_ID, DISPATCHED_AT,
+            ),
+            41,
+        )
+        with self.assertRaisesRegex(ValueError, "source SHA"):
+            service.handle({
+                "version": 1, "action": "cancel",
+                "identity": legacy_identity, "run_id": 41,
+            })
+
     def test_broker_config_rejects_symlink_even_when_target_is_private(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -436,6 +694,7 @@ class DispatchBrokerBoundaryTests(unittest.TestCase):
                 "credential_file": str(token),
                 "service_uid": os.geteuid(),
                 "coordinator_uid": os.geteuid() + 1,
+                "dispatch_actor": "orchestra-bot",
                 "allowed_models": {"codex": ["gpt-5-codex"]},
             }))
             real.chmod(0o600)
@@ -462,6 +721,7 @@ class WorkerArtifactTests(unittest.TestCase):
             output = root / "output"
             runtime = root / "runtime"
             encoded = base64.urlsafe_b64encode(zlib.compress(b"make a change")).decode()
+            payload_sha256 = hashlib.sha256(encoded.encode("ascii")).hexdigest()
             environment = {
                 "PATH": os.environ.get("PATH", ""),
                 "HOME": str(root / "home"),
@@ -472,6 +732,8 @@ class WorkerArtifactTests(unittest.TestCase):
                 "ORCHESTRA_AGENT": "codex",
                 "ORCHESTRA_MODEL": "gpt-5-codex",
                 "ORCHESTRA_PAYLOAD": encoded,
+                "ORCHESTRA_PAYLOAD_SHA256": payload_sha256,
+                "ORCHESTRA_SOURCE_SHA": TASK_SHA,
                 "ORCHESTRA_OUTPUT_DIR": str(output),
                 "ORCHESTRA_RUNTIME_DIR": str(runtime),
                 "OPENAI_API_KEY": "openai-secret-token-value",
@@ -563,6 +825,7 @@ class WorkerArtifactTests(unittest.TestCase):
         verification, execution = workflow.split("  execute:\n", 1)
         self.assertIn("workflow_sha:", workflow)
         self.assertIn("source_sha:", workflow)
+        self.assertNotIn("cancel-in-progress: true", workflow)
         self.assertIn("verify-workflow-sha:", verification)
         self.assertIn("ACTUAL_WORKFLOW_SHA: ${{ github.sha }}", verification)
         self.assertNotIn("environment: orchestra-workers", verification)
