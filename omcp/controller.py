@@ -130,7 +130,7 @@ def canonical_opencode_executable(value: str) -> str:
 
 
 def deepseek_runner_command(spec_path: Path, task_dir: Path, workspace: Path,
-                            credential_file: Path) -> list[str]:
+                            credential_file: Path, backend: str = "auto") -> list[str]:
     """Run the direct adapter with only its private files and DeepSeek egress."""
     source_root = Path(__file__).resolve().parent.parent
     policy = SandboxPolicy(
@@ -138,6 +138,7 @@ def deepseek_runner_command(spec_path: Path, task_dir: Path, workspace: Path,
         read_files=(spec_path, credential_file),
         write_paths=(task_dir,),
         network_hosts=("api.deepseek.com",),
+        backend=backend,
     )
     return sandbox_command(
         policy, [sys.executable, "-m", "omcp.runner", "--spec", str(spec_path)],
@@ -438,9 +439,9 @@ class Config:
             raise ValueError("heartbeat_seconds must be between 5 and 300")
         requested_sandbox = raw.get("sandbox_backend", "auto")
         if not isinstance(requested_sandbox, str) or requested_sandbox not in {
-            "auto", "seatbelt", "bubblewrap",
+            "auto", "seatbelt", "bubblewrap", "systemd",
         }:
-            raise ValueError("sandbox_backend must be auto, seatbelt, or bubblewrap")
+            raise ValueError("sandbox_backend must be auto, seatbelt, bubblewrap, or systemd")
         # Availability is checked when a sandboxed process launches and by the
         # health report.  Configuration loading stays platform-neutral so a
         # backed-up config can be inspected on another host.
@@ -1644,6 +1645,7 @@ class TaskController:
             elif worker.adapter == "deepseek":
                 runner_command = deepseek_runner_command(
                     spec_path, task_dir, workspace, Path(worker.credential_file or ""),
+                    self.config.sandbox_backend,
                 )
             else:
                 runner_command = [sys.executable, "-m", "omcp.runner", "--spec", str(spec_path)]

@@ -108,6 +108,19 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
         self.assertIn("--new-session", command)
         self.assertEqual(command[-3:], ["--", "/usr/bin/python3", "-V"])
 
+    def test_systemd_fallback_keeps_normal_workers_off_the_network(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            with patch("omcp.platform.host_platform", return_value="linux"), patch(
+                "omcp.platform.sandbox_executable", return_value="/usr/bin/systemd-run"
+            ):
+                command = sandbox_command(SandboxPolicy(
+                    read_paths=(workspace,), backend="systemd", workdir=workspace,
+                ), ["/usr/bin/true"])
+        self.assertIn("--property=NoNewPrivileges=yes", command)
+        self.assertIn("--property=PrivateTmp=yes", command)
+        self.assertIn("--property=RestrictAddressFamilies=AF_UNIX", command)
+
     def test_provider_sandbox_reshare_is_limited_to_network_namespace(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
