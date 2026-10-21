@@ -36,6 +36,7 @@ from orchestra.contracts import (
     AUTHORIZED_OPERATIONS,
     EXECUTION_RUNTIMES,
     ArtifactReference,
+    ContractValidationError,
     EvidenceReference,
     ExecutionError,
     ExecutionGrant,
@@ -2572,3 +2573,34 @@ def _text_reason(value: Any) -> str:
     if "\x00" in value:
         raise AuthorityConfigurationError("reason must not contain NUL")
     return value
+
+
+# ---------------------------------------------------------------------------
+# Public dictionary adapters for the authenticated service boundary
+# ---------------------------------------------------------------------------
+
+
+def task_spec_from_dict(payload: dict[str, Any]) -> TaskSpec:
+    """Reconstruct a canonical task from client JSON; never trusts a digest."""
+
+    if not isinstance(payload, dict):
+        raise ContractValidationError("task payload must be an object")
+    return _task_from_payload(payload)
+
+
+def execution_grant_from_dict(payload: dict[str, Any]) -> ExecutionGrant:
+    if not isinstance(payload, dict):
+        raise ContractValidationError("grant payload must be an object")
+    return _grant_from_payload(payload)
+
+
+def execution_report_from_dict(payload: dict[str, Any]) -> ExecutionReport:
+    if not isinstance(payload, dict):
+        raise ContractValidationError("report payload must be an object")
+    return _report_from_payload(payload)
+
+
+def verification_record_from_dict(payload: dict[str, Any]) -> VerificationRecord:
+    if not isinstance(payload, dict):
+        raise ContractValidationError("verification payload must be an object")
+    return _verification_from_payload(payload)
