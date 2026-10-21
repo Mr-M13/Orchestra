@@ -1,0 +1,52 @@
+# Example only. Do not install or enable on a live host as part of Phase 3A.
+[Unit]
+Description=Orchestra shadow execution authority (not activated)
+Documentation=file:/opt/orchestra/docs/decisions/ADR-008-authority-security-boundary.md
+After=local-fs.target
+ConditionPathExists=/etc/orchestra/authority.json
+
+[Service]
+Type=simple
+User=orchestra-authority
+Group=orchestra-authority
+SupplementaryGroups=orchestra-clients
+WorkingDirectory=/opt/orchestra
+Environment=PYTHONPATH=/opt/orchestra
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -m orchestra.authority_service --config /etc/orchestra/authority.json
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=15s
+KillSignal=SIGTERM
+
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+AmbientCapabilities=
+RemoveIPC=yes
+
+StateDirectory=orchestra-authority
+StateDirectoryMode=0700
+ReadWritePaths=/run/orchestra-authority
+# No EnvironmentFile and no provider credentials are passed to this service.
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,32 @@
+{
+  "authority_id": "authority:shadow-phase3a",
+  "service_uid": 2101,
+  "database_path": "/var/lib/orchestra-authority/authority.sqlite3",
+  "socket_path": "/run/orchestra-authority/authority.sock",
+  "socket_gid": 2100,
+  "socket_mode": 432,
+  "peers": [
+    {"uid": 2102, "role": "coordinator", "label": "coordinator"},
+    {"uid": 2103, "role": "human", "label": "approver"},
+    {"uid": 2104, "role": "verifier", "label": "verifier"},
+    {"uid": 2105, "role": "worker", "label": "worker"},
+    {"uid": 2106, "role": "operator", "label": "operator"}
+  ],
+  "audiences": [
+    {
+      "adapter_id": "fake-local-adapter",
+      "runtime": "local_process",
+      "agent_id": "fake-coding-agent",
+      "model_provider": "fake-provider",
+      "model_id": "fake-model",
+      "coding_harness": "fake-harness"
+    }
+  ],
+  "standing_authorizations": [],
+  "grant_ttl_seconds": 120,
+  "approval_ttl_seconds": 300,
+  "stale_attempt_seconds": 60,
+  "max_message_bytes": 1048576,
+  "socket_timeout_seconds": 30,
+  "max_connections": 16
+}
