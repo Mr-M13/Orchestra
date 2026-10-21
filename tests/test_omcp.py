@@ -348,7 +348,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(spec["credential_file"], str(credential))
         self.assertNotIn("never-log-this", (self.state / "audit.jsonl").read_text())
 
-    def test_deepseek_uses_trusted_development_authorization_when_enabled(self):
+    def test_deepseek_remains_pending_when_global_approvals_are_disabled(self):
         credential = Path(self.temp.name) / "deepseek.key"
         credential.write_text("not-printed")
         credential.chmod(0o600)
@@ -362,9 +362,26 @@ class ControllerTests(unittest.TestCase):
             workspace_preparer=lambda *_: self.root,
             id_factory=lambda: "11111111-1111-1111-1111-111111111111")
         task = self.controller.submit_task("direct-approval", "Review", "Do not edit", "deepseek")
-        self.assertEqual(task["status"], "running")
-        self.assertEqual(task["approval"]["status"], "not_required")
-        self.assertEqual(self.popen.call_count, 1)
+        self.assertEqual(task["status"], "approval_required")
+        self.assertEqual(task["approval"]["status"], "pending")
+        self.assertEqual(self.popen.call_count, 0)
+
+    def test_omitted_consequence_class_requires_explicit_approval(self):
+        self.controller.close()
+        self.controller = TaskController(
+            Config(
+                "owner/repo", self.root, self.state, "origin/main",
+                {"ina": Worker("ina", ("codex",))},
+                Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+                task_approval_mode="disabled",
+            ),
+            popen=self.popen, workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: "11111111-1111-1111-1111-111111111111",
+        )
+        task = self.controller.submit_task("unclassified-default", "Review", "Do not edit", "ina")
+        self.assertEqual(task["consequence_class"], "unclassified")
+        self.assertEqual(task["status"], "approval_required")
+        self.assertEqual(self.popen.call_count, 0)
 
     def test_protected_and_unclassified_work_still_requires_explicit_approval(self):
         self.controller.close()
@@ -439,6 +456,7 @@ class ControllerTests(unittest.TestCase):
     def test_disabled_approval_policy_releases_existing_pending_request(self):
         submitted = self.controller.submit_task(
             "pending-before-policy-change", "Queued work", "Perform bounded work", "ina",
+            True, None, "routine_development",
         )
         self.assertEqual(submitted["status"], "approval_required")
         self.controller.close()
@@ -651,6 +669,19 @@ class ControllerTests(unittest.TestCase):
         submitted = self.submit()
         self.complete(submitted["task_id"], result="x" * 2000)
         result = self.controller.task_result(submitted["task_id"])
+        self.assertTrue(result["truncated"])
+        self.assertEqual(len(result["result"]), 1024)
+
+    def test_result_reader_does_not_read_past_bound_sentinel(self):
+        self.controller.config = Config(
+            self.config.repository, self.config.project_root, self.config.state_dir,
+            self.config.base_ref, self.config.workers, self.config.principal,
+            max_result_bytes=1024,
+        )
+        submitted = self.submit()
+        self.complete(submitted["task_id"], result="x" * 4096)
+        with patch("pathlib.Path.read_bytes", side_effect=AssertionError("unbounded read")):
+            result = self.controller.task_result(submitted["task_id"])
         self.assertTrue(result["truncated"])
         self.assertEqual(len(result["result"]), 1024)
 

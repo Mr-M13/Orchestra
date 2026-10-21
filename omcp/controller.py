@@ -833,7 +833,7 @@ class TaskController:
     def submit_task(
         self, request_id: str, title: str, instructions: str, worker: str,
         requires_approval: bool = True, repository_profile: str | None = None,
-        consequence_class: str = "routine_development",
+        consequence_class: str = "unclassified",
     ) -> dict[str, Any]:
         self._authorize("tasks:submit", "task.submit")
         if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id):
@@ -878,12 +878,13 @@ class TaskController:
             return {**self._public(previous), "acknowledged": True, "idempotent_replay": True}
         task_id = self.id_factory()
         now = utc_now()
-        # The owner-selected trusted-development profile applies uniformly to
-        # every configured local lane. Provider egress remains fixed by the
-        # adapter and credential file; task input cannot widen it.
+        # A missing classification is consequential, not routine. Direct
+        # provider egress also always needs a fresh local decision.
+        requires_explicit_approval = self.config.workers[worker].adapter == "deepseek"
         approvals_disabled = (
             self.config.task_approval_mode == "disabled"
             and consequence_class == "routine_development"
+            and not requires_explicit_approval
         )
         status = "accepted" if standing_authorization or approvals_disabled else "approval_required"
         task = {
@@ -1075,7 +1076,10 @@ class TaskController:
         if task.get("result_path"):
             path = Path(task["result_path"])
             if path.exists():
-                raw = path.read_bytes()
+                # A worker controls this file. Read one sentinel byte only so
+                # result retrieval cannot allocate an unbounded response.
+                with path.open("rb") as result_file:
+                    raw = result_file.read(self.config.max_result_bytes + 1)
                 truncated = len(raw) > self.config.max_result_bytes
                 output = raw[:self.config.max_result_bytes].decode("utf-8", "replace")
         self._audit("task.result", task_id, "allowed", {"truncated": truncated})
@@ -1294,7 +1298,8 @@ class TaskController:
             if task.get("status") != "approval_required":
                 continue
             if (task.get("kind") == "host_operation"
-                    or task.get("consequence_class") != "routine_development"):
+                    or task.get("consequence_class") != "routine_development"
+                    or self.config.workers[task["worker"]].adapter == "deepseek"):
                 self._expire_approval(task)
                 continue
             task["status"] = "accepted"

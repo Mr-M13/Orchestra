@@ -56,7 +56,7 @@
   "max_parallel_tasks": 2,
   "startup_lease_seconds": 30,
   "heartbeat_seconds": 15,
-  "sandbox_backend": "systemd",
-  "task_approval_mode": "disabled",
+  "sandbox_backend": "bubblewrap",
+  "task_approval_mode": "required",
   "standing_authorizations": []
 }

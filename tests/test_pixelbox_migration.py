@@ -606,12 +606,12 @@ class DeploymentAssetTests(unittest.TestCase):
     def test_assets_are_present_and_do_not_touch_existing_services(self):
         root = Path(__file__).resolve().parents[1]
         example = json.loads((root / "deploy/pixelbox/omcp.example.json").read_text())
-        self.assertEqual(example["sandbox_backend"], "systemd")
+        self.assertEqual(example["sandbox_backend"], "bubblewrap")
         self.assertEqual(example["max_parallel_tasks"], 2)
         self.assertEqual(set(example["workers"]), {
             "ina-codex", "hamed-codex", "deepseek-primary", "deepseek-secondary",
         })
-        self.assertEqual(example["task_approval_mode"], "disabled")
+        self.assertEqual(example["task_approval_mode"], "required")
         self.assertNotEqual(
             Path(example["state_dir"]), Path(example["project_root"]),
         )
