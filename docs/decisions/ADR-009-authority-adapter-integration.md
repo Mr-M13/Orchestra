@@ -2,6 +2,7 @@
 
 - **Status:** Proposed, inactive prototype
 - **Date:** 2026-10-21
+- **Updated:** 2026-10-22 (stable macOS process identity)
 - **Related:** [ADR-007](ADR-007-execution-authority-prototype.md),
   [ADR-008](ADR-008-authority-security-boundary.md),
   [coding-worker adapter](../CODING-WORKER-ADAPTER.md)
@@ -38,10 +39,12 @@ the same durable state root.
   from the same intent.
 - A crash after the durable `launching` transition is an unknown outcome. The
   adapter never launches again automatically.
-- A running process is adopted only when its PID and platform process identity
-  match. Linux uses `/proc`; macOS binds fixed-argument `/bin/ps` start time,
-  process group and command. A missing, malformed or changed identity becomes
-  unknown.
+- A running process is adopted only when its full kernel-derived
+  `ProcessIdentity` matches: PID, process group, effective UID and precise
+  start time. Linux uses `/proc/<pid>/stat` plus `/proc/<pid>/status`; macOS
+  uses `proc_pidinfo(PROC_PIDTBSDINFO)` (`pbi_pid`, `pbi_pgid`, `pbi_uid`,
+  `pbi_start_tvsec`, `pbi_start_tvusec`). No mutable `/bin/ps` command text is
+  used. A missing, malformed or changed identity becomes unknown.
 - A terminal worker result is bounded and hashed again by the adapter. It is
   still an untrusted report until an independent verifier records a decision.
 
@@ -68,11 +71,39 @@ operation. Persisting `launching` first and refusing automatic recovery is the
 fail-closed choice: it may require operator reconciliation, but it cannot cause
 an uncertain task to run twice.
 
+## Process identity and legacy records
+
+Job records use version 2 and persist a structured `ProcessIdentity`. Identity
+capture succeeds only if the kernel reports PID, process group, effective UID
+and start time consistently. The adapter retries capture briefly after spawn;
+if identity remains unavailable, status becomes `unknown`, cancellation is
+refused and recovery is `ambiguous`. There is no weaker `ps` fallback for
+security decisions.
+
+Version 1 records that have already launched a process, including the former
+Darwin command hash stored in `pid_start`, are not adopted. Their status becomes
+`unknown` and recovery returns `ambiguous`. Version 1 `intent_prepared` or
+`consumed` records may be recovered through the authority because no process
+was launched; they are upgraded to version 2 before launch. This keeps old
+records fail-closed without invalidating safe pre-launch recovery.
+
+The integration test creates its temporary runtime directory under `/tmp` to
+keep Unix socket paths short. Because Darwin inherits the parent directory group
+rather than the process effective group, the test explicitly sets the runtime
+directory group to the configured socket GID. The authority service still
+rejects any runtime directory owned by the wrong group; the test models the
+production `tmpfiles.d` ownership rather than weakening that check.
+
 ## Validation
 
 Unit and integration tests cover concurrent consumption, replay, exact binding,
 authority unavailability and unauthenticated peers, crashes on each side of
 consumption and launch, process-group cancellation, restart recovery, bounded
-artifact hashing and independent verification. The disposable Linux boundary
-test additionally runs the authority, coordinator, approver, worker and
-verifier as separate operating-system UIDs over the real Unix socket.
+artifact hashing and independent verification. A real-process regression test
+captures identity across the macOS Python framework launcher transition and
+asserts it remains stable. Tests also cover mismatched identity, unavailable
+identity and legacy version 1 job records.
+
+The disposable Linux boundary test additionally runs the authority,
+coordinator, approver, worker and verifier as separate operating-system UIDs
+over the real Unix socket.

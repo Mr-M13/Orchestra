@@ -35,11 +35,17 @@ from orchestra.contracts import (
     ResourceUsage, TaskSpec,
 )
 from orchestra.authority import execution_grant_from_dict
+from orchestra.process_identity import ProcessIdentity, capture_process_identity
 
 ADAPTER_ID = "disposable-coding-worker"
 RUNTIME = "local_process"
 HARNESS_ID = "disposable-harness"
 MAX_INSTRUCTION_BYTES = 65_536
+JOB_RECORD_VERSION = 2
+LEGACY_IDENTITY_DETAIL = (
+    "legacy job record has no verifiable process identity; "
+    "automatic recovery is forbidden"
+)
 
 _THREAD_LOCKS_GUARD = threading.Lock()
 _THREAD_LOCKS: weakref.WeakValueDictionary[str, threading.Lock] = (
@@ -219,6 +225,14 @@ class DisposableCodingWorkerAdapter:
             durable_grant = execution_grant_from_dict(_read_json(job / "grant.json"))
             if durable_grant.to_dict() != grant.to_dict():
                 raise AdapterExecutionError("grant differs from durable execution intent")
+            if record.get("version") != JOB_RECORD_VERSION:
+                if record.get("state") not in {"intent_prepared", "consumed"}:
+                    if record.get("state") != "unknown":
+                        record["state"] = "unknown"
+                        record["legacy_identity"] = True
+                        _atomic_json(record_path, record)
+                    raise AdapterExecutionError(LEGACY_IDENTITY_DETAIL)
+                record["version"] = JOB_RECORD_VERSION
             if record.get("state") in {"intent_prepared", "consumed"}:
                 recovery = self._recover_locked(task, grant.attempt_id)
                 if recovery.state != "recovered":
@@ -238,14 +252,15 @@ class DisposableCodingWorkerAdapter:
             raise AdapterExecutionError("concurrent adapter intent exists") from None
         provider_run_id = "local-" + hashlib.sha256(grant.attempt_id.encode()).hexdigest()[:24]
         dispatched_at = _now()
-        record = {"version": 1, "attempt_id": grant.attempt_id,
+        record = {"version": JOB_RECORD_VERSION, "attempt_id": grant.attempt_id,
             "provider_run_id": provider_run_id, "adapter_id": ADAPTER_ID, "runtime": RUNTIME,
             "proposal_digest": task.digest, "grant_id": grant.grant_id,
             "task_id": task.task_id, "state": "intent_prepared", "dispatched_at": dispatched_at,
             "consume_request_id": "consume-" + secrets.token_hex(16),
             "consume_receipt": None,
             "started_at": None, "deadline": time.time() + task.resource_limits.max_runtime_seconds,
-            "pid": None, "pid_start": None, "max_output_bytes": task.resource_limits.max_output_bytes}
+            "pid": None, "process_identity": None,
+            "max_output_bytes": task.resource_limits.max_output_bytes}
         _atomic_json(job / "grant.json", grant.to_dict())
         _atomic_json(record_path, record)
         self._fault("after_intent", record)
@@ -283,6 +298,7 @@ class DisposableCodingWorkerAdapter:
 
     def _launch(self, task: TaskSpec, grant: ExecutionGrant, record_path: Path,
                 record: dict[str, Any]) -> DispatchReceipt:
+        record["version"] = JOB_RECORD_VERSION
         job = record_path.parent
         workspace = job / "workspace"
         try:
@@ -310,45 +326,37 @@ class DisposableCodingWorkerAdapter:
             "--spec", str(spec_path)], cwd=job, env=environment, stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
             close_fds=True)
+        identity = self._capture_process_identity(process)
         record.update({"state": "running", "pid": process.pid,
-            "pid_start": self._pid_start(process.pid), "started_at": _now()})
+            "process_identity": identity.to_dict() if identity is not None else None,
+            "started_at": _now()})
         _atomic_json(record_path, record)
         self._processes[grant.attempt_id] = process
         self._fault("after_process_start", record)
         return self._receipt(record)
 
     @staticmethod
-    def _pid_start(pid: int) -> str | None:
-        if not isinstance(pid, int) or isinstance(pid, bool) or pid < 1:
-            return None
-        if sys.platform.startswith("linux"):
-            try:
-                return "linux:" + Path(f"/proc/{pid}/stat").read_text().split()[21]
-            except (OSError, IndexError):
+    def _capture_process_identity(process: subprocess.Popen[bytes]) -> ProcessIdentity | None:
+        for _attempt in range(5):
+            identity = capture_process_identity(
+                process.pid, expected_uid=os.geteuid(),
+            )
+            if identity is not None:
+                return identity
+            if process.poll() is not None:
                 return None
-        if sys.platform == "darwin":
-            try:
-                completed = subprocess.run(
-                    ["/bin/ps", "-ww", "-o", "lstart=", "-o", "pgid=",
-                     "-o", "command=", "-p", str(pid)],
-                    capture_output=True, text=True, timeout=1,
-                    env={"LANG": "C", "PATH": "/usr/bin:/bin"},
-                    check=False,
-                )
-            except (OSError, subprocess.SubprocessError):
-                return None
-            output = completed.stdout.strip()
-            fields = output.split(maxsplit=6)
-            if completed.returncode != 0 or len(fields) != 7:
-                return None
-            try:
-                process_group = int(fields[5])
-            except ValueError:
-                return None
-            if process_group != pid or not fields[6]:
-                return None
-            return "darwin:" + hashlib.sha256(output.encode("utf-8")).hexdigest()
+            time.sleep(0.01)
         return None
+
+    @staticmethod
+    def _identity(record: dict[str, Any]) -> ProcessIdentity | None:
+        payload = record.get("process_identity")
+        if not isinstance(payload, dict):
+            return None
+        try:
+            return ProcessIdentity.from_dict(payload)
+        except (TypeError, ValueError):
+            return None
 
     def _receipt(self, record: dict[str, Any]) -> DispatchReceipt:
         return DispatchReceipt(record["attempt_id"], record["provider_run_id"],
@@ -364,16 +372,25 @@ class DisposableCodingWorkerAdapter:
         return path, record
 
     def _alive(self, record: dict[str, Any]) -> bool:
-        pid = record.get("pid")
-        expected = record.get("pid_start")
-        if not isinstance(pid, int) or not isinstance(expected, str) or not expected:
+        expected = self._identity(record)
+        if expected is None:
             return False
-        actual = self._pid_start(pid)
+        actual = capture_process_identity(
+            expected.pid, expected_uid=expected.uid,
+        )
         return actual is not None and actual == expected
 
     def status(self, receipt: DispatchReceipt) -> AdapterStatus:
         path, record = self._record_for(receipt); job = path.parent
         result_path = job / "result.json"
+        if record.get("version") != JOB_RECORD_VERSION:
+            record["state"] = "unknown"
+            record["legacy_identity"] = True
+            _atomic_json(path, record)
+            return AdapterStatus(
+                "unknown", provider_state="outcome_unknown",
+                detail=LEGACY_IDENTITY_DETAIL,
+            )
         if record.get("terminal_outcome") == "timed_out":
             return AdapterStatus("failed", provider_state="timed_out")
         if result_path.exists():
@@ -401,9 +418,11 @@ class DisposableCodingWorkerAdapter:
         return AdapterStatus("running", provider_state="running")
 
     def _terminate(self, record: dict[str, Any]) -> bool:
-        if not self._alive(record): return False
+        identity = self._identity(record)
+        if identity is None or not self._alive(record):
+            return False
         try:
-            os.killpg(record["pid"], signal.SIGTERM)
+            os.killpg(identity.pgid, signal.SIGTERM)
         except ProcessLookupError:
             return True
         except OSError:
@@ -414,7 +433,7 @@ class DisposableCodingWorkerAdapter:
             time.sleep(0.01)
         if self._alive(record):
             try:
-                os.killpg(record["pid"], signal.SIGKILL)
+                os.killpg(identity.pgid, signal.SIGKILL)
             except ProcessLookupError:
                 return True
             except OSError:
@@ -422,7 +441,7 @@ class DisposableCodingWorkerAdapter:
         self._reap(record["attempt_id"])
         process = self._processes.get(record["attempt_id"])
         return ((process is not None and process.poll() is not None)
-                or self._process_group_absent(record["pid"]))
+                or self._process_group_absent(identity.pgid))
 
     @staticmethod
     def _process_group_absent(pid: int) -> bool:
@@ -531,6 +550,14 @@ class DisposableCodingWorkerAdapter:
         record = _read_json(path)
         if record.get("proposal_digest") != task.digest: return RecoveryResult("failed", "proposal binding mismatch")
         state = record.get("state")
+        if record.get("version") != JOB_RECORD_VERSION:
+            if state not in {"intent_prepared", "consumed"}:
+                if state != "unknown":
+                    record["state"] = "unknown"
+                    record["legacy_identity"] = True
+                    _atomic_json(path, record)
+                return RecoveryResult("ambiguous", LEGACY_IDENTITY_DETAIL)
+            record["version"] = JOB_RECORD_VERSION
         if state in {"intent_prepared", "consumed"}:
             try:
                 grant = execution_grant_from_dict(_read_json(path.parent / "grant.json"))

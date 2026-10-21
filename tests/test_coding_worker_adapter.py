@@ -19,6 +19,7 @@ from orchestra.contracts import (
     ExecutionGrant, FileScope, GrantValidationError, IsolationRequirements,
     NetworkPolicy, ResourceLimits, TaskSpec,
 )
+from orchestra.process_identity import ProcessIdentity
 
 
 class MockAuthority:
@@ -154,21 +155,6 @@ class CodingWorkerAdapterTests(unittest.TestCase):
         process=adapter._processes[receipt.attempt_id]
         process.terminate(); process.wait(timeout=2)
 
-    def test_darwin_process_identity_requires_exact_process_group(self):
-        valid=mock.Mock(returncode=0,
-            stdout="Wed Oct 21 12:34:56 2026 1234 /usr/bin/python worker.py\n")
-        with mock.patch("orchestra.coding_worker_adapter.sys.platform","darwin"), \
-                mock.patch("orchestra.coding_worker_adapter.subprocess.run",
-                    return_value=valid):
-            identity=DisposableCodingWorkerAdapter._pid_start(1234)
-        self.assertIsInstance(identity,str); self.assertTrue(identity.startswith("darwin:"))
-        wrong_group=mock.Mock(returncode=0,
-            stdout="Wed Oct 21 12:34:56 2026 999 /usr/bin/python worker.py\n")
-        with mock.patch("orchestra.coding_worker_adapter.sys.platform","darwin"), \
-                mock.patch("orchestra.coding_worker_adapter.subprocess.run",
-                    return_value=wrong_group):
-            self.assertIsNone(DisposableCodingWorkerAdapter._pid_start(1234))
-
     def test_timeout_is_reported_without_retry(self):
         adapter=DisposableCodingWorkerAdapter(self.root,self.authority,
             harness=DisposableHarnessConfig("sleep",10)); value=task(seconds=1); receipt=adapter.dispatch(value,grant(value))
@@ -195,10 +181,54 @@ class CodingWorkerAdapterTests(unittest.TestCase):
             harness=DisposableHarnessConfig("sleep",10)); value=task(); issued=grant(value)
         receipt=adapter.dispatch(value,issued)
         reopened=DisposableCodingWorkerAdapter(self.root,self.authority)
-        with mock.patch.object(reopened,"_pid_start",return_value=None):
+        with mock.patch(
+            "orchestra.coding_worker_adapter.capture_process_identity",
+            return_value=None,
+        ):
             recovered=reopened.recover(value,issued.attempt_id)
         self.assertEqual(recovered.state,"ambiguous")
         adapter.cancel(receipt,"cleanup")
+
+    def test_identity_mismatch_is_unknown_and_not_cancelled(self):
+        adapter=DisposableCodingWorkerAdapter(self.root,self.authority,
+            harness=DisposableHarnessConfig("sleep",10)); value=task(); issued=grant(value)
+        receipt=adapter.dispatch(value,issued)
+        record=json.loads((self.root/issued.attempt_id/"job.json").read_text())
+        actual=ProcessIdentity.from_dict(record["process_identity"])
+        wrong=ProcessIdentity(
+            platform=actual.platform, pid=actual.pid, pgid=actual.pgid,
+            uid=actual.uid, start_seconds=actual.start_seconds,
+            start_microseconds=(actual.start_microseconds + 1) % 1_000_000,
+            start_ticks=(actual.start_ticks + 1 if actual.start_ticks is not None else None),
+        )
+        with mock.patch(
+            "orchestra.coding_worker_adapter.capture_process_identity",
+            return_value=wrong,
+        ):
+            self.assertEqual(adapter.status(receipt).state,"unknown")
+            result=adapter.cancel(receipt,"must not signal")
+        self.assertFalse(result.requested)
+        os.killpg(record["pid"],signal.SIGKILL)
+        adapter._processes[issued.attempt_id].wait(timeout=2)
+
+    def test_legacy_job_record_is_not_adopted(self):
+        adapter=DisposableCodingWorkerAdapter(self.root,self.authority,
+            harness=DisposableHarnessConfig("sleep",10)); value=task(); issued=grant(value)
+        receipt=adapter.dispatch(value,issued)
+        record_path=self.root/issued.attempt_id/"job.json"
+        record=json.loads(record_path.read_text())
+        pid=record["pid"]
+        record["version"]=1
+        record["pid_start"]="darwin:legacy-command-hash"
+        record.pop("process_identity",None)
+        record_path.write_text(json.dumps(record))
+        state=adapter.status(receipt)
+        self.assertEqual(state.state,"unknown")
+        self.assertIn("legacy",state.detail or "")
+        reopened=DisposableCodingWorkerAdapter(self.root,self.authority)
+        self.assertEqual(reopened.recover(value,issued.attempt_id).state,"ambiguous")
+        os.killpg(pid,signal.SIGKILL)
+        adapter._processes[issued.attempt_id].wait(timeout=2)
 
     def test_recovery_adopts_a_live_process(self):
         adapter=DisposableCodingWorkerAdapter(self.root,self.authority,

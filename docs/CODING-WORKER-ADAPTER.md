@@ -16,11 +16,40 @@ worker outcome. The worker result remains an `untrusted_worker_report` and
 `completion_verified` is always false.
 
 Cancellation sends `SIGTERM` to the disposable worker's process group, checks
-the recorded Linux process start identity before signalling, and escalates to
+the recorded stable process identity before signalling, and escalates to
 `SIGKILL` only for that same group. A missing process without a terminal result
 is `unknown`; recovery returns `ambiguous` and never retries it. `collect()`
 recomputes artifact size and SHA-256 before constructing an `ExecutionReport`,
 then removes the disposable workspace and harness input.
+
+## Process identity
+
+A PID alone is never treated as worker identity. The adapter persists a
+`ProcessIdentity` containing the PID, process group, effective UID and a
+kernel-derived start time:
+
+- **Linux:** `/proc/<pid>/stat` process group and starttime, plus the effective
+  UID from `/proc/<pid>/status`.
+- **macOS:** `proc_pidinfo(PROC_PIDTBSDINFO)` from `libproc`, using `pbi_pid`,
+  `pbi_pgid`, `pbi_uid`, `pbi_start_tvsec` and `pbi_start_tvusec`.
+
+No mutable `/bin/ps` command text is part of identity. On macOS this is
+important because the Python framework launcher changes its visible command
+from `.../bin/python3` to `.../Resources/Python.app/Contents/MacOS/Python`
+during interpreter startup. Identity is captured after spawn with a bounded
+retry and must remain identical across that transition.
+
+If the kernel identity is unavailable, malformed or different, status becomes
+`unknown`, cancellation is refused, and recovery returns `ambiguous`. There is
+no weaker `ps` fallback for authorisation, cancellation or recovery.
+
+Job records written by the current adapter use record version 2 and store
+`process_identity` as a structured object. Version 1 records that have already
+launched a process (including the former Darwin command hash in `pid_start`)
+are never adopted: status becomes `unknown` and recovery returns `ambiguous`.
+A version 1 record in `intent_prepared` or `consumed` may still be recovered
+through the authority because no process has been launched; it is upgraded to
+version 2 before launch.
 
 ## Phase 3C authenticated authority boundary
 
@@ -63,7 +92,7 @@ separate verifier identity can mark the authority attempt verified.
 | `intent_prepared` | Query the exact consume request. Consume only when the authority proves it was never seen. |
 | `consumed` | Launch the fixed harness once from the persisted grant and task binding. |
 | `launching` | Mark unknown and never retry: the process-start outcome is uncertain. |
-| `running` | Adopt only a live process whose PID, process group and platform process-start identity match. |
+| `running` | Adopt only a live process whose PID, process group, UID and kernel start time match the persisted `ProcessIdentity`. |
 | Terminal result | Recompute bounded artifact metadata and return the same durable untrusted report. |
 
 Cancellation targets the recorded process group. A cancellation race or a
@@ -81,9 +110,11 @@ machine or shared contracts.
 
 ## Limitations
 
-- This is a Unix test harness. Linux identity uses `/proc`; macOS identity uses
-  fixed-argument `/bin/ps` output bound to start time, process group and command.
-  An unavailable or malformed identity fails closed. Windows is unsupported.
+- This is a Unix test harness. Linux identity uses `/proc` starttime, process
+  group and UID. macOS identity uses `proc_pidinfo` microsecond start time,
+  process group and UID; no command text is trusted. An unavailable, malformed
+  or mismatched identity fails closed, and version 1 launched records are not
+  adopted. Windows is unsupported.
 - It simulates one bounded file change and does not clone or modify a repository.
 - It provides no OS sandbox beyond a private temporary directory; production
   isolation remains a future runtime responsibility.

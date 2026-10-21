@@ -1,3 +1,4 @@
+import os
 import tempfile
 import threading
 import time
@@ -41,9 +42,13 @@ def integration_task(suffix="one", *, seconds=5):
 def integration_config(root, task):
     state=root/"s"; runtime=root/"r"
     state.mkdir(mode=0o700); runtime.mkdir(mode=0o750)
+    # /tmp inherits its parent group on Darwin; model the production tmpfiles
+    # ownership instead of relying on Linux directory-group semantics.
+    os.chown(runtime, -1, os.getgid())
+    os.chmod(runtime, 0o750)
     return ServiceConfig(authority_id="authority:phase3c-test",
-        service_uid=__import__("os").geteuid(), database_path=str(state/"a.db"),
-        socket_path=str(runtime/"a.sock"), socket_gid=__import__("os").getgid(),
+        service_uid=os.geteuid(), database_path=str(state/"a.db"),
+        socket_path=str(runtime/"a.sock"), socket_gid=os.getgid(),
         peers=tuple(PeerIdentity(uid,role,role) for role,uid in CLIENT_UIDS.items()),
         audiences=(ExecutionAudience(adapter_id=ADAPTER_ID,runtime=RUNTIME,
             agent_id=task.agent_id,model_provider=task.model_provider,
@@ -59,6 +64,7 @@ class AuthorityAdapterIntegrationTests(unittest.TestCase):
         self.task=integration_task(); self.clock=MutableClock()
         config=integration_config(self.root,self.task)
         self.assertLess(len(config.socket_path.encode("utf-8")),80)
+        self.assertEqual(Path(config.socket_path).parent.stat().st_gid, config.socket_gid)
         self.running=RunningService(config,clock=self.clock)
         self.running.__enter__(); self.addCleanup(self.running.__exit__,None,None,None)
         self.coordinator=self.running.client("coordinator")
