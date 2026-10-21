@@ -68,13 +68,15 @@ def default_opencode_executable() -> Path:
 
 def sandbox_backend(requested: str = "auto") -> str:
     """Resolve the isolation backend, failing closed for unknown requests."""
-    if requested not in {"auto", "seatbelt", "bubblewrap"}:
-        raise ValueError("sandbox backend must be auto, seatbelt, or bubblewrap")
+    if requested not in {"auto", "seatbelt", "bubblewrap", "systemd"}:
+        raise ValueError("sandbox backend must be auto, seatbelt, bubblewrap, or systemd")
     platform = host_platform()
     if requested == "seatbelt":
         return "seatbelt" if platform == "darwin" else _unavailable(requested, platform)
     if requested == "bubblewrap":
         return "bubblewrap" if platform == "linux" else _unavailable(requested, platform)
+    if requested == "systemd":
+        return "systemd" if platform == "linux" else _unavailable(requested, platform)
     if platform == "darwin":
         return "seatbelt"
     if platform == "linux":
@@ -100,6 +102,11 @@ def sandbox_executable(backend: str) -> str:
             raise SandboxUnavailable(
                 "bubblewrap (bwrap) is required for the Linux worker sandbox"
             )
+        return str(Path(discovered).resolve(strict=True))
+    if backend == "systemd":
+        discovered = shutil.which("systemd-run")
+        if not discovered:
+            raise SandboxUnavailable("systemd-run is required for the systemd worker sandbox")
         return str(Path(discovered).resolve(strict=True))
     raise ValueError("unknown sandbox backend")
 
@@ -266,6 +273,39 @@ def _bubblewrap_command(policy: SandboxPolicy, command: Sequence[str]) -> list[s
     return args
 
 
+def _systemd_command(policy: SandboxPolicy, command: Sequence[str]) -> list[str]:
+    """Confine a worker in a transient service when Bubblewrap mounts fail."""
+    if policy.loopback_bind_ports or policy.loopback_connect_ports:
+        raise SandboxUnavailable("exact loopback-port filtering requires the Seatbelt backend")
+    args = [
+        sandbox_executable("systemd"), "--wait", "--collect", "--quiet", "--pipe",
+        "--service-type=exec", "--property=NoNewPrivileges=yes",
+        "--property=PrivateTmp=yes", "--property=ProtectSystem=strict",
+        "--property=ProtectHome=tmpfs", "--property=RestrictSUIDSGID=yes",
+        "--property=LockPersonality=yes",
+    ]
+    families = "AF_UNIX" + (" AF_INET AF_INET6" if policy.network_hosts else "")
+    args.append(f"--property=RestrictAddressFamilies={families}")
+    for path in policy.read_paths:
+        if not path.exists():
+            raise SandboxUnavailable(f"sandbox read path does not exist: {path}")
+        args.append(f"--property=BindReadOnlyPaths={path}:{path}")
+    for path in policy.read_files:
+        if not path.exists():
+            raise SandboxUnavailable(f"sandbox read file does not exist: {path}")
+        args.append(f"--property=BindReadOnlyPaths={path}:{path}")
+    for path in policy.write_paths:
+        if not path.exists():
+            raise SandboxUnavailable(f"sandbox write path does not exist: {path}")
+        args.append(f"--property=BindPaths={path}:{path}")
+    if policy.workdir is not None:
+        args.append(f"--working-directory={policy.workdir}")
+    environment = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/tmp", "TMPDIR": "/tmp", **policy.environment}
+    for name, value in sorted(environment.items()):
+        args.append(f"--setenv={name}={value}")
+    return [*args, "--", *command]
+
+
 def sandbox_command(policy: SandboxPolicy, command: Sequence[str]) -> list[str]:
     """Wrap ``command`` in the host's supported sandbox.
 
@@ -281,7 +321,9 @@ def sandbox_command(policy: SandboxPolicy, command: Sequence[str]) -> list[str]:
             raise ValueError("Seatbelt executable must be an absolute path")
         profile = _seatbelt_profile(normalized, str(executable))
         return [sandbox_executable("seatbelt"), "-p", profile, *command]
-    return _bubblewrap_command(normalized, command)
+    if backend == "bubblewrap":
+        return _bubblewrap_command(normalized, command)
+    return _systemd_command(normalized, command)
 
 
 def describe_sandbox(requested: str = "auto") -> dict[str, object]:
