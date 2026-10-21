@@ -61,6 +61,14 @@ bwrap --version
 git --version
 ```
 
+The supplied configuration uses a systemd transient-service sandbox. It is the
+compatible fallback for a host where Bubblewrap cannot construct its private
+root filesystem (for example, `Can't open source /: Function not implemented`).
+It retains `ProtectSystem=strict`, private temporary storage,
+no-new-privileges, restricted address families, and explicit read/write bind
+paths. Do not replace it with unsandboxed execution. Bubblewrap remains
+available for hosts where a real worker preflight succeeds.
+
 Install the reviewed Codex CLI for the service user, or place it on the service
 `PATH`. Confirm:
 

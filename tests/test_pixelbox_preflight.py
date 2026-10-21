@@ -49,18 +49,15 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
     def test_installer_cannot_start_services_before_readiness_preflight(self):
         source = (DEPLOY / "install.sh").read_text()
         staged_gate = source.index('if [[ "$STAGED_ONLY" == "1" ]]')
-        broker_config_gate = source.index("ServiceConfig.load")
         daemon_reload = source.index("systemctl daemon-reload")
-        broker_start = source.index("systemctl enable --now orchestra-github-dispatch.service")
         coordinator_config_gate = source.index(
             "from omcp.controller import Config; Config.load"
         )
         coordinator_start = source.index("systemctl enable orchestra-omcp.service")
-        self.assertLess(staged_gate, broker_config_gate)
-        self.assertLess(broker_config_gate, daemon_reload)
-        self.assertLess(daemon_reload, broker_start)
-        self.assertLess(broker_start, coordinator_config_gate)
+        self.assertLess(staged_gate, daemon_reload)
+        self.assertLess(daemon_reload, coordinator_config_gate)
         self.assertLess(coordinator_config_gate, coordinator_start)
+        self.assertNotIn("orchestra-github-dispatch.service", source)
         self.assertIn("--apply requires a Linux ARM64 host", source)
         self.assertIn("units use this path", source)
 
@@ -68,18 +65,11 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
         coordinator = (
             DEPLOY / "systemd" / "orchestra-omcp.service"
         ).read_text()
-        broker = (
-            DEPLOY / "systemd" / "orchestra-github-dispatch.service"
-        ).read_text()
         tunnel = (DEPLOY / "systemd" / "orchestra-tunnel.service").read_text()
         health = (DEPLOY / "systemd" / "orchestra-health.service").read_text()
 
         self.assertIn("ExecStartPre=/usr/bin/test -r /etc/orchestra/omcp.json", coordinator)
-        self.assertIn("User=orchestra-github", broker)
-        self.assertIn("Group=orchestra-ipc", broker)
-        self.assertIn("ProtectSystem=strict", broker)
-        self.assertNotIn("EnvironmentFile=", broker)
-        self.assertIn("Before=orchestra-omcp.service", broker)
+        self.assertNotIn("orchestra-github-dispatch", coordinator)
         self.assertIn("ExecStartPre=/usr/bin/test -S ", tunnel)
         self.assertIn("After=orchestra-omcp.service", health)
         for optional in (
@@ -107,6 +97,50 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
         self.assertIn(str(workspace / "config"), command)
         self.assertIn("--new-session", command)
         self.assertEqual(command[-3:], ["--", "/usr/bin/python3", "-V"])
+
+    def test_systemd_fallback_keeps_normal_workers_off_the_network(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            with patch("omcp.platform.host_platform", return_value="linux"), patch(
+                "omcp.platform.sandbox_executable", return_value="/usr/bin/systemd-run"
+            ):
+                command = sandbox_command(SandboxPolicy(
+                    read_paths=(workspace,), backend="systemd", workdir=workspace,
+                ), ["/usr/bin/true"])
+        self.assertIn("--property=NoNewPrivileges=yes", command)
+        self.assertIn("--property=PrivateTmp=yes", command)
+        self.assertIn("--property=RestrictAddressFamilies=AF_UNIX", command)
+
+    def test_systemd_provider_egress_requires_literal_allowlist(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            with patch("omcp.platform.host_platform", return_value="linux"), patch(
+                "omcp.platform.sandbox_executable", return_value="/usr/bin/systemd-run"
+            ):
+                with self.assertRaisesRegex(SandboxUnavailable, "IP allowlist"):
+                    sandbox_command(SandboxPolicy(
+                        read_paths=(workspace,), network_hosts=("api.deepseek.com",),
+                        backend="systemd", workdir=workspace,
+                    ), ["/usr/bin/true"])
+                command = sandbox_command(SandboxPolicy(
+                    read_paths=(workspace,), network_hosts=("api.deepseek.com",),
+                    network_addresses=("203.0.113.8",), backend="systemd", workdir=workspace,
+                ), ["/usr/bin/true"])
+        self.assertIn("--property=IPAddressDeny=any", command)
+        self.assertIn("--property=IPAddressAllow=203.0.113.8/32", command)
+
+    def test_systemd_launcher_runs_workers_as_a_dedicated_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            with patch("omcp.platform.host_platform", return_value="linux"), patch(
+                "omcp.platform.sandbox_executable", return_value="/usr/bin/systemd-run"
+            ):
+                command = sandbox_command(SandboxPolicy(
+                    read_paths=(workspace,), backend="systemd", workdir=workspace,
+                    worker_user="orchestra-worker", worker_group="orchestra-worker",
+                ), ["/usr/bin/true"])
+        self.assertIn("--uid=orchestra-worker", command)
+        self.assertIn("--gid=orchestra-worker", command)
 
     def test_provider_sandbox_reshare_is_limited_to_network_namespace(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -186,19 +220,17 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
         self.assertIn("separate owner approval", runbook)
         self.assertIn("A `0600` file under the same\nUID is not isolation", runbook)
 
-    def test_coordinator_example_contains_no_github_target_or_credential(self):
+    def test_coordinator_example_has_four_local_lanes_without_actions_dispatch(self):
         import json
 
         example = json.loads((DEPLOY / "omcp.example.json").read_text())
-        for name in ("actions-codex", "actions-deepseek"):
-            worker = example["workers"][name]
-            self.assertIn("github_dispatch_socket", worker)
-            self.assertIn("github_service_uid", worker)
-            for forbidden in (
-                "credential_file", "github_repository", "workflow",
-                "workflow_ref", "workflow_sha",
-            ):
-                self.assertNotIn(forbidden, worker)
+        self.assertEqual(set(example["workers"]), {
+            "ina-codex", "hamed-codex", "deepseek-primary", "deepseek-secondary",
+        })
+        self.assertEqual(example["task_approval_mode"], "required")
+        for worker in example["workers"].values():
+            self.assertNotIn("github_dispatch_socket", worker)
+            self.assertNotIn("github_service_uid", worker)
 
 
 if __name__ == "__main__":

@@ -363,6 +363,24 @@ class ControllerTests(unittest.TestCase):
             id_factory=lambda: "11111111-1111-1111-1111-111111111111")
         task = self.controller.submit_task("direct-approval", "Review", "Do not edit", "deepseek")
         self.assertEqual(task["status"], "approval_required")
+        self.assertEqual(task["approval"]["status"], "pending")
+        self.assertEqual(self.popen.call_count, 0)
+
+    def test_omitted_consequence_class_requires_explicit_approval(self):
+        self.controller.close()
+        self.controller = TaskController(
+            Config(
+                "owner/repo", self.root, self.state, "origin/main",
+                {"ina": Worker("ina", ("codex",))},
+                Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+                task_approval_mode="disabled",
+            ),
+            popen=self.popen, workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: "11111111-1111-1111-1111-111111111111",
+        )
+        task = self.controller.submit_task("unclassified-default", "Review", "Do not edit", "ina")
+        self.assertEqual(task["consequence_class"], "unclassified")
+        self.assertEqual(task["status"], "approval_required")
         self.assertEqual(self.popen.call_count, 0)
 
     def test_protected_and_unclassified_work_still_requires_explicit_approval(self):
@@ -400,7 +418,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(len(self.controller.list_approvals()["approvals"]), 4)
         self.popen.assert_not_called()
 
-    def test_disabled_approval_policy_runs_protected_and_unclassified_without_request(self):
+    def test_disabled_approval_policy_keeps_protected_and_unclassified_work_pending(self):
         self.controller.close()
         ids = iter([
             "11111111-1111-1111-1111-111111111111",
@@ -421,26 +439,24 @@ class ControllerTests(unittest.TestCase):
             "automatic-security", "Security work", "Perform bounded security work", "ina",
             True, "default", "security_change",
         )
-        self.assertEqual(first["status"], "running")
-        self.assertEqual(first["authorization"], {
-            "mode": "automatic", "policy": "task_approvals_disabled",
-        })
-        self.assertEqual(first["approval"]["status"], "not_required")
-        self.assertEqual(self.controller.list_approvals()["approvals"], [])
+        self.assertEqual(first["status"], "approval_required")
+        self.assertEqual(first["authorization"], {"mode": "explicit"})
+        self.assertEqual(first["approval"]["status"], "pending")
+        self.assertEqual(self.controller.list_approvals()["approvals"][0]["task_id"], first["task_id"])
 
-        self.complete(first["task_id"])
         second = self.controller.submit_task(
             "automatic-unclassified", "Unclassified work", "Perform bounded work", "ina",
             False, "default", "unclassified",
         )
-        self.assertEqual(second["status"], "running")
-        self.assertEqual(self.popen.call_count, 2)
+        self.assertEqual(second["status"], "approval_required")
+        self.assertEqual(self.popen.call_count, 0)
         audit = (self.state / "audit.jsonl").read_text()
-        self.assertIn('"authorization_mode":"automatic"', audit)
+        self.assertIn('"authorization_mode":"explicit"', audit)
 
     def test_disabled_approval_policy_releases_existing_pending_request(self):
         submitted = self.controller.submit_task(
             "pending-before-policy-change", "Queued work", "Perform bounded work", "ina",
+            True, None, "routine_development",
         )
         self.assertEqual(submitted["status"], "approval_required")
         self.controller.close()
@@ -656,6 +672,19 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(result["truncated"])
         self.assertEqual(len(result["result"]), 1024)
 
+    def test_result_reader_does_not_read_past_bound_sentinel(self):
+        self.controller.config = Config(
+            self.config.repository, self.config.project_root, self.config.state_dir,
+            self.config.base_ref, self.config.workers, self.config.principal,
+            max_result_bytes=1024,
+        )
+        submitted = self.submit()
+        self.complete(submitted["task_id"], result="x" * 4096)
+        with patch("pathlib.Path.read_bytes", side_effect=AssertionError("unbounded read")):
+            result = self.controller.task_result(submitted["task_id"])
+        self.assertTrue(result["truncated"])
+        self.assertEqual(len(result["result"]), 1024)
+
     def test_host_operation_is_exact_commit_local_approval_only(self):
         target = "1" * 40
         harness = "2" * 40
@@ -809,7 +838,7 @@ class ControllerTests(unittest.TestCase):
         submitted = [
             self.controller.submit_task(
                 f"parallel-{number}", "Parallel", "Run independently",
-                f"worker-{number}", True, f"repo-{number}", "unclassified",
+                f"worker-{number}", True, f"repo-{number}", "routine_development",
             )
             for number in range(1, 4)
         ]
@@ -850,10 +879,10 @@ class ControllerTests(unittest.TestCase):
             id_factory=lambda: next(ids),
         )
         first = self.controller.submit_task(
-            "writer-one", "Write one", "Edit files", "one", True, "one", "unclassified",
+            "writer-one", "Write one", "Edit files", "one", True, "one", "routine_development",
         )
         second = self.controller.submit_task(
-            "writer-two", "Write two", "Edit files", "two", True, "two", "unclassified",
+            "writer-two", "Write two", "Edit files", "two", True, "two", "routine_development",
         )
 
         self.assertEqual(first["status"], "running")
@@ -885,13 +914,13 @@ class ControllerTests(unittest.TestCase):
             id_factory=lambda: next(ids),
         )
         first = self.controller.submit_task(
-            "hot-1", "Hot one", "Edit", "hot-1", True, "hot", "unclassified",
+            "hot-1", "Hot one", "Edit", "hot-1", True, "hot", "routine_development",
         )
         hot_waiting = self.controller.submit_task(
-            "hot-2", "Hot two", "Edit", "hot-2", True, "hot", "unclassified",
+            "hot-2", "Hot two", "Edit", "hot-2", True, "hot", "routine_development",
         )
         other_waiting = self.controller.submit_task(
-            "other", "Other", "Edit", "other", True, "other", "unclassified",
+            "other", "Other", "Edit", "other", True, "other", "routine_development",
         )
         self.complete(first["task_id"])
         self.controller.tick()

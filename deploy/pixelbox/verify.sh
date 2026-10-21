@@ -133,7 +133,7 @@ else
 fi
 
 if command -v systemctl >/dev/null; then
-  for unit in orchestra-github-dispatch.service orchestra-omcp.service orchestra-health.timer; do
+  for unit in orchestra-omcp.service orchestra-health.timer; do
     if systemctl is-active --quiet "$unit"; then
       pass "$unit active"
     else
