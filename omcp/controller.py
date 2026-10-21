@@ -219,6 +219,8 @@ class Config:
     standing_authorizations: tuple[StandingAuthorization, ...] = ()
     host_operations: dict[str, HostOperation] | None = None
     task_approval_mode: str = "required"
+    local_worker_git_mode: str = "fetch"
+    local_worker_source_sha: str | None = None
     max_worker_seconds: int = 1_800
     max_parallel_tasks: int = 1
     startup_lease_seconds: int = 30
@@ -407,6 +409,15 @@ class Config:
         task_approval_mode = raw.get("task_approval_mode", "required")
         if task_approval_mode not in {"required", "disabled"}:
             raise ValueError("task_approval_mode must be required or disabled")
+        local_worker_git_mode = raw.get("local_worker_git_mode", "fetch")
+        if local_worker_git_mode not in {"fetch", "owner_synced"}:
+            raise ValueError("local_worker_git_mode must be fetch or owner_synced")
+        local_worker_source_sha = raw.get("local_worker_source_sha")
+        if local_worker_git_mode == "owner_synced" and (
+            not isinstance(local_worker_source_sha, str) or
+            not re.fullmatch(r"[0-9a-f]{40}", local_worker_source_sha)
+        ):
+            raise ValueError("owner_synced requires a pinned 40-character local_worker_source_sha")
         max_worker_seconds = int(raw.get("max_worker_seconds", 1_800))
         if not 60 <= max_worker_seconds <= 7_200:
             raise ValueError("max_worker_seconds must be between 60 and 7200")
@@ -571,6 +582,8 @@ class Config:
             standing_authorizations=tuple(standing_authorizations),
             host_operations=host_operations,
             task_approval_mode=task_approval_mode,
+            local_worker_git_mode=local_worker_git_mode,
+            local_worker_source_sha=local_worker_source_sha,
             max_worker_seconds=max_worker_seconds,
             max_parallel_tasks=max_parallel_tasks,
             startup_lease_seconds=startup_lease_seconds,
@@ -1543,10 +1556,11 @@ class TaskController:
             # GitHub Actions checks out the exact source SHA remotely.  Its local
             # worktree is prepared from the owner-synchronised tracking ref so
             # the coordinator never needs the broker's private GitHub token.
-            # Local workers still refresh their base ref before creating a
-            # worktree because they execute from that checkout directly.
+            # Local workers fetch by default; owner_synced requires an
+            # owner-pinned exact commit and never accesses GitHub credentials.
             workspace = self.workspace_preparer(
-                task_id, branch, profile, worker.adapter != "github_actions",
+                task_id, branch, profile,
+                worker.adapter != "github_actions" and self.config.local_worker_git_mode == "fetch",
             )
             source_sha: str | None = None
             if worker.adapter == "github_actions":
@@ -1801,6 +1815,14 @@ class TaskController:
                 profile.project_root, "fetch", "--no-tags", "origin",
                 profile.base_ref.split("/", 1)[1],
             )
+        elif self.config.local_worker_git_mode == "owner_synced":
+            pinned = self.config.local_worker_source_sha
+            if not isinstance(pinned, str) or not re.fullmatch(r"[0-9a-f]{40}", pinned):
+                raise RuntimeError("owner_synced requires an owner-pinned source commit")
+            code, resolved = self._git(profile.project_root, "rev-parse", "--verify",
+                                       profile.base_ref + "^{commit}", allow_failure=True)
+            if code != 0 or resolved != pinned:
+                raise RuntimeError("owner-synchronised ref differs from pinned source commit")
         exists, _ = self._git(profile.project_root, "show-ref", "--verify", "--quiet",
                               "refs/heads/" + branch, allow_failure=True)
         if exists != 1:

@@ -117,9 +117,14 @@ Keep the checkout's `origin` set to the configured repository's canonical
 workers, synchronise `origin/<branch>` through the reviewed migration/import
 step before activation. The coordinator creates the local worktree from that
 owner-synchronised ref without fetching, so the broker's private GitHub token
-does not cross into the coordinator identity. Local workers still fetch their
-configured base ref and therefore require their own separately reviewed Git
-read credential for a private repository.
+does not cross into the coordinator identity. Local workers fetch their configured base ref by default. On credential-isolated
+PixelBox, set `local_worker_git_mode` to `owner_synced` and set
+`local_worker_source_sha` to the full, independently reviewed commit SHA.
+An owner-controlled sync must update the local tracking ref to that exact SHA
+before starting workers. The coordinator checks that the ref matches the pin
+and does not fetch. This pin is not evidence of freshness or upstream approval;
+the owner must independently verify the SHA and repeat the sync/pin update for
+new revisions. Never put GitHub credentials in the coordinator.
 
 ## 4. GitHub Actions worker setup
 
