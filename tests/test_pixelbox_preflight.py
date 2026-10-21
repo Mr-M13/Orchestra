@@ -7,6 +7,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +16,7 @@ from omcp.health import _iso_age_seconds
 from omcp.mcp_proxy import _validate_socket_path, connect
 from omcp.platform import SandboxPolicy, SandboxUnavailable, sandbox_command
 from omcp.runner import opencode_commands
+from omcp import systemd_deepseek_launcher
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +24,29 @@ DEPLOY = ROOT / "deploy" / "pixelbox"
 
 
 class PixelBoxDeploymentPreflightTests(unittest.TestCase):
+
+    def test_root_launcher_rejects_untrusted_task_spec_and_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"; task_id = "11111111-1111-1111-1111-111111111111"
+            task_dir = state / "tasks" / task_id; task_dir.mkdir(parents=True)
+            spec = task_dir / "runner.json"
+            spec.write_text(json.dumps({"adapter": "codex", "task_id": task_id}))
+            spec.chmod(0o600)
+            with patch.object(systemd_deepseek_launcher, "STATE_ROOT", state), \
+                    patch("omcp.systemd_deepseek_launcher.pwd.getpwnam", return_value=type("P", (), {"pw_uid": os.getuid()})()):
+                with self.assertRaisesRegex(SystemExit, "exact DeepSeek task"):
+                    systemd_deepseek_launcher.task_spec(task_id)
+
+    def test_root_launcher_requires_root_owned_literal_ip_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy = Path(directory) / "policy.json"
+            policy.write_text(json.dumps({"endpoint_addresses": ["api.deepseek.com"]}))
+            policy.chmod(0o600)
+            with patch.object(systemd_deepseek_launcher, "POLICY", policy), \
+                    patch("omcp.systemd_deepseek_launcher.private_regular"):
+                with self.assertRaisesRegex(SystemExit, "non-literal IP"):
+                    systemd_deepseek_launcher.policy_addresses()
     def test_scripts_parse_and_default_to_read_only_operations(self):
         install = DEPLOY / "install.sh"
         verify = DEPLOY / "verify.sh"

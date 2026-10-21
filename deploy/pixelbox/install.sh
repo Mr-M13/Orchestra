@@ -84,6 +84,8 @@ validate_source_commit() {
   for required in \
     omcp/server.py \
     omcp/health.py \
+    omcp/systemd_deepseek_launcher.py \
+    deploy/pixelbox/sudoers/orchestra-deepseek-worker \
     deploy/pixelbox/systemd/orchestra-omcp.service; do
     git -C "$SOURCE_ROOT" cat-file -e "$RELEASE_SHA:$required" 2>/dev/null \
       || fail "release commit is missing reviewed file: $required"
@@ -181,6 +183,8 @@ validate_release_tree() {
     .github/workflows/orchestra-worker.yml \
     deploy/pixelbox/install.sh \
     deploy/pixelbox/verify.sh \
+    omcp/systemd_deepseek_launcher.py \
+    deploy/pixelbox/sudoers/orchestra-deepseek-worker \
     deploy/pixelbox/systemd/orchestra-omcp.service; do
     sudo test -r "$release_root/$required" \
       || fail "staged release is missing reviewed file: $required"
@@ -281,6 +285,12 @@ install_units() {
     sudo install -m 0644 "$release_root/deploy/pixelbox/systemd/$unit" \
       "/etc/systemd/system/$unit"
   done
+  sudo install -D -o root -g root -m 0755 "$release_root/omcp/systemd_deepseek_launcher.py" \
+    /usr/local/libexec/orchestra-deepseek-launcher
+  sudo install -D -o root -g root -m 0440 "$release_root/deploy/pixelbox/sudoers/orchestra-deepseek-worker" \
+    /etc/sudoers.d/orchestra-deepseek-worker
+  sudo visudo -cf /etc/sudoers.d/orchestra-deepseek-worker >/dev/null \
+    || fail "DeepSeek launcher sudo policy is invalid"
 }
 
 preflight_activation() {
@@ -304,6 +314,15 @@ preflight_activation() {
     mode="$(sudo stat -c '%a' "$CONFIG_ROOT/$file")"
     [[ "$mode" == "600" ]] || fail "$CONFIG_ROOT/$file must have mode 0600"
   done
+  id orchestra-worker >/dev/null 2>&1 || fail "dedicated orchestra-worker account is missing"
+  sudo test -f "$CONFIG_ROOT/deepseek-worker.json" \
+    || fail "root-owned DeepSeek network policy is missing"
+  [[ "$(sudo stat -c '%a:%u' "$CONFIG_ROOT/deepseek-worker.json")" == "600:0" ]] \
+    || fail "DeepSeek network policy must be root-owned mode 0600"
+  sudo test -f "$CONFIG_ROOT/secrets/deepseek-api-key" \
+    || fail "DeepSeek credential is missing"
+  [[ "$(sudo stat -c '%a:%U' "$CONFIG_ROOT/secrets/deepseek-api-key")" == "400:orchestra-worker" ]] \
+    || fail "DeepSeek credential must be owned by orchestra-worker mode 0400"
 }
 
 activate_release() {

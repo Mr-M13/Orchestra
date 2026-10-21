@@ -147,6 +147,14 @@ class PlatformTests(unittest.TestCase):
             credential = root / "credential"; credential.write_text("test")
             with self.assertRaisesRegex(SandboxUnavailable, "IP allowlist"):
                 deepseek_runner_command(spec, root, root, credential, "systemd")
+            command = deepseek_runner_command(
+                spec, root / "11111111-1111-1111-1111-111111111111", root,
+                credential, "systemd", ("203.0.113.8",),
+            )
+        self.assertEqual(command, [
+            "/usr/bin/sudo", "-n", "/usr/local/libexec/orchestra-deepseek-launcher",
+            "--task-id", "11111111-1111-1111-1111-111111111111",
+        ])
 
 
 class GitHubConfigTests(unittest.TestCase):

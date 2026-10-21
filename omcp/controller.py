@@ -17,7 +17,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from omcp.platform import (
-    SandboxPolicy, canonical_git_executable, default_opencode_executable,
+    SandboxPolicy, SandboxUnavailable, canonical_git_executable, default_opencode_executable,
     describe_sandbox, host_platform, sandbox_command,
 )
 
@@ -133,6 +133,13 @@ def deepseek_runner_command(spec_path: Path, task_dir: Path, workspace: Path,
                             credential_file: Path, backend: str = "auto",
                             endpoint_addresses: tuple[str, ...] = ()) -> list[str]:
     """Run the direct adapter with only its private files and DeepSeek egress."""
+    if backend == "systemd":
+        if not endpoint_addresses:
+            raise SandboxUnavailable("systemd provider egress requires an owner-configured literal IP allowlist")
+        return [
+            "/usr/bin/sudo", "-n", "/usr/local/libexec/orchestra-deepseek-launcher",
+            "--task-id", task_dir.name,
+        ]
     source_root = Path(__file__).resolve().parent.parent
     policy = SandboxPolicy(
         read_paths=(source_root, workspace, task_dir),

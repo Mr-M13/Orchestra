@@ -1,0 +1,2 @@
+Cmnd_Alias ORCHESTRA_DEEPSEEK_LAUNCH = /usr/local/libexec/orchestra-deepseek-launcher --task-id *
+hamed ALL=(root) NOPASSWD: ORCHESTRA_DEEPSEEK_LAUNCH

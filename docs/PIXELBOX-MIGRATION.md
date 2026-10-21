@@ -61,13 +61,30 @@ bwrap --version
 git --version
 ```
 
-The supplied configuration uses a systemd transient-service sandbox. It is the
-compatible fallback for a host where Bubblewrap cannot construct its private
-root filesystem (for example, `Can't open source /: Function not implemented`).
-It retains `ProtectSystem=strict`, private temporary storage,
-no-new-privileges, restricted address families, and explicit read/write bind
-paths. Do not replace it with unsandboxed execution. Bubblewrap remains
-available for hosts where a real worker preflight succeeds.
+DeepSeek may use the supplied root-owned systemd launcher when Bubblewrap cannot
+construct its private root filesystem (for example, `Can't open source /:
+Function not implemented`). The coordinator is granted only one fixed launcher
+command; it cannot call `systemd-run`, choose a unit, identity, command, mount,
+environment, or network property. The launcher runs only `omcp.runner` as
+`orchestra-worker`, with `IPAddressDeny=any` and literal IP addresses from a
+root-owned policy file. Do not replace it with unsandboxed execution.
+
+Before activation, a local root operator must create the dedicated account,
+place the DeepSeek credential where only that account can read it, and record
+the currently approved literal provider addresses. These are installation
+prerequisites, not values to commit or enter into chat:
+
+```sh
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin orchestra-worker
+sudo install -d -m 0700 -o root -g root /etc/orchestra/secrets
+sudo install -m 0400 -o orchestra-worker -g orchestra-worker /path/to/deepseek-api-key /etc/orchestra/secrets/deepseek-api-key
+sudo install -m 0600 -o root -g root /path/to/reviewed-deepseek-worker.json /etc/orchestra/deepseek-worker.json
+```
+
+`deepseek-worker.json` contains only `{"endpoint_addresses":["literal-ip",...]}`.
+An absent, non-literal, non-root-owned, or empty policy fails closed. Validate a
+candidate with a harmless approved DeepSeek task and prove that a connection to
+an unapproved address is denied before enabling the tunnel.
 
 Install the reviewed Codex CLI for the service user, or place it on the service
 `PATH`. Confirm:
