@@ -310,7 +310,7 @@ preflight_activation() {
   validate_release_tree "$release_root"
   for file in omcp.json omcp.env tunnel.env; do
     [[ -f "$CONFIG_ROOT/$file" ]] || fail "required owner configuration is missing: $CONFIG_ROOT/$file"
-    mode="$(stat -c '%a' "$CONFIG_ROOT/$file")"
+    mode="$(sudo stat -c '%a' "$CONFIG_ROOT/$file")"
     [[ "$mode" == "600" ]] || fail "$CONFIG_ROOT/$file must have mode 0600"
   done
   id orchestra-github >/dev/null 2>&1 || fail "dedicated orchestra-github account is missing"
@@ -319,15 +319,15 @@ preflight_activation() {
   broker_uid="$(id -u orchestra-github)"
   [[ "$coordinator_uid" != "$broker_uid" ]] || fail "GitHub broker must use a different UID"
   for file in github-dispatch/config.json github-dispatch/github-actions.token; do
-    [[ -f "$CONFIG_ROOT/$file" ]] || fail "broker configuration is missing: $CONFIG_ROOT/$file"
-    [[ "$(stat -c '%a' "$CONFIG_ROOT/$file")" == "600" ]] \
+    sudo test -f "$CONFIG_ROOT/$file" || fail "broker configuration is missing: $CONFIG_ROOT/$file"
+    [[ "$(sudo stat -c '%a' "$CONFIG_ROOT/$file")" == "600" ]] \
       || fail "$CONFIG_ROOT/$file must have mode 0600"
-    [[ "$(stat -c '%u' "$CONFIG_ROOT/$file")" == "$broker_uid" ]] \
+    [[ "$(sudo stat -c '%u' "$CONFIG_ROOT/$file")" == "$broker_uid" ]] \
       || fail "$CONFIG_ROOT/$file must be owned by orchestra-github"
   done
-  [[ "$(stat -c '%a' "$CONFIG_ROOT/github-dispatch")" == "700" ]] \
+  [[ "$(sudo stat -c '%a' "$CONFIG_ROOT/github-dispatch")" == "700" ]] \
     || fail "$CONFIG_ROOT/github-dispatch must have mode 0700"
-  [[ "$(stat -c '%u' "$CONFIG_ROOT/github-dispatch")" == "$broker_uid" ]] \
+  [[ "$(sudo stat -c '%u' "$CONFIG_ROOT/github-dispatch")" == "$broker_uid" ]] \
     || fail "$CONFIG_ROOT/github-dispatch must be owned by orchestra-github"
   sudo -u orchestra-github PYTHONPATH="$release_root" /usr/bin/python3 -c \
     'import sys; from pathlib import Path; from omcp.github_dispatch_service import ServiceConfig; ServiceConfig.load(Path(sys.argv[1]))' \
