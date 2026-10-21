@@ -1,4 +1,5 @@
 import io
+from dataclasses import replace
 import http.client
 import json
 import os
@@ -113,6 +114,42 @@ class ControllerTests(unittest.TestCase):
             submitted["task_id"], "omcp/task-11111111",
             self.config.profile("default"), True,
         )
+
+    def test_owner_synced_local_worker_skips_fetch_and_checks_pin(self):
+        sha = "a" * 40
+        self.controller.config = replace(
+            self.config, local_worker_git_mode="owner_synced", local_worker_source_sha=sha,
+        )
+        profile = self.config.profile("default")
+        def fake_git(_root, *args, **_kwargs):
+            return (1, "") if "show-ref" in args else (0, sha)
+        with patch.object(self.controller, "_verify_profile_origin"), \
+                patch.object(self.controller, "_git", side_effect=fake_git) as git:
+            result = self.controller._prepare_workspace("test-owner", "omcp/task-owner", profile, False)
+        self.assertEqual(result, self.state / "worktrees" / "default" / "test-owner")
+        self.assertFalse(any("fetch" in call.args for call in git.call_args_list))
+        self.assertTrue(any("rev-parse" in call.args for call in git.call_args_list))
+
+    def test_owner_synced_local_worker_rejects_mismatched_ref(self):
+        self.controller.config = replace(
+            self.config, local_worker_git_mode="owner_synced", local_worker_source_sha="a" * 40,
+        )
+        with patch.object(self.controller, "_verify_profile_origin"), \
+                patch.object(self.controller, "_git", return_value=(0, "b" * 40)):
+            with self.assertRaisesRegex(RuntimeError, "differs from pinned"):
+                self.controller._prepare_workspace(
+                    "test-mismatch", "omcp/task-mismatch", self.config.profile("default"), False,
+                )
+
+    def test_owner_synced_local_worker_rejects_wrong_origin(self):
+        self.controller.config = replace(
+            self.config, local_worker_git_mode="owner_synced", local_worker_source_sha="a" * 40,
+        )
+        with patch.object(self.controller, "_git", return_value=(0, "https://github.com/other/repo.git")):
+            with self.assertRaisesRegex(RuntimeError, "origin must match"):
+                self.controller._prepare_workspace(
+                    "test-origin", "omcp/task-origin", self.config.profile("default"), False,
+                )
 
     def test_opencode_failure_exposes_only_allowlisted_diagnostic_fields(self):
         self.controller.close()
