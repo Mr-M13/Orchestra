@@ -15,7 +15,9 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
+import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -38,6 +40,11 @@ ADAPTER_ID = "disposable-coding-worker"
 RUNTIME = "local_process"
 HARNESS_ID = "disposable-harness"
 MAX_INSTRUCTION_BYTES = 65_536
+
+_THREAD_LOCKS_GUARD = threading.Lock()
+_THREAD_LOCKS: weakref.WeakValueDictionary[str, threading.Lock] = (
+    weakref.WeakValueDictionary()
+)
 
 
 class AdapterExecutionError(RuntimeError):
@@ -180,15 +187,22 @@ class DisposableCodingWorkerAdapter:
     @contextmanager
     def _attempt_lock(self, attempt_id: str):
         lock_path = self.state_root / ("." + attempt_id + ".lock")
-        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(lock_path, flags, 0o600)
-        try:
-            os.fchmod(descriptor, 0o600)
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            yield
-        finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-            os.close(descriptor)
+        key = str(lock_path)
+        with _THREAD_LOCKS_GUARD:
+            thread_lock = _THREAD_LOCKS.get(key)
+            if thread_lock is None:
+                thread_lock = threading.Lock()
+                _THREAD_LOCKS[key] = thread_lock
+        with thread_lock:
+            flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(lock_path, flags, 0o600)
+            try:
+                os.fchmod(descriptor, 0o600)
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                yield
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
 
     def dispatch(self, task: TaskSpec, grant: ExecutionGrant) -> DispatchReceipt:
         with self._attempt_lock(grant.attempt_id):

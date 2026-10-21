@@ -4,6 +4,7 @@ import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 from orchestra.authority import (
     ExecutionAudience, execution_grant_from_dict,
@@ -130,6 +131,25 @@ class AuthorityAdapterIntegrationTests(unittest.TestCase):
         threads=[threading.Thread(target=dispatch,args=(adapter,)) for adapter in adapters]
         for thread in threads: thread.start()
         for thread in threads: thread.join()
+        self.assertFalse(errors)
+        self.assertEqual(len(receipts),2); self.assertEqual(receipts[0],receipts[1])
+        owners=[adapter for adapter in adapters if grant.attempt_id in adapter._processes]
+        self.assertEqual(len(owners),1)
+        owners[0].cancel(receipts[0],"test cleanup")
+
+    def test_shared_state_serializes_when_flock_is_process_scoped(self):
+        grant=self.issue(); state=self.root/"shared-jobs"
+        adapters=[DisposableCodingWorkerAdapter(
+            state,self.coordinator,clock=self.clock,
+            harness=DisposableHarnessConfig("sleep",1)) for _ in range(2)]
+        receipts=[]; errors=[]
+        def dispatch(adapter):
+            try: receipts.append(adapter.dispatch(self.task,grant))
+            except Exception as exc: errors.append(exc)
+        threads=[threading.Thread(target=dispatch,args=(adapter,)) for adapter in adapters]
+        with mock.patch("orchestra.coding_worker_adapter.fcntl.flock"):
+            for thread in threads: thread.start()
+            for thread in threads: thread.join()
         self.assertFalse(errors)
         self.assertEqual(len(receipts),2); self.assertEqual(receipts[0],receipts[1])
         owners=[adapter for adapter in adapters if grant.attempt_id in adapter._processes]
