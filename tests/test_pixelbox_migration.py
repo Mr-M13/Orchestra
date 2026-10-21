@@ -126,7 +126,7 @@ class PlatformTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
                 patch("omcp.platform.host_platform", return_value="linux"), \
                 patch("omcp.platform.sandbox_executable", return_value="/usr/bin/systemd-run"):
-            workspace = Path(directory)
+            workspace = Path(directory).resolve()
             command = sandbox_command(SandboxPolicy(
                 read_paths=(workspace,), write_paths=(workspace,),
                 backend="systemd", workdir=workspace,
