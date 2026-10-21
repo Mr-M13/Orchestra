@@ -319,8 +319,36 @@ class DisposableCodingWorkerAdapter:
 
     @staticmethod
     def _pid_start(pid: int) -> str | None:
-        try: return Path(f"/proc/{pid}/stat").read_text().split()[21]
-        except (OSError, IndexError): return None
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid < 1:
+            return None
+        if sys.platform.startswith("linux"):
+            try:
+                return "linux:" + Path(f"/proc/{pid}/stat").read_text().split()[21]
+            except (OSError, IndexError):
+                return None
+        if sys.platform == "darwin":
+            try:
+                completed = subprocess.run(
+                    ["/bin/ps", "-ww", "-o", "lstart=", "-o", "pgid=",
+                     "-o", "command=", "-p", str(pid)],
+                    capture_output=True, text=True, timeout=1,
+                    env={"LANG": "C", "PATH": "/usr/bin:/bin"},
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return None
+            output = completed.stdout.strip()
+            fields = output.split(maxsplit=6)
+            if completed.returncode != 0 or len(fields) != 7:
+                return None
+            try:
+                process_group = int(fields[5])
+            except ValueError:
+                return None
+            if process_group != pid or not fields[6]:
+                return None
+            return "darwin:" + hashlib.sha256(output.encode("utf-8")).hexdigest()
+        return None
 
     def _receipt(self, record: dict[str, Any]) -> DispatchReceipt:
         return DispatchReceipt(record["attempt_id"], record["provider_run_id"],
@@ -337,7 +365,11 @@ class DisposableCodingWorkerAdapter:
 
     def _alive(self, record: dict[str, Any]) -> bool:
         pid = record.get("pid")
-        return isinstance(pid, int) and self._pid_start(pid) == record.get("pid_start")
+        expected = record.get("pid_start")
+        if not isinstance(pid, int) or not isinstance(expected, str) or not expected:
+            return False
+        actual = self._pid_start(pid)
+        return actual is not None and actual == expected
 
     def status(self, receipt: DispatchReceipt) -> AdapterStatus:
         path, record = self._record_for(receipt); job = path.parent
@@ -353,8 +385,12 @@ class DisposableCodingWorkerAdapter:
         if record["state"] in {"cancelled", "failed", "unknown"}:
             return AdapterStatus(record["state"], provider_state=record["state"])
         if time.time() >= record["deadline"]:
-            self._terminate(record); record["state"] = "failed"; record["terminal_outcome"] = "timed_out"; _atomic_json(path, record)
-            return AdapterStatus("failed", provider_state="timed_out")
+            if self._terminate(record):
+                record["state"] = "failed"; record["terminal_outcome"] = "timed_out"
+                _atomic_json(path, record)
+                return AdapterStatus("failed", provider_state="timed_out")
+            record["state"] = "unknown"; _atomic_json(path, record)
+            return AdapterStatus("unknown", provider_state="outcome_unknown")
         process = self._processes.get(receipt.attempt_id)
         if process is not None and process.poll() is not None:
             record["state"] = "failed"; record["terminal_outcome"] = "interrupted"; _atomic_json(path, record)
@@ -366,15 +402,37 @@ class DisposableCodingWorkerAdapter:
 
     def _terminate(self, record: dict[str, Any]) -> bool:
         if not self._alive(record): return False
-        try: os.killpg(record["pid"], signal.SIGTERM)
-        except ProcessLookupError: return False
+        try:
+            os.killpg(record["pid"], signal.SIGTERM)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
         deadline = time.monotonic() + 2
-        while self._alive(record) and time.monotonic() < deadline: time.sleep(0.01)
+        while self._alive(record) and time.monotonic() < deadline:
+            self._reap(record["attempt_id"])
+            time.sleep(0.01)
         if self._alive(record):
-            try: os.killpg(record["pid"], signal.SIGKILL)
-            except ProcessLookupError: pass
+            try:
+                os.killpg(record["pid"], signal.SIGKILL)
+            except ProcessLookupError:
+                return True
+            except OSError:
+                return False
         self._reap(record["attempt_id"])
-        return True
+        process = self._processes.get(record["attempt_id"])
+        return ((process is not None and process.poll() is not None)
+                or self._process_group_absent(record["pid"]))
+
+    @staticmethod
+    def _process_group_absent(pid: int) -> bool:
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        return False
 
     def _reap(self, attempt_id: str) -> None:
         process = self._processes.get(attempt_id)

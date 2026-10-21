@@ -63,7 +63,7 @@ separate verifier identity can mark the authority attempt verified.
 | `intent_prepared` | Query the exact consume request. Consume only when the authority proves it was never seen. |
 | `consumed` | Launch the fixed harness once from the persisted grant and task binding. |
 | `launching` | Mark unknown and never retry: the process-start outcome is uncertain. |
-| `running` | Adopt only a live process whose PID and Linux process-start identity both match. |
+| `running` | Adopt only a live process whose PID, process group and platform process-start identity match. |
 | Terminal result | Recompute bounded artifact metadata and return the same durable untrusted report. |
 
 Cancellation targets the recorded process group. A cancellation race or a
@@ -81,8 +81,9 @@ machine or shared contracts.
 
 ## Limitations
 
-- This is a Unix test harness; process-group and `/proc` identity checks have
-  not been ported to Windows or macOS.
+- This is a Unix test harness. Linux identity uses `/proc`; macOS identity uses
+  fixed-argument `/bin/ps` output bound to start time, process group and command.
+  An unavailable or malformed identity fails closed. Windows is unsupported.
 - It simulates one bounded file change and does not clone or modify a repository.
 - It provides no OS sandbox beyond a private temporary directory; production
   isolation remains a future runtime responsibility.

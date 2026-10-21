@@ -8,6 +8,7 @@ import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 from orchestra.adapters import AgentAdapter
 from orchestra.coding_worker_adapter import (
@@ -128,6 +129,46 @@ class CodingWorkerAdapterTests(unittest.TestCase):
         self.assertTrue(result.requested); self.assertEqual(result.provider_state,"cancelled")
         self.assertEqual(adapter.collect(receipt).outcome,"cancelled")
 
+    def test_signal_permission_failure_is_unknown(self):
+        adapter=DisposableCodingWorkerAdapter(self.root,self.authority,
+            harness=DisposableHarnessConfig("sleep",10)); value=task()
+        receipt=adapter.dispatch(value,grant(value))
+        with mock.patch("orchestra.coding_worker_adapter.os.killpg",
+                side_effect=PermissionError(1,"operation not permitted")):
+            result=adapter.cancel(receipt,"test denied cancellation")
+        self.assertFalse(result.requested); self.assertEqual(result.provider_state,"unknown")
+        process=adapter._processes[receipt.attempt_id]
+        process.terminate(); process.wait(timeout=2)
+
+    def test_timeout_with_unenforceable_termination_is_unknown(self):
+        adapter=DisposableCodingWorkerAdapter(self.root,self.authority,
+            harness=DisposableHarnessConfig("sleep",10)); value=task()
+        receipt=adapter.dispatch(value,grant(value))
+        record_path=self.root/receipt.attempt_id/"job.json"
+        record=json.loads(record_path.read_text()); record["deadline"]=0
+        record_path.write_text(json.dumps(record))
+        with mock.patch("orchestra.coding_worker_adapter.os.killpg",
+                side_effect=PermissionError(1,"operation not permitted")):
+            state=adapter.status(receipt)
+        self.assertEqual(state.state,"unknown")
+        process=adapter._processes[receipt.attempt_id]
+        process.terminate(); process.wait(timeout=2)
+
+    def test_darwin_process_identity_requires_exact_process_group(self):
+        valid=mock.Mock(returncode=0,
+            stdout="Wed Oct 21 12:34:56 2026 1234 /usr/bin/python worker.py\n")
+        with mock.patch("orchestra.coding_worker_adapter.sys.platform","darwin"), \
+                mock.patch("orchestra.coding_worker_adapter.subprocess.run",
+                    return_value=valid):
+            identity=DisposableCodingWorkerAdapter._pid_start(1234)
+        self.assertIsInstance(identity,str); self.assertTrue(identity.startswith("darwin:"))
+        wrong_group=mock.Mock(returncode=0,
+            stdout="Wed Oct 21 12:34:56 2026 999 /usr/bin/python worker.py\n")
+        with mock.patch("orchestra.coding_worker_adapter.sys.platform","darwin"), \
+                mock.patch("orchestra.coding_worker_adapter.subprocess.run",
+                    return_value=wrong_group):
+            self.assertIsNone(DisposableCodingWorkerAdapter._pid_start(1234))
+
     def test_timeout_is_reported_without_retry(self):
         adapter=DisposableCodingWorkerAdapter(self.root,self.authority,
             harness=DisposableHarnessConfig("sleep",10)); value=task(seconds=1); receipt=adapter.dispatch(value,grant(value))
@@ -148,6 +189,16 @@ class CodingWorkerAdapterTests(unittest.TestCase):
         reopened=DisposableCodingWorkerAdapter(self.root,self.authority)
         recovered=reopened.recover(value,issued.attempt_id)
         self.assertEqual(recovered.state,"ambiguous"); self.assertEqual(reopened.status(receipt).state,"unknown")
+
+    def test_unverifiable_process_identity_is_never_recovered(self):
+        adapter=DisposableCodingWorkerAdapter(self.root,self.authority,
+            harness=DisposableHarnessConfig("sleep",10)); value=task(); issued=grant(value)
+        receipt=adapter.dispatch(value,issued)
+        reopened=DisposableCodingWorkerAdapter(self.root,self.authority)
+        with mock.patch.object(reopened,"_pid_start",return_value=None):
+            recovered=reopened.recover(value,issued.attempt_id)
+        self.assertEqual(recovered.state,"ambiguous")
+        adapter.cancel(receipt,"cleanup")
 
     def test_recovery_adopts_a_live_process(self):
         adapter=DisposableCodingWorkerAdapter(self.root,self.authority,

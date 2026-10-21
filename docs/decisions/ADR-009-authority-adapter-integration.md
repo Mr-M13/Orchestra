@@ -38,8 +38,10 @@ the same durable state root.
   from the same intent.
 - A crash after the durable `launching` transition is an unknown outcome. The
   adapter never launches again automatically.
-- A running process is adopted only when its PID and Linux process-start value
-  match. A missing or changed process becomes unknown.
+- A running process is adopted only when its PID and platform process identity
+  match. Linux uses `/proc`; macOS binds fixed-argument `/bin/ps` start time,
+  process group and command. A missing, malformed or changed identity becomes
+  unknown.
 - A terminal worker result is bounded and hashed again by the adapter. It is
   still an untrusted report until an independent verifier records a decision.
 

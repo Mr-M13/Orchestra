@@ -39,11 +39,11 @@ def integration_task(suffix="one", *, seconds=5):
 
 
 def integration_config(root, task):
-    state=root/"authority-state"; runtime=root/"authority-run"
+    state=root/"s"; runtime=root/"r"
     state.mkdir(mode=0o700); runtime.mkdir(mode=0o750)
     return ServiceConfig(authority_id="authority:phase3c-test",
-        service_uid=__import__("os").geteuid(), database_path=str(state/"authority.sqlite3"),
-        socket_path=str(runtime/"authority.sock"), socket_gid=__import__("os").getgid(),
+        service_uid=__import__("os").geteuid(), database_path=str(state/"a.db"),
+        socket_path=str(runtime/"a.sock"), socket_gid=__import__("os").getgid(),
         peers=tuple(PeerIdentity(uid,role,role) for role,uid in CLIENT_UIDS.items()),
         audiences=(ExecutionAudience(adapter_id=ADAPTER_ID,runtime=RUNTIME,
             agent_id=task.agent_id,model_provider=task.model_provider,
@@ -54,10 +54,12 @@ def integration_config(root, task):
 
 class AuthorityAdapterIntegrationTests(unittest.TestCase):
     def setUp(self):
-        self.temp=tempfile.TemporaryDirectory(prefix="orchestra-phase3c-")
+        self.temp=tempfile.TemporaryDirectory(prefix="oa-",dir="/tmp")
         self.addCleanup(self.temp.cleanup); self.root=Path(self.temp.name)
         self.task=integration_task(); self.clock=MutableClock()
-        self.running=RunningService(integration_config(self.root,self.task),clock=self.clock)
+        config=integration_config(self.root,self.task)
+        self.assertLess(len(config.socket_path.encode("utf-8")),80)
+        self.running=RunningService(config,clock=self.clock)
         self.running.__enter__(); self.addCleanup(self.running.__exit__,None,None,None)
         self.coordinator=self.running.client("coordinator")
         self.worker=self.running.client("worker"); self.verifier=self.running.client("verifier")
