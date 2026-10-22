@@ -90,6 +90,7 @@ def collect_health(config_path: Path, tunnel_url: str | None = None) -> dict[str
         },
         "execution_limit": config.max_parallel_tasks,
         "task_approval_mode": config.task_approval_mode,
+        "local_worker_launcher": config.local_worker_launcher,
     }
     if not checks["configuration"]["owner_only"]:
         report["errors"].append("configuration_permissions")
