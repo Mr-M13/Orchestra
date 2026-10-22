@@ -251,7 +251,7 @@ def _unit_outcome(sha: str) -> UnitOutcome:
                               int(values[4]) // 1_000, int(values[5]) // 1_000)
     except ValueError as error:
         raise LaunchRefused("systemd returned an invalid execution status") from error
-    if not re.fullmatch(r"[0-9a-f]{32}", outcome.invocation_id) or outcome.active_state == "active":
+    if not re.fullmatch(r"[0-9a-f]{32}", outcome.invocation_id) or outcome.active_state != "inactive":
         raise LaunchRefused("systemd unit is stale or still active")
     return outcome
 
@@ -273,7 +273,7 @@ def record_receipt(releases_root: Path, job_path: Path, receipts_dir: Path) -> P
             (job.release_digest, job.manifest_digest, job.test_tree_digest):
         raise LaunchRefused("release differs from the sealed test job")
     outcome = _unit_outcome(job.sha)
-    if outcome.active_state == "active" or job.boot_id != _boot_id() or outcome.started_monotonic_ms < job.prepared_monotonic_ms \
+    if outcome.active_state != "inactive" or job.boot_id != _boot_id() or outcome.started_monotonic_ms < job.prepared_monotonic_ms \
             or outcome.exited_monotonic_ms < outcome.started_monotonic_ms:
         raise LaunchRefused("unit invocation is stale or predates the sealed job")
     if outcome.result != "success" or outcome.exec_main_status != 0:

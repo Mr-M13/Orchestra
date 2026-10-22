@@ -122,6 +122,21 @@ class PixelBoxTestLauncherTests(unittest.TestCase):
                      self.assertRaisesRegex(launcher.LaunchRefused, "stale"):
                     launcher.record_receipt(releases, path, receipts)
 
+    def test_receipt_refuses_all_nonterminal_systemd_states(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary); releases, _ = self.release(base)
+            jobs, receipts = base / "jobs", base / "receipts"; jobs.mkdir(); receipts.mkdir()
+            protected, root = self.root_context()
+            with protected, root:
+                path = launcher.prepare_job(releases, self.sha, jobs, self.worker_group())
+                job = launcher._load_job(path)
+                for state in ("active", "activating", "deactivating", "failed"):
+                    outcome = launcher.UnitOutcome("a" * 32, state, "success", 0,
+                        job.prepared_monotonic_ms + 1, job.prepared_monotonic_ms + 2)
+                    with patch.object(launcher, "_unit_outcome", return_value=outcome), \
+                         self.assertRaisesRegex(launcher.LaunchRefused, "stale"):
+                        launcher.record_receipt(releases, path, receipts)
+
     def test_receipt_refuses_empty_truncated_or_non_canary_journal_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary); releases, _ = self.release(base)
@@ -172,6 +187,8 @@ class PixelBoxTestLauncherTests(unittest.TestCase):
         self.assertIn("PrivateIPC=yes", unit)
         self.assertIn("LimitFSIZE=32768", unit)
         self.assertIn("SetLoginEnvironment=no", unit)
+        self.assertNotIn("/var/www/nextcloud", unit)
+        self.assertNotIn("/srv/nextcloud", unit)
         self.assertNotIn("EnvironmentFile=", unit)
 
 

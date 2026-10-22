@@ -61,3 +61,6 @@ This environment has no running systemd and is not ARM64. PixelBox must verify
 `RestrictAddressFamilies=none`, invocation-scoped journal retrieval, direct
 unprivileged start with `PrivateUsers`, timeout/cgroup cleanup, and the actual
 AF_UNIX denial. The canary must remain disconnected from production services.
+PixelBox currently has its memory cgroup disabled: `MemoryMax=1G` remains in
+the unit as a required limit, but a canary must not run until the owner verifies
+that the target cgroup hierarchy enforces it.
