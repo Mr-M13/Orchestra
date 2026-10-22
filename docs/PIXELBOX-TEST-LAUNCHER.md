@@ -50,8 +50,12 @@ the general test suite.
    Nextcloud, or Tailscale.
 4. Run `systemd-analyze verify` and `systemd-analyze security`. Prepare the
    SHA, run one unit, then generate a receipt only after systemd reports success.
-   Independently probe AF_UNIX socket creation under the same transient policy;
-   it must fail with `EPERM` or `EACCES`.
+   Independently probe AF_UNIX socket creation under the equivalent transient
+   denial policy (`RestrictAddressFamilies=~AF_UNIX`); it must fail with a
+   kernel-level denial such as `EPERM`, `EACCES`, or `EAFNOSUPPORT`.  The
+   `none` spelling used by the unit is accepted in a unit file but is not
+   accepted by systemd's transient-property API on the supported PixelBox
+   release.
 5. Roll back by stopping the instance and removing only the new unit, wrappers,
    account, and empty launcher directories. No production symlink changes.
 
