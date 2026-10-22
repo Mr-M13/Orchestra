@@ -49,10 +49,11 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
 ReadOnlyPaths=/opt/orchestra/releases/%i /var/lib/orchestra-test/jobs/%i.json /usr /bin /lib /lib64 /usr/local/lib/orchestra-test-launcher
-InaccessiblePaths=/etc/orchestra /home/hamed /root /run /var/run /run/docker.sock /var/run/docker.sock /run/tailscale /var/run/tailscale /var/lib/tailscale /var/www/nextcloud /srv/nextcloud /var/lib/orchestra-test/receipts /var/lib/orchestra-test/output
-StandardOutput=append:/var/lib/orchestra-test/output/%i.log
-StandardError=inherit
-LimitFSIZE=32768
+InaccessiblePaths=/etc/orchestra /home/hamed /root /run /var/run /run/docker.sock /var/run/docker.sock /run/tailscale /var/run/tailscale /var/lib/tailscale /var/www/nextcloud /srv/nextcloud /var/lib/orchestra-test/receipts
+StandardOutput=journal
+StandardError=journal
+LogRateLimitIntervalSec=1s
+LogRateLimitBurst=8
 Environment=PATH=/usr/bin:/bin
 UnsetEnvironment=HOME XDG_CONFIG_HOME XDG_DATA_HOME SSH_AUTH_SOCK SSH_AGENT_PID GIT_ASKPASS GITHUB_TOKEN DEEPSEEK_API_KEY
 

@@ -12,19 +12,21 @@ approved canary:
 1. A root-only `prepare` command validates `/opt/orchestra/releases/<sha>`:
    the full SHA marker, deployment tree digest, root ownership/non-writability,
    fixed manifest, and the exact hash of its sole executable test. It seals a
-   root-owned job file.
+   root-owned `0640` job readable only by the dedicated worker group.
 2. `orchestra-test@<sha>.service` starts **directly** as `orchestra-test` and
    reads that sealed job. It executes only
    `tests.test_socket_free_canary`; there are no task-supplied arguments,
    network destinations, credentials, or writable state paths.
 3. A root-only `receipt` command revalidates the release, manifest and test
-   tree; obtains the terminal unit result directly from systemd; hashes the
-   bounded manager-owned output; and writes a root-owned receipt. It refuses a
-   failed/non-zero unit or any release identity change.
+   tree; obtains the terminal unit result and invocation ID directly from
+   systemd; hashes only that invocation's bounded journal output; and writes a
+   root-owned receipt. It refuses an active, stale, failed/non-zero, pre-seal,
+   or wrong-boot invocation, or any release identity change.
 
 Test output is untrusted evidence, not a success claim. A receipt binds the
-SHA, release digest, manifest digest, executable-test digest, systemd status,
-and output artifact hash/size. It is never consumed by OMCP or deployment code.
+SHA, release digest, manifest digest, executable-test digest, systemd invocation
+ID and timing/status, and output artifact hash/size. It is never consumed by
+OMCP or deployment code.
 
 The unit has `RestrictAddressFamilies=none`, so even `AF_UNIX` socket creation
 is denied. `PrivateNetwork`, `IPAddressDeny`, `SocketBindDeny`, hidden `/run`,
@@ -38,9 +40,11 @@ the general test suite.
    staging procedure.
 2. Independently install the committed launcher module and two wrappers
    (`orchestra-test-launcher`, `orchestra-test-runner`) root-owned outside every
-   release. Create root-owned directories: `jobs` (0711), `output` (0700), and
-   `receipts` (0700) under `/var/lib/orchestra-test`. Do not grant the test UID
-   access to them.
+   release. Create root-owned directories: `jobs` (0710, group
+   `orchestra-test`) and `receipts` (0700) under `/var/lib/orchestra-test`.
+   The worker may read exactly its group-readable sealed job but cannot list,
+   alter, or access receipts. Output is captured in the journal by invocation,
+   not in a reusable worker-visible file.
 3. Install the unit as root-owned 0644. Create `orchestra-test` as a locked,
    no-home, no-group system account. Do not edit OMCP, tunnel, Docker,
    Nextcloud, or Tailscale.
@@ -54,6 +58,6 @@ the general test suite.
 ## Unverified here
 
 This environment has no running systemd and is not ARM64. PixelBox must verify
-`RestrictAddressFamilies=none`, manager-created output ownership, direct
+`RestrictAddressFamilies=none`, invocation-scoped journal retrieval, direct
 unprivileged start with `PrivateUsers`, timeout/cgroup cleanup, and the actual
 AF_UNIX denial. The canary must remain disconnected from production services.
