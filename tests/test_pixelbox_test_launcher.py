@@ -18,10 +18,16 @@ ROOT = Path(__file__).resolve().parents[1]
 UNIT = ROOT / "deploy" / "pixelbox" / "systemd" / "orchestra-test@.service.example"
 MANIFEST = ROOT / "deploy" / "pixelbox" / "test-manifest.json"
 CANARY = ROOT / "tests" / "test_socket_free_canary.py"
+TEST_BOOT_ID = "123e4567-e89b-12d3-a456-426614174000"
 
 
 class PixelBoxTestLauncherTests(unittest.TestCase):
     sha = "a" * 40
+
+    def setUp(self):
+        self.boot_id = patch.object(launcher, "_boot_id", return_value=TEST_BOOT_ID)
+        self.boot_id.start()
+        self.addCleanup(self.boot_id.stop)
 
     def release(self, parent: Path) -> tuple[Path, Path]:
         releases, root = parent / "releases", parent / "releases" / self.sha
