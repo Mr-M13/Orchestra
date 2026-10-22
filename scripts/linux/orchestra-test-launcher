@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""Root-owned fixed-profile launcher installed outside a tested release.
+
+The installation procedure copies this exact file to /usr/local/libexec with
+root ownership and mode 0755. It deliberately exposes no arbitrary command,
+environment, working-directory, credential or network option.
+"""
+import sys
+
+# This directory is installed root-owned alongside this wrapper, never loaded
+# from the SHA-selected release under test.
+sys.path.insert(0, "/usr/local/lib/orchestra-test-launcher")
+from pixelbox_test_launcher import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
