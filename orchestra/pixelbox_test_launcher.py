@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import os
+import pwd
 import re
 import signal
 import stat
@@ -40,7 +41,7 @@ class Release:
 
 
 @dataclass(frozen=True)
-class TestEvidence:
+class SupervisorReceipt:
     version: int
     profile: str
     sha: str
@@ -48,8 +49,8 @@ class TestEvidence:
     outcome: str
     exit_code: int
     duration_ms: int
-    output_sha256: str
-    output: str
+    artifact_sha256: str
+    artifact_bytes: int
 
 
 def _protected(info: os.stat_result) -> bool:
@@ -93,13 +94,26 @@ def fixed_command(release: Release) -> tuple[str, ...]:
     return FIXED_COMMAND
 
 
-def _atomic_result(path: Path, evidence: TestEvidence) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+def _receipt_path(receipt_dir: Path, sha: str) -> Path:
+    info = receipt_dir.lstat()
+    if not stat.S_ISDIR(info.st_mode) or not _protected(info):
+        raise LaunchRefused("receipt directory must be root-owned and non-writable")
+    return receipt_dir / f"{sha}.json"
+
+
+def _write_receipt(receipt_dir: Path, receipt: SupervisorReceipt) -> Path:
+    """Write a root-owned receipt after the unprivileged child has exited.
+
+    ``receipt_dir`` is never visible or writable to the child.  Its ownership
+    check, O_EXCL temporary file and atomic replacement prevent a child from
+    replacing or racing this record, including through a pre-existing symlink.
+    """
+    path = _receipt_path(receipt_dir, receipt.sha)
     temporary = path.with_name(path.name + ".tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            json.dump(asdict(evidence), output, sort_keys=True, separators=(",", ":"))
+            json.dump(asdict(receipt), output, sort_keys=True, separators=(",", ":"))
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary, path)
@@ -108,21 +122,35 @@ def _atomic_result(path: Path, evidence: TestEvidence) -> None:
         raise
 
 
-def run_fixed_profile(releases_root: Path, sha: str, result_path: Path, timeout_seconds: int) -> TestEvidence:
+def _drop_to_worker(worker_user: str) -> None:
+    worker = pwd.getpwnam(worker_user)
+    os.setgroups([])
+    os.setgid(worker.pw_gid)
+    os.setuid(worker.pw_uid)
+
+
+def run_fixed_profile(
+    releases_root: Path, sha: str, receipt_dir: Path, timeout_seconds: int,
+    worker_user: str = "orchestra-test",
+) -> SupervisorReceipt:
     """Run the fixed profile, bounded and in a separate process group.
 
     The systemd unit is the security boundary. This function supplies the
     deterministic command, timeout and SHA-bound evidence format used inside
     that unit; it intentionally has no network, credential or provider inputs.
+    It must be invoked by the root-owned external supervisor, not by the child.
     """
     if not 1 <= timeout_seconds <= 3_600:
         raise LaunchRefused("timeout must be between 1 and 3600 seconds")
+    if os.geteuid() != 0:
+        raise LaunchRefused("fixed-profile supervisor must run as root")
     release = verified_release(releases_root, sha)
+    _receipt_path(receipt_dir, sha)
     started = time.monotonic()
     process = subprocess.Popen(
         fixed_command(release), cwd=release.path, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=False,
-        start_new_session=True,
+        start_new_session=True, preexec_fn=lambda: _drop_to_worker(worker_user),
         env={"PATH": "/usr/bin:/bin", "PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1"},
     )
     try:
@@ -140,25 +168,28 @@ def run_fixed_profile(releases_root: Path, sha: str, result_path: Path, timeout_
         exit_code = process.returncode
     payload = payload[:RESULT_LIMIT]
     duration_ms = int((time.monotonic() - started) * 1000)
-    evidence = TestEvidence(
+    receipt = SupervisorReceipt(
         version=1, profile=PROFILE, sha=release.sha, release_digest=release.digest,
         outcome=outcome, exit_code=exit_code, duration_ms=duration_ms,
-        output_sha256=hashlib.sha256(payload).hexdigest(),
-        output=payload.decode("utf-8", errors="replace"),
+        artifact_sha256=hashlib.sha256(payload).hexdigest(), artifact_bytes=len(payload),
     )
-    _atomic_result(result_path, evidence)
-    return evidence
+    _write_receipt(receipt_dir, receipt)
+    return receipt
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--releases-root", type=Path, required=True)
     parser.add_argument("--sha", required=True)
-    parser.add_argument("--result", type=Path, required=True)
+    parser.add_argument("--receipt-dir", type=Path, required=True)
+    parser.add_argument("--worker-user", default="orchestra-test")
     parser.add_argument("--timeout-seconds", type=int, default=900)
     args = parser.parse_args(argv)
     try:
-        evidence = run_fixed_profile(args.releases_root, args.sha, args.result, args.timeout_seconds)
+        evidence = run_fixed_profile(
+            args.releases_root, args.sha, args.receipt_dir, args.timeout_seconds,
+            args.worker_user,
+        )
     except LaunchRefused as error:
         parser.error(str(error))
     return 0 if evidence.outcome == "passed" else evidence.exit_code

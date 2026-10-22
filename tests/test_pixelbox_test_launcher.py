@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -66,47 +67,81 @@ class PixelBoxTestLauncherTests(unittest.TestCase):
         self.assertIn("unittest", launcher.FIXED_COMMAND)
         self.assertNotIn("sh", launcher.FIXED_COMMAND)
 
-    def test_timeout_is_bounded_and_records_sha_bound_evidence(self):
+    def test_timeout_is_bounded_and_records_root_supervisor_receipt(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             releases, _target = self.release(root)
-            result = root / "results" / "result.json"
+            receipts = root / "receipts"
+            receipts.mkdir()
+            receipts.chmod(0o700)
             sleeping = (sys.executable, "-c", "import time; time.sleep(5)")
             started = time.monotonic()
-            with patch.object(launcher, "_protected", return_value=True), patch.object(
-                launcher, "FIXED_COMMAND", sleeping
-            ):
-                evidence = launcher.run_fixed_profile(releases, self.sha, result, 1)
+            with patch.object(launcher, "_protected", return_value=True), \
+                 patch.object(launcher.os, "geteuid", return_value=0), \
+                 patch.object(launcher, "_drop_to_worker"), \
+                 patch.object(launcher, "FIXED_COMMAND", sleeping):
+                evidence = launcher.run_fixed_profile(releases, self.sha, receipts, 1)
             self.assertLess(time.monotonic() - started, 3)
             self.assertEqual(evidence.outcome, "timed_out")
+            result = receipts / f"{self.sha}.json"
             stored = json.loads(result.read_text())
             self.assertEqual(stored["sha"], self.sha)
             self.assertEqual(stored["profile"], launcher.PROFILE)
             self.assertEqual(stored["exit_code"], 124)
             self.assertEqual(stat.S_IMODE(result.stat().st_mode), 0o600)
 
-    def test_result_is_bounded_and_cannot_be_an_authority_grant(self):
+    def test_receipt_is_root_supervisor_generated_and_child_output_is_only_hashed(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             releases, _target = self.release(root)
-            result = root / "result.json"
+            receipts = root / "receipts"
+            receipts.mkdir()
             noisy = (sys.executable, "-c", "print('x' * 100000)")
-            with patch.object(launcher, "_protected", return_value=True), patch.object(
-                launcher, "FIXED_COMMAND", noisy
-            ):
-                evidence = launcher.run_fixed_profile(releases, self.sha, result, 10)
+            with patch.object(launcher, "_protected", return_value=True), \
+                 patch.object(launcher.os, "geteuid", return_value=0), \
+                 patch.object(launcher, "_drop_to_worker"), \
+                 patch.object(launcher, "FIXED_COMMAND", noisy):
+                evidence = launcher.run_fixed_profile(releases, self.sha, receipts, 10)
             self.assertEqual(evidence.outcome, "passed")
-            self.assertLessEqual(len(evidence.output.encode()), launcher.RESULT_LIMIT)
-            self.assertEqual(set(json.loads(result.read_text())), {
-                "duration_ms", "exit_code", "outcome", "output", "output_sha256",
+            self.assertEqual(evidence.artifact_bytes, launcher.RESULT_LIMIT)
+            self.assertEqual(set(json.loads((receipts / f"{self.sha}.json").read_text())), {
+                "artifact_bytes", "artifact_sha256", "duration_ms", "exit_code", "outcome",
                 "profile", "release_digest", "sha", "version",
             })
+
+    def test_child_cannot_replace_authoritative_receipt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            receipts = Path(temporary) / "receipts"
+            receipts.mkdir()
+            target = receipts / f"{self.sha}.json"
+            target.symlink_to("/etc/shadow")
+            receipt = launcher.SupervisorReceipt(
+                1, launcher.PROFILE, self.sha, "b" * 64, "passed", 0, 1, "c" * 64, 0
+            )
+            with patch.object(launcher, "_protected", return_value=True):
+                launcher._write_receipt(receipts, receipt)
+            self.assertFalse(target.is_symlink())
+            self.assertEqual(json.loads(target.read_text())["sha"], self.sha)
+
+    def test_refuses_nonroot_supervisor_and_unprotected_receipt_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            releases, _target = self.release(root)
+            receipts = root / "receipts"
+            receipts.mkdir()
+            with patch.object(launcher, "_protected", return_value=True):
+                with self.assertRaisesRegex(launcher.LaunchRefused, "run as root"):
+                    launcher.run_fixed_profile(releases, self.sha, receipts, 1)
+            with patch.object(launcher.os, "geteuid", return_value=0), \
+                 patch.object(launcher, "_protected", return_value=False):
+                with self.assertRaisesRegex(launcher.LaunchRefused, "unsafe releases root"):
+                    launcher.run_fixed_profile(releases, self.sha, receipts, 1)
 
     def test_unit_defense_in_depth_blocks_network_secrets_and_host_services(self):
         unit = UNIT.read_text()
         for directive in (
-            "User=orchestra-test", "SupplementaryGroups=", "PrivateNetwork=yes",
-            "IPAddressDeny=any", "SocketBindDeny=any", "RestrictAddressFamilies=AF_UNIX",
+            "User=root", "--worker-user orchestra-test", "SupplementaryGroups=", "PrivateNetwork=yes",
+            "IPAddressDeny=any", "SocketBindDeny=any", "RestrictAddressFamilies=none",
             "PrivateUsers=yes", "ProtectSystem=strict", "ProtectHome=tmpfs",
             "NoNewPrivileges=yes", "CapabilityBoundingSet=", "MemoryMax=1G",
             "TasksMax=128", "CPUQuota=200%", "KillMode=control-group",
@@ -114,6 +149,7 @@ class PixelBoxTestLauncherTests(unittest.TestCase):
             "/run/tailscale", "/var/www/nextcloud",
         ):
             self.assertIn(directive, unit)
+        self.assertNotIn("AF_UNIX", unit)
         self.assertNotIn("EnvironmentFile=", unit)
         self.assertNotIn("/opt/orchestra/current", unit.split("[Service]", 1)[1])
 
@@ -123,6 +159,30 @@ class PixelBoxTestLauncherTests(unittest.TestCase):
         self.assertIn("--sha %i", unit)
         self.assertIn("ConditionPathExists=/opt/orchestra/releases/%i/.orchestra-release-sha", unit)
         self.assertNotIn("omcp", unit.lower().split("[service]", 1)[1])
+
+    def test_no_network_profile_denies_unix_socket_syscalls(self):
+        """A systemd ``none`` address-family policy denies AF_UNIX as well."""
+        unit = UNIT.read_text()
+        policy = next(line for line in unit.splitlines() if line.startswith("RestrictAddressFamilies="))
+        self.assertEqual(policy, "RestrictAddressFamilies=none")
+        self.assertNotIn("AF_UNIX", policy)
+
+    @unittest.skipUnless(Path("/run/systemd/system").is_dir(), "requires a running systemd manager")
+    def test_systemd_policy_rejects_an_af_unix_socket(self):
+        """Kernel-backed negative probe for hosts which provide systemd.
+
+        This does not use Orchestra's unit or production configuration; it
+        creates one transient, no-network process with the same address-family
+        policy and requires its AF_UNIX socket creation to fail.
+        """
+        probe = subprocess.run(
+            [
+                "systemd-run", "--quiet", "--wait", "--collect", "--pipe",
+                "-p", "RestrictAddressFamilies=none", "/usr/bin/python3", "-c",
+                "import socket; socket.socket(socket.AF_UNIX)",
+            ], capture_output=True, text=True, timeout=30, check=False,
+        )
+        self.assertNotEqual(probe.returncode, 0, probe.stdout + probe.stderr)
 
 
 if __name__ == "__main__":

@@ -8,12 +8,12 @@ ConditionPathExists=/opt/orchestra/releases/%i/.orchestra-release-sha
 
 [Service]
 Type=exec
-User=orchestra-test
-Group=orchestra-test
+User=root
+Group=root
 SupplementaryGroups=
 UMask=0077
 WorkingDirectory=/opt/orchestra/releases/%i
-ExecStart=/usr/local/libexec/orchestra-test-launcher --releases-root /opt/orchestra/releases --sha %i --result /var/lib/orchestra-test/results/%i.json --timeout-seconds 900
+ExecStart=/usr/local/libexec/orchestra-test-launcher --releases-root /opt/orchestra/releases --sha %i --receipt-dir /var/lib/orchestra-test/receipts --worker-user orchestra-test --timeout-seconds 900
 TimeoutStartSec=930
 MemoryMax=1G
 TasksMax=128
@@ -38,7 +38,7 @@ ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
 ProcSubset=pid
-RestrictAddressFamilies=AF_UNIX
+RestrictAddressFamilies=none
 SocketBindDeny=any
 IPAddressDeny=any
 RestrictNamespaces=yes
@@ -49,12 +49,12 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
 ReadOnlyPaths=/opt/orchestra/releases/%i /usr /bin /lib /lib64 /usr/local/lib/orchestra-test-launcher
-ReadWritePaths=/var/lib/orchestra-test/results
+ReadWritePaths=/var/lib/orchestra-test/receipts
 InaccessiblePaths=/etc/orchestra /home/hamed /root /run /var/run /run/docker.sock /var/run/docker.sock /run/tailscale /var/run/tailscale /var/lib/tailscale /var/www/nextcloud /srv/nextcloud
-StateDirectory=orchestra-test/results
+StateDirectory=orchestra-test/receipts
 StateDirectoryMode=0700
 Environment=PATH=/usr/bin:/bin
 UnsetEnvironment=HOME XDG_CONFIG_HOME XDG_DATA_HOME SSH_AUTH_SOCK SSH_AGENT_PID GIT_ASKPASS GITHUB_TOKEN DEEPSEEK_API_KEY
 
-# The untrusted test process cannot write an authoritative result. The JSON is
-# bounded evidence only; systemd unit state remains the lifecycle record.
+# The root supervisor writes the receipt only after its unprivileged child exits.
+# It remains test evidence only; no result can authorise an execution or deploy.
