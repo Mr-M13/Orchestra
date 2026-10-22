@@ -69,7 +69,7 @@ class PixelBoxTestLauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary); releases, release = self.release(base)
             jobs, receipts, output = base / "jobs", base / "receipts", base / "output.log"
-            jobs.mkdir(); receipts.mkdir(); output.write_bytes(b"untrusted test output")
+            jobs.mkdir(); receipts.mkdir(); output.write_bytes(b"Ran 1 test\nOK\n")
             protected, root = self.root_context()
             with protected, root:
                 job = launcher.prepare_job(releases, self.sha, jobs, self.worker_group())
@@ -121,6 +121,22 @@ class PixelBoxTestLauncherTests(unittest.TestCase):
                 with patch.object(launcher, "_unit_outcome", return_value=active), \
                      self.assertRaisesRegex(launcher.LaunchRefused, "stale"):
                     launcher.record_receipt(releases, path, receipts)
+
+    def test_receipt_refuses_empty_truncated_or_non_canary_journal_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary); releases, _ = self.release(base)
+            jobs, receipts = base / "jobs", base / "receipts"; jobs.mkdir(); receipts.mkdir()
+            protected, root = self.root_context()
+            with protected, root:
+                path = launcher.prepare_job(releases, self.sha, jobs, self.worker_group())
+                job = launcher._load_job(path)
+                outcome = launcher.UnitOutcome("a" * 32, "inactive", "success", 0,
+                    job.prepared_monotonic_ms + 1, job.prepared_monotonic_ms + 2)
+                for evidence in (b"", b"Ran 1 test\n", b"x" * launcher.OUTPUT_LIMIT):
+                    with patch.object(launcher, "_unit_outcome", return_value=outcome), \
+                         patch.object(launcher, "_invocation_output", return_value=evidence), \
+                         self.assertRaisesRegex(launcher.LaunchRefused, "unavailable|incomplete"):
+                        launcher.record_receipt(releases, path, receipts)
                 stale = launcher.UnitOutcome("a" * 32, "inactive", "success", 0,
                                              job.prepared_monotonic_ms - 1, job.prepared_monotonic_ms)
                 with patch.object(launcher, "_unit_outcome", return_value=stale), \
@@ -153,6 +169,9 @@ class PixelBoxTestLauncherTests(unittest.TestCase):
         self.assertIn("LogRateLimitBurst=8", unit)
         self.assertIn("/var/lib/orchestra-test/receipts", unit)
         self.assertIn("StandardOutput=journal", unit)
+        self.assertIn("PrivateIPC=yes", unit)
+        self.assertIn("LimitFSIZE=32768", unit)
+        self.assertIn("SetLoginEnvironment=no", unit)
         self.assertNotIn("EnvironmentFile=", unit)
 
 

@@ -27,6 +27,7 @@ AmbientCapabilities=
 PrivateUsers=yes
 PrivateTmp=yes
 PrivateDevices=yes
+PrivateIPC=yes
 PrivateNetwork=yes
 ProtectSystem=strict
 ProtectHome=tmpfs
@@ -48,13 +49,16 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
-ReadOnlyPaths=/opt/orchestra/releases/%i /var/lib/orchestra-test/jobs/%i.json /usr /bin /lib /lib64 /usr/local/lib/orchestra-test-launcher
+ReadOnlyPaths=/opt/orchestra/releases/%i /var/lib/orchestra-test/jobs/%i.json /usr /bin /lib -/lib64 /usr/lib -/usr/lib64 /usr/local/lib/orchestra-test-launcher
 InaccessiblePaths=/etc/orchestra /home/hamed /root /run /var/run /run/docker.sock /var/run/docker.sock /run/tailscale /var/run/tailscale /var/lib/tailscale /var/www/nextcloud /srv/nextcloud /var/lib/orchestra-test/receipts
 StandardOutput=journal
 StandardError=journal
 LogRateLimitIntervalSec=1s
 LogRateLimitBurst=8
+LimitFSIZE=32768
+TemporaryFileSystem=/tmp:rw,size=1M,nosuid,nodev,noexec
 Environment=PATH=/usr/bin:/bin
+SetLoginEnvironment=no
 UnsetEnvironment=HOME XDG_CONFIG_HOME XDG_DATA_HOME SSH_AUTH_SOCK SSH_AGENT_PID GIT_ASKPASS GITHUB_TOKEN DEEPSEEK_API_KEY
 
 # Root-only preparation and receipt commands live outside this unit. The direct

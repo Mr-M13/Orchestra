@@ -6,9 +6,7 @@ import grp
 import hashlib
 import json
 import os
-import pwd
 import re
-import resource
 import signal
 import stat
 import subprocess
@@ -24,6 +22,7 @@ MANIFEST_RELATIVE = Path("deploy/pixelbox/test-manifest.json")
 OUTPUT_LIMIT = 32_768
 FIXED_COMMAND = ("/usr/bin/python3", "-m", "unittest", "tests.test_socket_free_canary", "-q")
 FIXED_TESTS = ("tests/test_socket_free_canary.py",)
+CANARY_EVIDENCE = (b"Ran 1 test", b"OK")
 
 
 class LaunchRefused(ValueError):
@@ -172,6 +171,9 @@ def _boot_id() -> str:
 def prepare_job(releases_root: Path, sha: str, jobs_dir: Path,
                 worker_group: str = "orchestra-test") -> Path:
     _require_root()
+    _protected_directory(jobs_dir)
+    if any(jobs_dir.iterdir()):
+        raise LaunchRefused("fixed canary permits exactly one sealed job at a time")
     release = verified_release(releases_root, sha)
     try:
         worker_gid = grp.getgrnam(worker_group).gr_gid
@@ -180,7 +182,7 @@ def prepare_job(releases_root: Path, sha: str, jobs_dir: Path,
     return _atomic_root_json(jobs_dir, f"{sha}.json", Job(
         1, PROFILE, release.sha, release.digest, release.manifest_digest,
         release.test_tree_digest, FIXED_COMMAND, 120, OUTPUT_LIMIT, _boot_id(),
-        time.clock_gettime_ns(time.CLOCK_BOOTTIME) // 1_000_000), mode=0o640, group=worker_gid)
+        time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 1_000_000), mode=0o640, group=worker_gid)
 
 
 def _load_job(path: Path) -> Job:
@@ -210,12 +212,9 @@ def run_job(job_path: Path, releases_root: Path) -> int:
             or manifest != job.manifest_digest or _test_tree_digest(root, protected=False) != job.test_tree_digest:
         raise LaunchRefused("executable test tree differs from sealed job")
 
-    def limit_output() -> None:
-        resource.setrlimit(resource.RLIMIT_FSIZE, (job.output_limit, job.output_limit))
-
     with tempfile.TemporaryFile() as output:
         process = subprocess.Popen(job.command, cwd=root, stdin=subprocess.DEVNULL,
-            stdout=output, stderr=subprocess.STDOUT, start_new_session=True, preexec_fn=limit_output,
+            stdout=output, stderr=subprocess.STDOUT, start_new_session=True,
             env={"PATH": "/usr/bin:/bin", "PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1"})
         try:
             status = process.wait(timeout=job.timeout_seconds)
@@ -263,7 +262,7 @@ def _invocation_output(invocation_id: str) -> bytes:
          f"_SYSTEMD_INVOCATION_ID={invocation_id}"], stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False, timeout=15,
     )
-    if completed.returncode or len(completed.stdout) > OUTPUT_LIMIT:
+    if completed.returncode or not completed.stdout or len(completed.stdout) >= OUTPUT_LIMIT:
         raise LaunchRefused("invocation output is unavailable or exceeds its fixed bound")
     return completed.stdout
 
@@ -277,9 +276,11 @@ def record_receipt(releases_root: Path, job_path: Path, receipts_dir: Path) -> P
     if outcome.active_state == "active" or job.boot_id != _boot_id() or outcome.started_monotonic_ms < job.prepared_monotonic_ms \
             or outcome.exited_monotonic_ms < outcome.started_monotonic_ms:
         raise LaunchRefused("unit invocation is stale or predates the sealed job")
-    output = _invocation_output(outcome.invocation_id)
     if outcome.result != "success" or outcome.exec_main_status != 0:
         raise LaunchRefused("unit did not complete the sealed test job successfully")
+    output = _invocation_output(outcome.invocation_id)
+    if any(marker not in output for marker in CANARY_EVIDENCE):
+        raise LaunchRefused("invocation output is incomplete or lacks fixed-canary evidence")
     return _atomic_root_json(receipts_dir, f"{job.sha}.json", Receipt(
         1, PROFILE, job.sha, job.release_digest, job.manifest_digest, job.test_tree_digest,
         outcome.invocation_id, outcome.result, outcome.exec_main_status,
