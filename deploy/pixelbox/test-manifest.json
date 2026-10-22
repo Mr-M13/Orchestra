@@ -1,0 +1,1 @@
+{"command":["/usr/bin/python3","-m","unittest","tests.test_socket_free_canary","-q"],"output_limit":32768,"profile":"pixelbox-socket-free-canary-v1","tests":["tests/test_socket_free_canary.py"],"timeout_seconds":120,"version":1}

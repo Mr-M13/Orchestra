@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+"""Unprivileged fixed-manifest runner installed outside the tested release."""
+import sys
+
+sys.path.insert(0, "/usr/local/lib/orchestra-test-launcher")
+from pixelbox_test_launcher import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())

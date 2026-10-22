@@ -1,198 +1,221 @@
-"""Fixed-profile, non-authoritative test execution for a staged PixelBox release.
-
-This module is deliberately not a task worker. The only executable profile is
-the repository's unit-test suite and its only input is the SHA-named,
-root-owned release directory created by ``deploy/pixelbox/install.sh``. A
-result produced by this code is test evidence, never an approval, merge, or
-deployment capability.
-"""
+"""Trusted preparation/receipt helpers for the socket-free PixelBox canary."""
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
 import os
-import pwd
 import re
-import signal
 import stat
 import subprocess
-import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Sequence
-
+from typing import Any, Sequence
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-RESULT_LIMIT = 32_768
-PROFILE = "python-unittest-v1"
-FIXED_COMMAND = ("/usr/bin/python3", "-m", "unittest", "discover", "-s", "tests", "-q")
+PROFILE = "pixelbox-socket-free-canary-v1"
+MANIFEST_RELATIVE = Path("deploy/pixelbox/test-manifest.json")
+OUTPUT_LIMIT = 32_768
+FIXED_COMMAND = ("/usr/bin/python3", "-m", "unittest", "tests.test_socket_free_canary", "-q")
+FIXED_TESTS = ("tests/test_socket_free_canary.py",)
 
 
 class LaunchRefused(ValueError):
-    """Raised before a test process is allowed to start."""
+    pass
 
 
 @dataclass(frozen=True)
 class Release:
-    sha: str
-    path: Path
-    digest: str
+    sha: str; path: Path; digest: str; manifest_digest: str; test_tree_digest: str
 
 
 @dataclass(frozen=True)
-class SupervisorReceipt:
-    version: int
-    profile: str
-    sha: str
-    release_digest: str
-    outcome: str
-    exit_code: int
-    duration_ms: int
-    artifact_sha256: str
-    artifact_bytes: int
+class Job:
+    version: int; profile: str; sha: str; release_digest: str; manifest_digest: str
+    test_tree_digest: str; command: tuple[str, ...]; timeout_seconds: int; output_limit: int
+
+
+@dataclass(frozen=True)
+class Receipt:
+    version: int; profile: str; sha: str; release_digest: str; manifest_digest: str
+    test_tree_digest: str; unit_result: str; exec_main_status: int
+    output_sha256: str; output_bytes: int
 
 
 def _protected(info: os.stat_result) -> bool:
     return info.st_uid == 0 and not info.st_mode & 0o022
 
 
-def _read_regular(path: Path, maximum: int = 256) -> str:
+def _require_root() -> None:
+    if os.geteuid() != 0:
+        raise LaunchRefused("trusted preparation and receipt operations must run as root")
+
+
+def _regular(path: Path, maximum: int = 1_048_576) -> bytes:
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or not _protected(info):
-        raise LaunchRefused(f"unsafe release metadata: {path.name}")
-    value = path.read_text(encoding="ascii").strip()
-    if len(value) > maximum:
-        raise LaunchRefused(f"oversized release metadata: {path.name}")
-    return value
+        raise LaunchRefused(f"unsafe file: {path}")
+    if info.st_size > maximum:
+        raise LaunchRefused(f"oversized file: {path}")
+    return path.read_bytes()
+
+
+def _protected_directory(path: Path) -> None:
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or not _protected(info):
+        raise LaunchRefused(f"unsafe directory: {path}")
+
+
+def _release_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    excluded = {".orchestra-release-sha", ".orchestra-release-digest"}
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        relative = path.relative_to(root).as_posix()
+        if relative in excluded:
+            continue
+        info = path.lstat()
+        if stat.S_ISDIR(info.st_mode):
+            continue
+        digest.update(relative.encode() + b"\0")
+        if stat.S_ISLNK(info.st_mode):
+            digest.update(b"L\0" + os.readlink(path).encode() + b"\0")
+        elif stat.S_ISREG(info.st_mode):
+            digest.update(b"X\0" if info.st_mode & 0o111 else b"F\0")
+            digest.update(path.read_bytes() + b"\0")
+        else:
+            raise LaunchRefused(f"unsupported release entry: {relative}")
+    return digest.hexdigest()
+
+
+def _fixed_manifest(root: Path) -> str:
+    raw = _regular(root / MANIFEST_RELATIVE, 4096)
+    try:
+        manifest = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise LaunchRefused("invalid fixed test manifest") from error
+    expected: dict[str, Any] = {"version": 1, "profile": PROFILE,
+        "command": list(FIXED_COMMAND), "tests": list(FIXED_TESTS),
+        "timeout_seconds": 120, "output_limit": OUTPUT_LIMIT}
+    if manifest != expected:
+        raise LaunchRefused("test manifest is not the approved socket-free profile")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _test_tree_digest(root: Path, protected: bool = True) -> str:
+    digest = hashlib.sha256()
+    for relative in FIXED_TESTS:
+        path = root / relative
+        raw = _regular(path) if protected else path.read_bytes()
+        digest.update(relative.encode() + b"\0" + hashlib.sha256(raw).digest())
+    return digest.hexdigest()
 
 
 def verified_release(releases_root: Path, sha: str) -> Release:
-    """Return only a direct, SHA-named, protected staged release."""
     if not SHA_RE.fullmatch(sha):
         raise LaunchRefused("SHA must be exactly 40 lowercase hexadecimal characters")
-    root_info = releases_root.lstat()
-    if not stat.S_ISDIR(root_info.st_mode) or not _protected(root_info):
-        raise LaunchRefused("unsafe releases root")
-    path = releases_root / sha
-    info = path.lstat()
-    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or not _protected(info):
-        raise LaunchRefused("release is not a protected directory")
-    marker = _read_regular(path / ".orchestra-release-sha", 41)
-    digest = _read_regular(path / ".orchestra-release-digest", 65)
-    if marker != sha or not re.fullmatch(r"[0-9a-f]{64}", digest):
-        raise LaunchRefused("release marker or digest does not match the requested SHA")
-    tests = path / "tests"
-    if not tests.is_dir() or tests.is_symlink():
-        raise LaunchRefused("release does not contain a direct tests directory")
-    return Release(sha=sha, path=path, digest=digest)
+    _protected_directory(releases_root)
+    root = releases_root / sha
+    _protected_directory(root)
+    marker = _regular(root / ".orchestra-release-sha", 41).decode().strip()
+    recorded = _regular(root / ".orchestra-release-digest", 65).decode().strip()
+    if marker != sha or not re.fullmatch(r"[0-9a-f]{64}", recorded):
+        raise LaunchRefused("release marker or digest does not match requested SHA")
+    if _release_digest(root) != recorded:
+        raise LaunchRefused("staged release digest does not match its tree")
+    return Release(sha, root, recorded, _fixed_manifest(root), _test_tree_digest(root))
 
 
-def fixed_command(release: Release) -> tuple[str, ...]:
-    """Return the sole allowed command; there are no task-provided arguments."""
-    del release
-    return FIXED_COMMAND
-
-
-def _receipt_path(receipt_dir: Path, sha: str) -> Path:
-    info = receipt_dir.lstat()
-    if not stat.S_ISDIR(info.st_mode) or not _protected(info):
-        raise LaunchRefused("receipt directory must be root-owned and non-writable")
-    return receipt_dir / f"{sha}.json"
-
-
-def _write_receipt(receipt_dir: Path, receipt: SupervisorReceipt) -> Path:
-    """Write a root-owned receipt after the unprivileged child has exited.
-
-    ``receipt_dir`` is never visible or writable to the child.  Its ownership
-    check, O_EXCL temporary file and atomic replacement prevent a child from
-    replacing or racing this record, including through a pre-existing symlink.
-    """
-    path = _receipt_path(receipt_dir, receipt.sha)
-    temporary = path.with_name(path.name + ".tmp")
+def _atomic_root_json(directory: Path, filename: str, value: object) -> Path:
+    _protected_directory(directory)
+    target, temporary = directory / filename, directory / (filename + ".tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            json.dump(asdict(receipt), output, sort_keys=True, separators=(",", ":"))
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, path)
+            json.dump(asdict(value), output, sort_keys=True, separators=(",", ":"))
+            output.flush(); os.fsync(output.fileno())
+        os.replace(temporary, target)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
+    return target
 
 
-def _drop_to_worker(worker_user: str) -> None:
-    worker = pwd.getpwnam(worker_user)
-    os.setgroups([])
-    os.setgid(worker.pw_gid)
-    os.setuid(worker.pw_uid)
-
-
-def run_fixed_profile(
-    releases_root: Path, sha: str, receipt_dir: Path, timeout_seconds: int,
-    worker_user: str = "orchestra-test",
-) -> SupervisorReceipt:
-    """Run the fixed profile, bounded and in a separate process group.
-
-    The systemd unit is the security boundary. This function supplies the
-    deterministic command, timeout and SHA-bound evidence format used inside
-    that unit; it intentionally has no network, credential or provider inputs.
-    It must be invoked by the root-owned external supervisor, not by the child.
-    """
-    if not 1 <= timeout_seconds <= 3_600:
-        raise LaunchRefused("timeout must be between 1 and 3600 seconds")
-    if os.geteuid() != 0:
-        raise LaunchRefused("fixed-profile supervisor must run as root")
+def prepare_job(releases_root: Path, sha: str, jobs_dir: Path) -> Path:
+    _require_root()
     release = verified_release(releases_root, sha)
-    _receipt_path(receipt_dir, sha)
-    started = time.monotonic()
-    process = subprocess.Popen(
-        fixed_command(release), cwd=release.path, stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=False,
-        start_new_session=True, preexec_fn=lambda: _drop_to_worker(worker_user),
-        env={"PATH": "/usr/bin:/bin", "PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1"},
-    )
+    return _atomic_root_json(jobs_dir, f"{sha}.json", Job(
+        1, PROFILE, release.sha, release.digest, release.manifest_digest,
+        release.test_tree_digest, FIXED_COMMAND, 120, OUTPUT_LIMIT))
+
+
+def _load_job(path: Path) -> Job:
+    raw = _regular(path, 8192)
     try:
-        payload, _ = process.communicate(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGTERM)
-        try:
-            payload, _ = process.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            payload, _ = process.communicate()
-        outcome, exit_code = "timed_out", 124
-    else:
-        outcome = "passed" if process.returncode == 0 else "failed"
-        exit_code = process.returncode
-    payload = payload[:RESULT_LIMIT]
-    duration_ms = int((time.monotonic() - started) * 1000)
-    receipt = SupervisorReceipt(
-        version=1, profile=PROFILE, sha=release.sha, release_digest=release.digest,
-        outcome=outcome, exit_code=exit_code, duration_ms=duration_ms,
-        artifact_sha256=hashlib.sha256(payload).hexdigest(), artifact_bytes=len(payload),
+        value = json.loads(raw); value["command"] = tuple(value["command"]); job = Job(**value)
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise LaunchRefused("invalid sealed test job") from error
+    if (job.version, job.profile, job.command, job.timeout_seconds, job.output_limit) != \
+            (1, PROFILE, FIXED_COMMAND, 120, OUTPUT_LIMIT) or not SHA_RE.fullmatch(job.sha):
+        raise LaunchRefused("sealed job does not name the approved profile")
+    return job
+
+
+def run_job(job_path: Path, releases_root: Path) -> int:
+    if os.geteuid() == 0:
+        raise LaunchRefused("test runner must not run as root")
+    job = _load_job(job_path)
+    root = releases_root / job.sha
+    if root.is_symlink() or not (root / "tests").is_dir():
+        raise LaunchRefused("sealed release disappeared before execution")
+    manifest = hashlib.sha256((root / MANIFEST_RELATIVE).read_bytes()).hexdigest()
+    if manifest != job.manifest_digest or _test_tree_digest(root, protected=False) != job.test_tree_digest:
+        raise LaunchRefused("executable test tree differs from sealed job")
+    return subprocess.run(job.command, cwd=root, stdin=subprocess.DEVNULL, check=False,
+        env={"PATH": "/usr/bin:/bin", "PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1"}).returncode
+
+
+def _unit_outcome(sha: str) -> tuple[str, int]:
+    completed = subprocess.run(
+        ["/bin/systemctl", "show", "--property=Result", "--property=ExecMainStatus",
+         "--value", f"orchestra-test@{sha}.service"], stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False, timeout=15,
     )
-    _write_receipt(receipt_dir, receipt)
-    return receipt
+    values = completed.stdout.splitlines()
+    if completed.returncode or len(values) != 2:
+        raise LaunchRefused("could not obtain terminal state from systemd")
+    try:
+        return values[0], int(values[1])
+    except ValueError as error:
+        raise LaunchRefused("systemd returned an invalid execution status") from error
+
+
+def record_receipt(releases_root: Path, job_path: Path, output_path: Path,
+                   receipts_dir: Path) -> Path:
+    _require_root(); job = _load_job(job_path); release = verified_release(releases_root, job.sha)
+    if (release.digest, release.manifest_digest, release.test_tree_digest) != \
+            (job.release_digest, job.manifest_digest, job.test_tree_digest):
+        raise LaunchRefused("release differs from the sealed test job")
+    unit_result, exec_main_status = _unit_outcome(job.sha)
+    output = _regular(output_path, OUTPUT_LIMIT)
+    if unit_result != "success" or exec_main_status != 0:
+        raise LaunchRefused("unit did not complete the sealed test job successfully")
+    return _atomic_root_json(receipts_dir, f"{job.sha}.json", Receipt(
+        1, PROFILE, job.sha, job.release_digest, job.manifest_digest, job.test_tree_digest,
+        unit_result, exec_main_status, hashlib.sha256(output).hexdigest(), len(output)))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--releases-root", type=Path, required=True)
-    parser.add_argument("--sha", required=True)
-    parser.add_argument("--receipt-dir", type=Path, required=True)
-    parser.add_argument("--worker-user", default="orchestra-test")
-    parser.add_argument("--timeout-seconds", type=int, default=900)
+    parser = argparse.ArgumentParser(description=__doc__); sub = parser.add_subparsers(dest="operation", required=True)
+    prepare = sub.add_parser("prepare"); prepare.add_argument("--releases-root", type=Path, required=True); prepare.add_argument("--sha", required=True); prepare.add_argument("--jobs-dir", type=Path, required=True)
+    run = sub.add_parser("run"); run.add_argument("--job", type=Path, required=True); run.add_argument("--releases-root", type=Path, required=True)
+    receipt = sub.add_parser("receipt"); receipt.add_argument("--releases-root", type=Path, required=True); receipt.add_argument("--job", type=Path, required=True); receipt.add_argument("--output", type=Path, required=True); receipt.add_argument("--receipts-dir", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
-        evidence = run_fixed_profile(
-            args.releases_root, args.sha, args.receipt_dir, args.timeout_seconds,
-            args.worker_user,
-        )
+        if args.operation == "prepare": prepare_job(args.releases_root, args.sha, args.jobs_dir); return 0
+        if args.operation == "run": return run_job(args.job, args.releases_root)
+        record_receipt(args.releases_root, args.job, args.output, args.receipts_dir); return 0
     except LaunchRefused as error:
         parser.error(str(error))
-    return 0 if evidence.outcome == "passed" else evidence.exit_code
 
 
 if __name__ == "__main__":

@@ -8,13 +8,13 @@ ConditionPathExists=/opt/orchestra/releases/%i/.orchestra-release-sha
 
 [Service]
 Type=exec
-User=root
-Group=root
+User=orchestra-test
+Group=orchestra-test
 SupplementaryGroups=
 UMask=0077
 WorkingDirectory=/opt/orchestra/releases/%i
-ExecStart=/usr/local/libexec/orchestra-test-launcher --releases-root /opt/orchestra/releases --sha %i --receipt-dir /var/lib/orchestra-test/receipts --worker-user orchestra-test --timeout-seconds 900
-TimeoutStartSec=930
+ExecStart=/usr/local/libexec/orchestra-test-runner run --job /var/lib/orchestra-test/jobs/%i.json --releases-root /opt/orchestra/releases
+TimeoutStartSec=120
 MemoryMax=1G
 TasksMax=128
 CPUQuota=200%
@@ -48,13 +48,13 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
-ReadOnlyPaths=/opt/orchestra/releases/%i /usr /bin /lib /lib64 /usr/local/lib/orchestra-test-launcher
-ReadWritePaths=/var/lib/orchestra-test/receipts
-InaccessiblePaths=/etc/orchestra /home/hamed /root /run /var/run /run/docker.sock /var/run/docker.sock /run/tailscale /var/run/tailscale /var/lib/tailscale /var/www/nextcloud /srv/nextcloud
-StateDirectory=orchestra-test/receipts
-StateDirectoryMode=0700
+ReadOnlyPaths=/opt/orchestra/releases/%i /var/lib/orchestra-test/jobs/%i.json /usr /bin /lib /lib64 /usr/local/lib/orchestra-test-launcher
+InaccessiblePaths=/etc/orchestra /home/hamed /root /run /var/run /run/docker.sock /var/run/docker.sock /run/tailscale /var/run/tailscale /var/lib/tailscale /var/www/nextcloud /srv/nextcloud /var/lib/orchestra-test/receipts /var/lib/orchestra-test/output
+StandardOutput=append:/var/lib/orchestra-test/output/%i.log
+StandardError=inherit
+LimitFSIZE=32768
 Environment=PATH=/usr/bin:/bin
 UnsetEnvironment=HOME XDG_CONFIG_HOME XDG_DATA_HOME SSH_AUTH_SOCK SSH_AGENT_PID GIT_ASKPASS GITHUB_TOKEN DEEPSEEK_API_KEY
 
-# The root supervisor writes the receipt only after its unprivileged child exits.
-# It remains test evidence only; no result can authorise an execution or deploy.
+# Root-only preparation and receipt commands live outside this unit. The direct
+# worker cannot open output or receipt paths; inherited stdout is bounded.
