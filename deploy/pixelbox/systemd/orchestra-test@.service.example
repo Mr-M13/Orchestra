@@ -1,0 +1,60 @@
+# Inactive Phase 1 example. Do not install or enable without a separately
+# approved PixelBox canary. %i must be a full lower-case Git SHA.
+[Unit]
+Description=Orchestra fixed-profile test for release %i
+Documentation=file:/opt/orchestra/current/docs/PIXELBOX-TEST-LAUNCHER.md
+After=local-fs.target
+ConditionPathExists=/opt/orchestra/releases/%i/.orchestra-release-sha
+
+[Service]
+Type=exec
+User=orchestra-test
+Group=orchestra-test
+SupplementaryGroups=
+UMask=0077
+WorkingDirectory=/opt/orchestra/releases/%i
+ExecStart=/usr/local/libexec/orchestra-test-launcher --releases-root /opt/orchestra/releases --sha %i --result /var/lib/orchestra-test/results/%i.json --timeout-seconds 900
+TimeoutStartSec=930
+MemoryMax=1G
+TasksMax=128
+CPUQuota=200%
+KillMode=control-group
+KillSignal=SIGTERM
+SendSIGKILL=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateUsers=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectSystem=strict
+ProtectHome=tmpfs
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX
+SocketBindDeny=any
+IPAddressDeny=any
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+ReadOnlyPaths=/opt/orchestra/releases/%i /usr /bin /lib /lib64 /usr/local/lib/orchestra-test-launcher
+ReadWritePaths=/var/lib/orchestra-test/results
+InaccessiblePaths=/etc/orchestra /home/hamed /root /run /var/run /run/docker.sock /var/run/docker.sock /run/tailscale /var/run/tailscale /var/lib/tailscale /var/www/nextcloud /srv/nextcloud
+StateDirectory=orchestra-test/results
+StateDirectoryMode=0700
+Environment=PATH=/usr/bin:/bin
+UnsetEnvironment=HOME XDG_CONFIG_HOME XDG_DATA_HOME SSH_AUTH_SOCK SSH_AGENT_PID GIT_ASKPASS GITHUB_TOKEN DEEPSEEK_API_KEY
+
+# The untrusted test process cannot write an authoritative result. The JSON is
+# bounded evidence only; systemd unit state remains the lifecycle record.

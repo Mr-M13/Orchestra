@@ -29,6 +29,11 @@ Portable source and staging tests on another platform do not prove PixelBox or
 Linux ARM64 readiness. Only `verify.sh --live --sha <sha>` on PixelBox can
 produce that evidence.
 
+`systemd/orchestra-test@.service.example` is an inactive Phase 1 prototype for
+a fixed-profile, SHA-pinned test canary. It is not installed by `install.sh`,
+does not contact OMCP, and cannot authorise a merge or deployment. See
+[the launcher boundary and canary procedure](../../docs/PIXELBOX-TEST-LAUNCHER.md).
+
 Read [docs/PIXELBOX-MIGRATION.md](../../docs/PIXELBOX-MIGRATION.md) before use.
 Never commit a filled environment file, GitHub token or provider key.
 Replace invalid UID/SHA placeholders in both templates during local owner
