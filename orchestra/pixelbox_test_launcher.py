@@ -236,23 +236,29 @@ def run_job(job_path: Path, releases_root: Path) -> int:
 
 
 def _unit_outcome(sha: str) -> UnitOutcome:
+    properties = (
+        "InvocationID", "ActiveState", "Result", "ExecMainStatus",
+        "ExecMainStartTimestampMonotonic", "ExecMainExitTimestampMonotonic",
+    )
     completed = subprocess.run(
-        ["/bin/systemctl", "show", "--property=InvocationID", "--property=ActiveState",
-         "--property=Result", "--property=ExecMainStatus",
-         "--property=ExecMainStartTimestampMonotonic", "--property=ExecMainExitTimestampMonotonic",
-         "--value", f"orchestra-test@{sha}.service"], stdin=subprocess.DEVNULL,
+        ["/bin/systemctl", "show", *(f"--property={name}" for name in properties),
+         f"orchestra-test@{sha}.service"], stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False, timeout=15,
     )
-    values = completed.stdout.splitlines()
-    if completed.returncode or len(values) != 6:
+    values = dict(line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line)
+    if completed.returncode or set(values) != set(properties):
         raise LaunchRefused("could not obtain terminal state from systemd")
     try:
-        outcome = UnitOutcome(values[0], values[1], values[2], int(values[3]),
-                              int(values[4]) // 1_000, int(values[5]) // 1_000)
+        outcome = UnitOutcome(
+            values["InvocationID"], values["ActiveState"], values["Result"],
+            int(values["ExecMainStatus"]),
+            int(values["ExecMainStartTimestampMonotonic"]) // 1_000,
+            int(values["ExecMainExitTimestampMonotonic"]) // 1_000,
+        )
     except ValueError as error:
         raise LaunchRefused("systemd returned an invalid execution status") from error
-    if not re.fullmatch(r"[0-9a-f]{32}", outcome.invocation_id) or outcome.active_state != "inactive":
-        raise LaunchRefused("systemd unit is stale or still active")
+    if not re.fullmatch(r"[0-9a-f]{32}", outcome.invocation_id) or outcome.active_state != "active":
+        raise LaunchRefused("systemd unit is not holding its completed invocation")
     return outcome
 
 
@@ -273,7 +279,7 @@ def record_receipt(releases_root: Path, job_path: Path, receipts_dir: Path) -> P
             (job.release_digest, job.manifest_digest, job.test_tree_digest):
         raise LaunchRefused("release differs from the sealed test job")
     outcome = _unit_outcome(job.sha)
-    if outcome.active_state != "inactive" or job.boot_id != _boot_id() or outcome.started_monotonic_ms < job.prepared_monotonic_ms \
+    if outcome.active_state != "active" or job.boot_id != _boot_id() or outcome.started_monotonic_ms < job.prepared_monotonic_ms \
             or outcome.exited_monotonic_ms < outcome.started_monotonic_ms:
         raise LaunchRefused("unit invocation is stale or predates the sealed job")
     if outcome.result != "success" or outcome.exec_main_status != 0:

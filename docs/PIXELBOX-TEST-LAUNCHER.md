@@ -17,11 +17,13 @@ approved canary:
    reads that sealed job. It executes only
    `tests.test_socket_free_canary`; there are no task-supplied arguments,
    network destinations, credentials, or writable state paths.
-3. A root-only `receipt` command revalidates the release, manifest and test
-   tree; obtains the terminal unit result and invocation ID directly from
-   systemd; hashes only that invocation's bounded journal output; and writes a
-   root-owned receipt. It refuses an active, stale, failed/non-zero, pre-seal,
-   or wrong-boot invocation, or any release identity change.
+3. The successful one-shot unit remains active without a process only long
+   enough for a root-only `receipt` command to revalidate the release, manifest
+   and test tree; obtain the completed invocation ID and result directly from
+   systemd; and hash only that invocation's bounded journal output. It then
+   writes a root-owned receipt, after which root stops the unit. The receipt
+   refuses an unheld, stale, failed/non-zero, pre-seal, or wrong-boot invocation,
+   or any release identity change.
 
 Test output is untrusted evidence, not a success claim. A receipt binds the
 SHA, release digest, manifest digest, executable-test digest, systemd invocation
@@ -29,8 +31,8 @@ ID and timing/status, and output artifact hash/size. It is never consumed by
 OMCP or deployment code.
 
 The unit has `RestrictAddressFamilies=none`, so even `AF_UNIX` socket creation
-is denied. `PrivateNetwork`, `IPAddressDeny`, `SocketBindDeny`, hidden `/run`,
-and explicit inaccessible production paths are independent defense in depth.
+is denied. `PrivateNetwork`, `IPAddressDeny`, `SocketBindDeny`, and explicit
+inaccessible production socket/state paths are independent defense in depth.
 The fixed canary has no socket requirement; isolation is not weakened to run
 the general test suite.
 
@@ -49,7 +51,8 @@ the general test suite.
    no-home, no-group system account. Do not edit OMCP, tunnel, Docker,
    Nextcloud, or Tailscale.
 4. Run `systemd-analyze verify` and `systemd-analyze security`. Prepare the
-   SHA, run one unit, then generate a receipt only after systemd reports success.
+   SHA, run one unit, then generate a receipt only after systemd reports success,
+   and stop the held unit immediately after the receipt is sealed.
    Independently probe AF_UNIX socket creation under the equivalent transient
    denial policy (`RestrictAddressFamilies=~AF_UNIX`); it must fail with a
    kernel-level denial such as `EPERM`, `EACCES`, or `EAFNOSUPPORT`.  The

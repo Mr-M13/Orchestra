@@ -8,6 +8,7 @@ ConditionPathExists=/opt/orchestra/releases/%i/.orchestra-release-sha
 
 [Service]
 Type=exec
+RemainAfterExit=yes
 User=orchestra-test
 Group=orchestra-test
 SupplementaryGroups=

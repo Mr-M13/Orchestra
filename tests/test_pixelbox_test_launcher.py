@@ -77,9 +77,9 @@ class PixelBoxTestLauncherTests(unittest.TestCase):
                 failed = launcher.UnitOutcome("a" * 32, "inactive", "failed", 1,
                                                sealed.prepared_monotonic_ms + 1, sealed.prepared_monotonic_ms + 2)
                 with patch.object(launcher, "_unit_outcome", return_value=failed), \
-                     self.assertRaisesRegex(launcher.LaunchRefused, "did not complete"):
+                     self.assertRaisesRegex(launcher.LaunchRefused, "stale"):
                     launcher.record_receipt(releases, job, receipts)
-                passed = launcher.UnitOutcome("a" * 32, "inactive", "success", 0,
+                passed = launcher.UnitOutcome("a" * 32, "active", "success", 0,
                                               sealed.prepared_monotonic_ms + 1, sealed.prepared_monotonic_ms + 2)
                 with patch.object(launcher, "_unit_outcome", return_value=passed), \
                      patch.object(launcher, "_invocation_output", return_value=output.read_bytes()):
@@ -104,11 +104,11 @@ class PixelBoxTestLauncherTests(unittest.TestCase):
             with patch.object(launcher, "_protected", return_value=False), patch.object(
                 launcher.os, "geteuid", return_value=0
             ), patch.object(launcher, "_unit_outcome", return_value=launcher.UnitOutcome(
-                "a" * 32, "inactive", "success", 0, 1, 2)), \
+                "a" * 32, "active", "success", 0, 1, 2)), \
                  self.assertRaisesRegex(launcher.LaunchRefused, "unsafe file|unsafe directory"):
                 launcher.record_receipt(releases, job, receipts)
 
-    def test_receipt_refuses_active_or_preparation_stale_invocations(self):
+    def test_receipt_refuses_inactive_or_preparation_stale_invocations(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary); releases, _ = self.release(base)
             jobs, receipts = base / "jobs", base / "receipts"; jobs.mkdir(); receipts.mkdir()
@@ -116,9 +116,9 @@ class PixelBoxTestLauncherTests(unittest.TestCase):
             with protected, root:
                 path = launcher.prepare_job(releases, self.sha, jobs, self.worker_group())
                 job = launcher._load_job(path)
-                active = launcher.UnitOutcome("a" * 32, "active", "success", 0,
+                inactive = launcher.UnitOutcome("a" * 32, "inactive", "success", 0,
                                               job.prepared_monotonic_ms + 1, job.prepared_monotonic_ms + 2)
-                with patch.object(launcher, "_unit_outcome", return_value=active), \
+                with patch.object(launcher, "_unit_outcome", return_value=inactive), \
                      self.assertRaisesRegex(launcher.LaunchRefused, "stale"):
                     launcher.record_receipt(releases, path, receipts)
 
@@ -130,7 +130,7 @@ class PixelBoxTestLauncherTests(unittest.TestCase):
             with protected, root:
                 path = launcher.prepare_job(releases, self.sha, jobs, self.worker_group())
                 job = launcher._load_job(path)
-                for state in ("active", "activating", "deactivating", "failed"):
+                for state in ("inactive", "activating", "deactivating", "failed"):
                     outcome = launcher.UnitOutcome("a" * 32, state, "success", 0,
                         job.prepared_monotonic_ms + 1, job.prepared_monotonic_ms + 2)
                     with patch.object(launcher, "_unit_outcome", return_value=outcome), \
@@ -145,14 +145,14 @@ class PixelBoxTestLauncherTests(unittest.TestCase):
             with protected, root:
                 path = launcher.prepare_job(releases, self.sha, jobs, self.worker_group())
                 job = launcher._load_job(path)
-                outcome = launcher.UnitOutcome("a" * 32, "inactive", "success", 0,
+                outcome = launcher.UnitOutcome("a" * 32, "active", "success", 0,
                     job.prepared_monotonic_ms + 1, job.prepared_monotonic_ms + 2)
                 for evidence in (b"", b"Ran 1 test\n", b"x" * launcher.OUTPUT_LIMIT):
                     with patch.object(launcher, "_unit_outcome", return_value=outcome), \
                          patch.object(launcher, "_invocation_output", return_value=evidence), \
                          self.assertRaisesRegex(launcher.LaunchRefused, "unavailable|incomplete"):
                         launcher.record_receipt(releases, path, receipts)
-                stale = launcher.UnitOutcome("a" * 32, "inactive", "success", 0,
+                stale = launcher.UnitOutcome("a" * 32, "active", "success", 0,
                                              job.prepared_monotonic_ms - 1, job.prepared_monotonic_ms)
                 with patch.object(launcher, "_unit_outcome", return_value=stale), \
                      self.assertRaisesRegex(launcher.LaunchRefused, "stale"):
