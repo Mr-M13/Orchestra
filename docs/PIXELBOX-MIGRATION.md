@@ -241,11 +241,53 @@ production settings:
   policy;
 - `max_parallel_tasks: 2` initially;
 - `sandbox_backend: "bubblewrap"` on PixelBox;
+- `local_worker_launcher: "systemd-user"` on PixelBox so local Codex workers
+  run in a separate transient user service rather than inheriting the
+  coordinator's seccomp filter;
 - each `github_actions` worker points only at the reviewed broker socket and
   binds its dedicated `github_service_uid`; target/SHA/token policy stays in
   the broker's private config;
 - no standing authorization for GitHub Actions workers;
 - `repository_profiles` binds each allowlisted checkout and base ref.
+
+### Local Codex worker boundary
+
+On Linux, the `systemd-user` launcher starts each non-DeepSeek local worker in
+a transient `orchestra-worker-<task-id>.service` under the service user's
+systemd manager. The coordinator unit keeps `RestrictSUIDSGID=yes`; the worker
+service deliberately sets `RestrictSUIDSGID=no`.
+
+This is not a cosmetic removal. systemd implements `RestrictSUIDSGID=yes` with
+a seccomp filter that makes `openat2()` return `ENOSYS`, because seccomp cannot
+inspect openat2's flags. Bubblewrap 0.12 uses openat2 for safe path resolution,
+so Codex fails before its first model request with:
+
+```text
+bwrap: Can't mkdir parents for /: Function not implemented
+```
+
+The worker service retains `ProtectSystem=strict`, `ProtectHome=read-only`,
+`PrivateTmp=yes`, `NoNewPrivileges=yes`, restricted address families,
+non-root execution, control-group cleanup, and writable paths limited to the
+task directory, its exact worktree and Git metadata, and the configured Codex
+home. Codex's own sandbox still enforces the per-task filesystem and network
+policy. It may read the owner checkout so Git can resolve the external metadata
+of a linked worktree, but routine mode never permits writes there. The routine
+profile also explicitly denies `/etc/orchestra`, because Codex's minimal system
+read set otherwise includes `/etc`.
+
+The launcher fails closed unless the service user has a live systemd user
+manager at `/run/user/<uid>/systemd/private`. On a host where the service user
+does not maintain a login session, enable lingering once with owner approval:
+
+```sh
+sudo loginctl enable-linger hamed
+test -S /run/user/1000/systemd/private
+```
+
+Enabling lingering starts a user manager but does not start this worker
+service; workers are transient and exist only for the lifetime of a task.
+Do not add `RestrictSUIDSGID=no` to `orchestra-omcp.service` as a shortcut.
 
 Install owner-only files:
 

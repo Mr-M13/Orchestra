@@ -149,6 +149,84 @@ def deepseek_runner_command(spec_path: Path, task_dir: Path, workspace: Path,
     )
 
 
+def systemd_user_runtime_dir() -> Path:
+    """Return the caller's private systemd user-manager runtime directory."""
+    configured = os.environ.get("XDG_RUNTIME_DIR")
+    root = Path(configured) if configured else Path(f"/run/user/{os.getuid()}")
+    try:
+        stat = root.stat()
+    except OSError:
+        raise RuntimeError("a private systemd user runtime directory is required") from None
+    if not root.is_dir() or stat.st_uid != os.getuid():
+        raise RuntimeError("a private systemd user runtime directory is required")
+    if not (root / "systemd" / "private").is_socket():
+        raise RuntimeError(
+            "systemd user manager is unavailable; enable lingering for the service user"
+        )
+    return root
+
+
+def systemd_user_worker_command(
+    runner_command: list[str], *, task_id: str, task_dir: Path, workspace: Path,
+    git_metadata_paths: tuple[Path, ...], codex_home: Path | None, source_root: Path,
+    max_worker_seconds: int, environment: dict[str, str],
+) -> tuple[list[str], str, Path]:
+    """Wrap one local worker in a transient hardened systemd user service.
+
+    The coordinator keeps ``RestrictSUIDSGID=yes``.  systemd implements that
+    option with a seccomp filter that deliberately makes ``openat2`` return
+    ENOSYS (seccomp cannot inspect openat2's flags).  Bubblewrap 0.12 uses
+    openat2 for safe path resolution, so a Codex worker started directly under
+    the coordinator cannot construct its sandbox.  The worker service therefore
+    drops only that incompatible filter and retains the filesystem, network,
+    credential and privilege boundaries below.
+    """
+    if host_platform() != "linux":
+        raise RuntimeError("the systemd-user worker launcher is supported only on Linux")
+    systemd_run = shutil.which("systemd-run")
+    if not systemd_run:
+        raise RuntimeError("systemd-run is required for the systemd-user worker launcher")
+    runtime_dir = systemd_user_runtime_dir()
+    unit = "orchestra-worker-" + task_id
+    properties = [
+        f"WorkingDirectory={source_root}",
+        "ProtectSystem=strict",
+        "ProtectHome=read-only",
+        "PrivateTmp=yes",
+        "NoNewPrivileges=yes",
+        "RestrictSUIDSGID=no",
+        "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+        "LockPersonality=yes",
+        "RestrictRealtime=yes",
+        "UMask=0077",
+        "KillMode=control-group",
+        f"TimeoutStopSec={max_worker_seconds + 30}",
+        f"ReadWritePaths={task_dir}",
+        f"ReadWritePaths={workspace}",
+        *[f"ReadWritePaths={path}" for path in git_metadata_paths],
+    ]
+    if codex_home is not None:
+        properties.append(f"ReadWritePaths={codex_home}")
+    child_environment = {
+        "PATH": environment.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "HOME": environment.get("HOME", str(Path.home())),
+        "GIT_TERMINAL_PROMPT": "0",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    for key in ("LANG", "LC_ALL"):
+        if key in environment:
+            child_environment[key] = environment[key]
+    command = [
+        systemd_run, "--user", "--wait", "--collect", "--quiet", "--pipe",
+        f"--unit={unit}",
+        *[f"--property={value}" for value in properties],
+        *[f"--setenv={key}={value}" for key, value in sorted(child_environment.items())],
+        "--", *runner_command,
+    ]
+    environment["XDG_RUNTIME_DIR"] = str(runtime_dir)
+    return command, unit, runtime_dir
+
+
 @dataclass(frozen=True)
 class Worker:
     name: str
@@ -227,6 +305,7 @@ class Config:
     task_approval_mode: str = "required"
     local_worker_git_mode: str = "fetch"
     local_worker_source_sha: str | None = None
+    local_worker_launcher: str = "direct"
     max_worker_seconds: int = 1_800
     max_parallel_tasks: int = 1
     startup_lease_seconds: int = 30
@@ -431,6 +510,9 @@ class Config:
             not re.fullmatch(r"[0-9a-f]{40}", local_worker_source_sha)
         ):
             raise ValueError("owner_synced requires a pinned 40-character local_worker_source_sha")
+        local_worker_launcher = raw.get("local_worker_launcher", "direct")
+        if local_worker_launcher not in {"direct", "systemd-user"}:
+            raise ValueError("local_worker_launcher must be direct or systemd-user")
         max_worker_seconds = int(raw.get("max_worker_seconds", 1_800))
         if not 60 <= max_worker_seconds <= 7_200:
             raise ValueError("max_worker_seconds must be between 60 and 7200")
@@ -597,6 +679,7 @@ class Config:
             task_approval_mode=task_approval_mode,
             local_worker_git_mode=local_worker_git_mode,
             local_worker_source_sha=local_worker_source_sha,
+            local_worker_launcher=local_worker_launcher,
             max_worker_seconds=max_worker_seconds,
             max_parallel_tasks=max_parallel_tasks,
             startup_lease_seconds=startup_lease_seconds,
@@ -678,6 +761,9 @@ class TaskController:
         self._heartbeat(force=True)
 
     def close(self) -> None:
+        for task in self.state["tasks"].values():
+            if task.get("status") in ACTIVE and task.get("worker_unit"):
+                self._stop_worker_unit(task)
         self._audit("service.stop", None, "allowed", {})
         try:
             self.heartbeat_path.unlink(missing_ok=True)
@@ -821,6 +907,7 @@ class TaskController:
             "task_id", "request_id", "title", "worker", "status", "created_at",
             "started_at", "finished_at", "exit_code", "branch", "approval",
             "cancel_reason", "failure", "repository_profile", "repository", "base_ref",
+            "worker_unit",
             "consequence_class", "authorization", "execution_capabilities",
             "resource_requirements", "reservation",
             "kind", "operation_id", "operation_type", "target_commit",
@@ -1135,6 +1222,7 @@ class TaskController:
                 os.killpg(int(pid), signal.SIGTERM)
             except ProcessLookupError:
                 pass
+        self._stop_worker_unit(task)
         if (task["status"] == "cancel_requested" and not pid
                 and worker is not None and worker.adapter == "github_actions"):
             # The runner that held the remote run ID disappeared.  Fail closed by
@@ -1143,6 +1231,27 @@ class TaskController:
             self._cancel_remote_best_effort(task)
         self.tick()
         return self._public(task)
+
+    def _stop_worker_unit(self, task: dict[str, Any]) -> None:
+        """Stop the transient user service that owns one local worker."""
+        unit = task.get("worker_unit")
+        if not isinstance(unit, str) or not re.fullmatch(r"orchestra-worker-[0-9a-f-]{36}", unit):
+            return
+        systemctl = shutil.which("systemctl")
+        if not systemctl:
+            return
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+        if not (Path(runtime_dir) / "systemd" / "private").is_socket():
+            return
+        try:
+            subprocess.run(
+                [systemctl, "--user", "stop", unit],
+                env={**os.environ, "XDG_RUNTIME_DIR": runtime_dir},
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, check=False, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
 
     def _cancel_remote_best_effort(self, task: dict[str, Any]) -> None:
         """Cancel one dispatched Actions run without exposing its token."""
@@ -1466,6 +1575,7 @@ class TaskController:
                     }
                 changed = True
                 self._reap_child(task.get("runner_pid"))
+                self._stop_worker_unit(task)
                 self._audit("task.complete", task["task_id"], "allowed", {"status": task["status"]})
                 continue
             pid = task.get("runner_pid")
@@ -1534,6 +1644,7 @@ class TaskController:
                         task["failure"] = {"type": "runner_exited_without_completion"}
                     self._release_reservation(task, task["finished_at"])
                     changed = True
+                    self._stop_worker_unit(task)
                     self._cancel_remote_if_actions(task)
                     self._audit("task.reconcile", task["task_id"], "allowed", {
                         "status": task["status"], "reason": "runner_reaped_without_completion",
@@ -1550,6 +1661,7 @@ class TaskController:
                     self._release_reservation(task, task["finished_at"])
                     changed = True
                     self._reap_child(pid)
+                    self._stop_worker_unit(task)
                     self._cancel_remote_if_actions(task)
                     self._audit("task.reconcile", task["task_id"], "allowed", {"status": task["status"]})
         if changed:
@@ -1590,6 +1702,20 @@ class TaskController:
                 )
                 if source_code != 0 or not re.fullmatch(r"[0-9a-f]{40}", source_sha):
                     raise RuntimeError("task worktree has no exact source commit")
+            git_metadata_paths: list[Path] = []
+            if worker.adapter in {"codex", "opencode"}:
+                for option in ("--git-dir", "--git-common-dir"):
+                    git_code, git_value = self._git(
+                        workspace, "rev-parse", option, allow_failure=True,
+                    )
+                    if git_code != 0 or not git_value:
+                        continue
+                    candidate = Path(git_value)
+                    resolved = (
+                        candidate if candidate.is_absolute() else workspace / candidate
+                    ).resolve()
+                    if resolved not in git_metadata_paths:
+                        git_metadata_paths.append(resolved)
             task_dir = self.config.state_dir / "tasks" / task_id
             task_dir.mkdir(parents=True, mode=0o700)
             os.chmod(task_dir, 0o700)
@@ -1624,6 +1750,11 @@ class TaskController:
                 "log_path": str(log_path), "result_path": str(result_path),
                 "completion_path": str(completion_path),
                 "execution_capabilities": task.get("execution_capabilities"),
+                # A linked worktree's .git file points outside the workspace.
+                # Routine Codex may read the owner checkout (never write it) so
+                # Git can resolve its own read-only metadata.
+                "git_read_paths": ([str(profile.project_root)]
+                                   if worker.adapter == "codex" else []),
                 "task_id": task_id,
                 "request_id": task["request_id"],
                 "lease_id": task["startup_lease"]["lease_id"],
@@ -1677,6 +1808,18 @@ class TaskController:
                 runner_environment.pop("TMPDIR", None)
                 runner_environment["PYTHONDONTWRITEBYTECODE"] = "1"
             runner_environment["GIT_TERMINAL_PROMPT"] = "0"
+            worker_unit: str | None = None
+            if (worker.adapter not in {"deepseek", "github_actions"}
+                    and self.config.local_worker_launcher == "systemd-user"):
+                runner_command, worker_unit, _ = systemd_user_worker_command(
+                    runner_command, task_id=task_id, task_dir=task_dir,
+                    workspace=workspace, git_metadata_paths=tuple(git_metadata_paths),
+                    codex_home=(Path(worker.codex_home).expanduser()
+                                if worker.codex_home else None),
+                    source_root=Path(__file__).resolve().parent.parent,
+                    max_worker_seconds=self.config.max_worker_seconds,
+                    environment=runner_environment,
+                )
             proc = self.popen(
                 runner_command,
                 cwd=Path(__file__).resolve().parent.parent, env=runner_environment,
@@ -1686,9 +1829,12 @@ class TaskController:
             task.update({
                 "status": "running", "runner_pid": proc.pid, "started_at": utc_now(),
             })
+            if worker_unit is not None:
+                task["worker_unit"] = worker_unit
             try:
                 self._save()
             except Exception:
+                self._stop_worker_unit(task)
                 try:
                     os.killpg(proc.pid, signal.SIGTERM)
                 except ProcessLookupError:

@@ -4,7 +4,8 @@ These files stage the Linux ARM64 coordinator. The installer is read-only by
 default and every mutating mode requires an explicit approval marker. No mode
 starts the tunnel or touches unrelated host services.
 
-- `omcp.example.json` — owner-only coordinator configuration template.
+- `omcp.example.json` — owner-only coordinator configuration template,
+  including the `systemd-user` local worker launcher for Codex on PixelBox.
 - `github-dispatch.example.json` — dedicated broker configuration template;
   it and the token must be owned by the separate `orchestra-github` UID.
 - `omcp.env.example` — fixed-principal tunnel assertions and service `PATH`.

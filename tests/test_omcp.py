@@ -10,13 +10,13 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 from urllib.parse import urlparse
 
 from omcp.approval import format_review
 from omcp.controller import (
     AuthorizationError, Config, HostOperation, Principal, RepositoryProfile, StandingAuthorization,
-    TaskController, Worker,
+    TaskController, Worker, systemd_user_worker_command,
 )
 from omcp.docker_gate import gated_command
 from omcp.host_runner import run as run_host_operation
@@ -150,6 +150,102 @@ class ControllerTests(unittest.TestCase):
                 self.controller._prepare_workspace(
                     "test-origin", "omcp/task-origin", self.config.profile("default"), False,
                 )
+
+    def test_systemd_user_worker_command_is_hardened(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task_dir = root / "task"
+            workspace = root / "workspace"
+            git_dir = root / "git-worktree"
+            codex_home = root / "codex-home"
+            for path in (task_dir, workspace, git_dir, codex_home):
+                path.mkdir()
+            environment = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": str(root)}
+            with patch("omcp.controller.host_platform", return_value="linux"), \
+                    patch("omcp.controller.shutil.which",
+                          side_effect=lambda name: f"/usr/bin/{name}"), \
+                    patch("omcp.controller.systemd_user_runtime_dir", return_value=root):
+                command, unit, runtime = systemd_user_worker_command(
+                    ["/usr/bin/python3", "-m", "omcp.runner", "--spec", "spec.json"],
+                    task_id="11111111-1111-1111-1111-111111111111",
+                    task_dir=task_dir, workspace=workspace,
+                    git_metadata_paths=(git_dir,), codex_home=codex_home,
+                    source_root=root, max_worker_seconds=90,
+                    environment=environment,
+                )
+        self.assertEqual(command[0], "/usr/bin/systemd-run")
+        self.assertIn("--user", command)
+        self.assertIn("--wait", command)
+        self.assertIn("--collect", command)
+        self.assertIn("--unit=orchestra-worker-11111111-1111-1111-1111-111111111111", command)
+        properties = {value.removeprefix("--property=") for value in command
+                      if value.startswith("--property=")}
+        self.assertIn("ProtectSystem=strict", properties)
+        self.assertIn("ProtectHome=read-only", properties)
+        self.assertIn("PrivateTmp=yes", properties)
+        self.assertIn("NoNewPrivileges=yes", properties)
+        self.assertIn("RestrictSUIDSGID=no", properties)
+        self.assertIn("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK", properties)
+        self.assertIn(f"ReadWritePaths={task_dir}", properties)
+        self.assertIn(f"ReadWritePaths={workspace}", properties)
+        self.assertIn(f"ReadWritePaths={git_dir}", properties)
+        self.assertIn(f"ReadWritePaths={codex_home}", properties)
+        self.assertEqual(unit, "orchestra-worker-11111111-1111-1111-1111-111111111111")
+        self.assertEqual(runtime, root)
+        self.assertEqual(environment["XDG_RUNTIME_DIR"], str(root))
+        self.assertIn("--", command)
+        self.assertEqual(command[command.index("--") + 1:], [
+            "/usr/bin/python3", "-m", "omcp.runner", "--spec", "spec.json",
+        ])
+
+    def test_systemd_user_worker_command_rejects_non_linux_hosts(self):
+        with patch("omcp.controller.host_platform", return_value="darwin"):
+            with self.assertRaisesRegex(RuntimeError, "only on Linux"):
+                systemd_user_worker_command(
+                    ["/usr/bin/python3", "-m", "omcp.runner"],
+                    task_id="11111111-1111-1111-1111-111111111111",
+                    task_dir=Path("/tmp/task"), workspace=Path("/tmp/workspace"),
+                    git_metadata_paths=(), codex_home=None, source_root=Path("/tmp"),
+                    max_worker_seconds=90, environment={},
+                )
+
+    def test_systemd_user_launcher_is_used_for_local_codex_worker(self):
+        self.controller.config = replace(
+            self.config, local_worker_launcher="systemd-user",
+        )
+        unit = "orchestra-worker-11111111-1111-1111-1111-111111111111"
+        launch = Mock(return_value=(
+            ["/usr/bin/systemd-run", "--user", "--unit=" + unit], unit, self.root,
+        ))
+        with patch("omcp.controller.systemd_user_worker_command", launch):
+            submitted = self.submit("systemd-launch")
+        self.assertEqual(submitted["status"], "running")
+        self.assertEqual(submitted["worker_unit"], unit)
+        self.assertEqual(self.popen.call_args.args[0][0], "/usr/bin/systemd-run")
+        launch.assert_called_once()
+
+    def test_cancelling_transient_worker_stops_its_unit(self):
+        self.controller.config = replace(
+            self.config, local_worker_launcher="systemd-user",
+        )
+        unit = "orchestra-worker-11111111-1111-1111-1111-111111111111"
+        launch = Mock(return_value=(
+            ["/usr/bin/systemd-run", "--user", "--unit=" + unit], unit, self.root,
+        ))
+        with patch("omcp.controller.systemd_user_worker_command", launch):
+            submitted = self.submit("systemd-cancel")
+        task = self.controller.state["tasks"][submitted["task_id"]]
+        task["runner_pid"] = 999999
+        with patch("omcp.controller.shutil.which", return_value="/usr/bin/systemctl"), \
+                patch.object(Path, "is_socket", return_value=True), \
+                patch("omcp.controller.subprocess.run") as stop:
+            self.controller.cancel_task(submitted["task_id"], "test cancellation")
+        stop.assert_any_call(
+            ["/usr/bin/systemctl", "--user", "stop", unit],
+            env=ANY, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=False, timeout=10,
+        )
 
     def test_opencode_failure_exposes_only_allowlisted_diagnostic_fields(self):
         self.controller.close()
@@ -1121,6 +1217,30 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "must be required or disabled"):
                     Config.load(config_path)
 
+    def test_config_loads_and_validates_local_worker_launcher(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            codex = Path(directory) / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            config_path = Path(directory) / "omcp.json"
+            raw = {
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(Path(directory) / "state"),
+                "workers": {"ina": {"command": [str(codex)]}},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+                "local_worker_launcher": "systemd-user",
+            }
+            config_path.write_text(json.dumps(raw))
+            os.chmod(config_path, 0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                self.assertEqual(Config.load(config_path).local_worker_launcher, "systemd-user")
+                raw["local_worker_launcher"] = "sometimes"
+                config_path.write_text(json.dumps(raw))
+                with self.assertRaisesRegex(ValueError, "direct or systemd-user"):
+                    Config.load(config_path)
+
     def test_config_supports_future_parallel_capacity_without_hardcoded_two(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "project"
@@ -1876,6 +1996,7 @@ class RunnerTests(unittest.TestCase):
                 "prompt_path": str(prompt), "log_path": str(root / "log"),
                 "result_path": str(root / "result"),
                 "completion_path": str(root / "completion"), "codex_home": None,
+                "git_read_paths": [str(root / "git-meta")],
                 "execution_capabilities": {
                     "profile": "routine_development_v1", "writable_paths": ["src"],
                     "network": False, "external_credentials": False,
@@ -1891,6 +2012,14 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("--ignore-rules", command)
             self.assertIn("--ephemeral", command)
             self.assertIn("permissions.orchestra-routine.network.enabled=false", command)
+            self.assertIn(
+                'permissions.orchestra-routine.filesystem./etc/orchestra="deny"',
+                command,
+            )
+            self.assertIn(
+                f'permissions.orchestra-routine.filesystem.{root / "git-meta"}="read"',
+                command,
+            )
             self.assertIn(
                 'permissions.orchestra-routine.filesystem.:workspace_roots={"."="read",".orchestra-tmp"="write","src"="write"}',
                 command,
