@@ -71,6 +71,7 @@ status, results, availability and cancellation.
 - [Execution policies and operator runbook](docs/EXECUTION-POLICIES.md) — distinguishes deployed prompt-free worker scheduling from the proposed, not-yet-active automatic merge/deploy policy.
 - [ADR-002: Local MCP task-control adapter](docs/decisions/ADR-002-omcp-task-control.md) — records the direct-control transport, authority and recovery boundary.
 - [ADR-004: PixelBox coordinator and GitHub Actions workers](docs/decisions/ADR-004-pixelbox-linux-actions-workers.md) — records the Linux sandbox, remote-worker, artifact and cutover decisions.
+- [ADR-009: Authenticated authority-to-disposable-adapter integration](docs/decisions/ADR-009-authority-adapter-integration.md) — records atomic consume-before-dispatch and fail-closed crash recovery for the inactive Phase 3C prototype.
 
 The lessons audit remains open to new evidence throughout development; completing the initial audit does not freeze what Orchestra can learn.
 
