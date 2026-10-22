@@ -240,26 +240,31 @@ def _unit_outcome(sha: str) -> UnitOutcome:
         "InvocationID", "ActiveState", "Result", "ExecMainStatus",
         "ExecMainStartTimestampMonotonic", "ExecMainExitTimestampMonotonic",
     )
-    completed = subprocess.run(
-        ["/bin/systemctl", "show", *(f"--property={name}" for name in properties),
-         f"orchestra-test@{sha}.service"], stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False, timeout=15,
-    )
-    values = dict(line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line)
-    if completed.returncode or set(values) != set(properties):
-        raise LaunchRefused("could not obtain terminal state from systemd")
-    try:
-        outcome = UnitOutcome(
-            values["InvocationID"], values["ActiveState"], values["Result"],
-            int(values["ExecMainStatus"]),
-            int(values["ExecMainStartTimestampMonotonic"]) // 1_000,
-            int(values["ExecMainExitTimestampMonotonic"]) // 1_000,
+    for attempt in range(25):
+        completed = subprocess.run(
+            ["/bin/systemctl", "show", *(f"--property={name}" for name in properties),
+             f"orchestra-test@{sha}.service"], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False, timeout=15,
         )
-    except ValueError as error:
-        raise LaunchRefused("systemd returned an invalid execution status") from error
-    if not re.fullmatch(r"[0-9a-f]{32}", outcome.invocation_id) or outcome.active_state != "active":
-        raise LaunchRefused("systemd unit is not holding its completed invocation")
-    return outcome
+        values = dict(line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line)
+        if completed.returncode or set(values) != set(properties):
+            raise LaunchRefused("could not obtain terminal state from systemd")
+        try:
+            outcome = UnitOutcome(
+                values["InvocationID"], values["ActiveState"], values["Result"],
+                int(values["ExecMainStatus"]),
+                int(values["ExecMainStartTimestampMonotonic"]) // 1_000,
+                int(values["ExecMainExitTimestampMonotonic"]) // 1_000,
+            )
+        except ValueError as error:
+            raise LaunchRefused("systemd returned an invalid execution status") from error
+        if not re.fullmatch(r"[0-9a-f]{32}", outcome.invocation_id) or outcome.active_state != "active":
+            raise LaunchRefused("systemd unit is not holding its completed invocation")
+        if outcome.exited_monotonic_ms >= outcome.started_monotonic_ms > 0:
+            return outcome
+        if attempt < 24:
+            time.sleep(0.1)
+    raise LaunchRefused("systemd did not retain completed invocation timing")
 
 
 def _invocation_output(invocation_id: str) -> bytes:
