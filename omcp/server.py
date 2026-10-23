@@ -50,7 +50,7 @@ TOOLS = [
                     "security_change", "unclassified",
                 ],
                 "default": "unclassified",
-                "description": "Declared consequence class. In required mode only owner-configured routine_development scopes may use standing authorization; disabled mode automatically authorizes all valid classes.",
+                "description": "Declared consequence class. In required mode only owner-configured routine_development scopes may use standing authorization; disabled mode automatically authorizes eligible routine_development only. Protected classes and unclassified work still require explicit approval.",
             },
         }, ["request_id", "title", "instructions", "worker", "repository_profile"]),
     },
