@@ -134,6 +134,25 @@ and does not fetch. This pin is not evidence of freshness or upstream approval;
 the owner must independently verify the SHA and repeat the sync/pin update for
 new revisions. Never put GitHub credentials in the coordinator.
 
+Each repository profile may override the global `local_worker_git_mode` and
+`local_worker_source_sha`. This is the required shape for multiple unrelated
+repositories: one profile can stay owner-synced and pinned while another
+fetches its own `origin/main`. Profiles that omit these values inherit the
+global defaults, preserving older configurations. Preparing one profile never
+changes another profile's source strategy.
+
+Routine writable paths are materialised inside the isolated task worktree
+before the worker starts. A missing authorised directory is created safely;
+absolute paths, `..`, `.git`, `.codex`, non-directory components and symlink
+components are rejected. The coordinator does not make the source checkout
+writable or create paths outside the task worktree.
+
+Every local Codex task must emit a structured `.orchestra-tmp/completion.json`
+contract; natural-language output is not used to decide success. Standing
+routine tasks also execute a trusted security probe that actually attempts the
+required negative assertions and records structured evidence. See
+[OMCP standing authorization](OMCP.md#standing-authorization).
+
 ## 4. GitHub Actions worker setup
 
 ### Repository workflow

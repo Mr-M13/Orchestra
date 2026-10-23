@@ -21,7 +21,9 @@
     "orchestra": {
       "repository": "Mr-M13/Orchestra",
       "project_root": "/home/hamed/orchestra-migration/checkout",
-      "base_ref": "origin/main"
+      "base_ref": "origin/main",
+      "local_worker_git_mode": "owner_synced",
+      "local_worker_source_sha": "REPLACE_WITH_REVIEWED_40_CHARACTER_COMMIT_SHA"
     }
   },
   "default_profile": "orchestra",

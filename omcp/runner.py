@@ -24,6 +24,7 @@ from omcp.controller import (
     OPENCODE_PROVIDER_ENDPOINTS,
     canonical_codex_executable, canonical_opencode_executable,
 )
+from omcp import worker_contract
 from omcp.platform import SandboxPolicy, host_platform, sandbox_command
 
 
@@ -851,9 +852,15 @@ def run(spec_path: Path) -> int:
     if (not isinstance(seconds, int) or isinstance(seconds, bool) or not 60 <= seconds <= 7200
             or not isinstance(maximum, int) or isinstance(maximum, bool) or not 1024 <= maximum <= 1048576):
         raise ValueError("invalid worker bounds")
-    runtime_dir = routine_tmp = None
+    runtime_dir = routine_tmp = contract_tmp = None
     gateway: PinnedProviderGateway | None = None
     worker_diagnostic: dict[str, Any] | None = None
+    completion_contract: str | None = None
+    completion_contract_error: str | None = None
+    security_assertions: str | None = None
+    security_checks: list[dict[str, Any]] | None = None
+    require_contract = adapter == "codex" and spec.get("require_completion_contract") is True
+    security_probe = adapter == "codex" and spec.get("security_probe") is True
     exit_code, error_type = 125, None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     def terminate(signum: int, _frame: Any) -> None: raise RunnerTerminated(signum)
@@ -890,12 +897,18 @@ def run(spec_path: Path) -> int:
                 command = [executable, "--ask-for-approval", "never", "exec", "--sandbox", "workspace-write",
                            "--cd", str(workspace), "--output-last-message", str(result), "-"]
                 environment = worker_environment(spec.get("codex_home"))
+                contract_tmp = workspace / worker_contract.CONTRACT_DIR
+                contract_tmp.mkdir(mode=0o700, exist_ok=True)
+                routine_tmp = contract_tmp
+                environment["TMPDIR"] = str(contract_tmp)
             else:
                 if (not isinstance(capabilities, dict) or capabilities.get("profile") != "routine_development_v1"
                         or capabilities.get("network") is not False or capabilities.get("external_credentials") is not False
                         or capabilities.get("git_metadata") != "read_only" or not isinstance(capabilities.get("writable_paths"), list)):
                     raise ValueError("invalid routine execution capabilities")
-                routine_tmp = workspace / ".orchestra-tmp"; routine_tmp.mkdir(mode=0o700)
+                contract_tmp = workspace / worker_contract.CONTRACT_DIR
+                contract_tmp.mkdir(mode=0o700, exist_ok=True)
+                routine_tmp = contract_tmp
                 git_read_paths = spec.get("git_read_paths", [])
                 if not isinstance(git_read_paths, list):
                     raise ValueError("invalid routine Git read paths")
@@ -904,6 +917,12 @@ def run(spec_path: Path) -> int:
                     git_read_paths,
                 )
                 environment = worker_environment(spec.get("codex_home")); environment["TMPDIR"] = str(routine_tmp)
+
+            if adapter == "codex" and security_probe:
+                probe_source = Path(__file__).with_name("routine_probe.py")
+                probe_target = worker_contract.security_probe_path(workspace)
+                shutil.copyfile(probe_source, probe_target)
+                os.chmod(probe_target, 0o600)
             if adapter == "opencode":
                 exit_code, worker_diagnostic = run_opencode_with_server(
                     server_command, command, workspace, environment, runtime_dir,
@@ -940,6 +959,44 @@ def run(spec_path: Path) -> int:
         signal.signal(signal.SIGTERM, previous_sigterm)
         if gateway is not None:
             gateway.close()
+        # Read the structured contract and security report while the private
+        # contract directory still exists.  These files are never interpreted
+        # as natural-language assertions.
+        if adapter == "codex" and contract_tmp is not None and require_contract:
+            try:
+                contract = worker_contract.read_completion_contract(
+                    worker_contract.contract_path(workspace),
+                )
+            except (worker_contract.CompletionContractError, OSError, ValueError) as exc:
+                completion_contract = "invalid"
+                completion_contract_error = type(exc).__name__
+            else:
+                completion_contract = contract["status"]
+        if adapter == "codex" and contract_tmp is not None and security_probe:
+            try:
+                checks = worker_contract.read_security_report(
+                    worker_contract.security_report_path(workspace),
+                )
+            except (worker_contract.SecurityAssertionError, OSError, ValueError) as exc:
+                security_assertions = "failed"
+                security_checks = [{
+                    "name": "probe",
+                    "attempted": True,
+                    "allowed": None,
+                    "error_type": type(exc).__name__,
+                }]
+            else:
+                security_assertions = "passed"
+                security_checks = [
+                    {
+                        "name": value["name"],
+                        "attempted": value["attempted"],
+                        "allowed": value["allowed"],
+                        "error_type": value["error_type"],
+                        "command": value.get("command"),
+                    }
+                    for value in checks.values()
+                ]
         if routine_tmp is not None:
             shutil.rmtree(routine_tmp, ignore_errors=True)
             if routine_tmp.exists():
@@ -962,6 +1019,16 @@ def run(spec_path: Path) -> int:
                 write_failure_result(
                     result, "Worker sandbox failed to start; the task did not run.\n",
                 )
+        if (not sandbox_failure and exit_code == 0 and require_contract
+                and completion_contract != "success"):
+            exit_code = 125
+            error_type = (
+                "TaskContractFailed" if completion_contract == "failure"
+                else "TaskContractInvalid"
+            )
+        if (not sandbox_failure and exit_code == 0 and security_probe
+                and security_assertions != "passed"):
+            exit_code, error_type = 125, "SecurityAssertionFailed"
         # result.txt is mandatory for every local worker.  A process can exit
         # zero after its tool sandbox failed, or without emitting the requested
         # final message; neither is a successful task.
@@ -977,6 +1044,14 @@ def run(spec_path: Path) -> int:
         record: dict[str, Any] = {
             "exit_code": exit_code, "finished_at": utc_now(), "runner_error": error_type,
         }
+        if require_contract:
+            record["completion_contract"] = completion_contract or "missing"
+            if completion_contract_error is not None:
+                record["completion_contract_error"] = completion_contract_error
+        if security_probe:
+            record["security_assertions"] = security_assertions or "failed"
+            if security_checks is not None:
+                record["security_checks"] = security_checks
         if worker_diagnostic is not None:
             record["worker_diagnostic"] = worker_diagnostic
         atomic_json(completion, record)
