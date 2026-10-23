@@ -3035,11 +3035,20 @@ class ServerLifecycleTests(unittest.TestCase):
         task_id = submitted["task_id"]
         self.assertEqual(self.call("task_status", {"task_id": task_id})["status"], "approval_required")
         self.assertEqual(len(self.call("list_tasks")["tasks"]), 1)
+        queued = self.call("task_snapshot", {"recent_limit": 20})
+        self.assertEqual(queued["counts"]["queued"], 1)
+        self.assertEqual(queued["counts"]["approval_pending"], 1)
+        self.assertEqual(queued["queued"][0]["queue_state"], "approval_pending")
+        self.assertEqual(queued["recent"], [])
         self.assertEqual(len(self.call("list_approvals")["approvals"]), 1)
         self.assertTrue(self.call("worker_availability")["workers"][0]["available"])
         self.assertEqual(self.call("cancel_task", {
             "task_id": task_id, "reason": "Requester withdrew it",
         })["status"], "cancelled")
+        terminal = self.call("task_snapshot", {"recent_limit": 20})
+        self.assertEqual(terminal["counts"]["queued"], 0)
+        self.assertEqual(terminal["counts"]["recent"], 1)
+        self.assertEqual(terminal["recent"][0]["task_id"], task_id)
         self.assertEqual(self.call("task_result", {"task_id": task_id})["result"], "")
 
         self.assertNotIn("resolve_approval", {tool.get("name") for tool in TOOLS})
@@ -3087,7 +3096,7 @@ class StdioIntegrationTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             responses = [json.loads(line) for line in completed.stdout.splitlines()]
             self.assertEqual([response["id"] for response in responses], [1, 2, 3])
-            self.assertEqual(len(responses[1]["result"]["tools"]), 9)
+            self.assertEqual(len(responses[1]["result"]["tools"]), len(TOOLS))
             self.assertEqual(responses[2]["result"]["structuredContent"]["status"], "ok")
 
 

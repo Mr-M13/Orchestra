@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import heapq
 import json
 import os
 import re
@@ -28,6 +29,7 @@ from omcp.routine_paths import (
 
 TERMINAL = {"succeeded", "failed", "cancelled", "rejected", "interrupted"}
 ACTIVE = {"starting", "running", "cancel_requested"}
+QUEUED = {"accepted", "approval_required"}
 WORKER_ADAPTERS = {"codex", "opencode", "deepseek", "github_actions"}
 GITHUB_ACTION_AGENTS = {"codex", "deepseek"}
 ACTIONS_WORKFLOW = "orchestra-worker.yml"
@@ -946,6 +948,111 @@ class TaskController:
         )
         return {key: task[key] for key in keys if key in task}
 
+    @staticmethod
+    def _task_progress(task: dict[str, Any]) -> str:
+        """Return a short, non-sensitive lifecycle description for display."""
+        remote_status = task.get("remote_status")
+        if isinstance(remote_status, str) and remote_status:
+            conclusion = task.get("remote_conclusion")
+            suffix = f" ({conclusion})" if isinstance(conclusion, str) and conclusion else ""
+            return f"Remote {remote_status}{suffix}"
+        status = task.get("status")
+        failure = task.get("failure")
+        failure_type = failure.get("type") if isinstance(failure, dict) else None
+        if status == "starting":
+            return "Starting worker"
+        if status == "running":
+            return "Execution in progress"
+        if status == "cancel_requested":
+            return "Cancellation requested"
+        if status == "accepted":
+            return "Ready to execute"
+        if status == "approval_required":
+            return "Awaiting approval"
+        if status == "succeeded":
+            return "Completed"
+        if status == "failed":
+            return f"Failed: {failure_type}" if failure_type else "Failed"
+        if status == "interrupted":
+            return f"Interrupted: {failure_type}" if failure_type else "Interrupted"
+        if status == "cancelled":
+            return "Cancelled"
+        if status == "rejected":
+            return "Rejected"
+        return ""
+
+    @classmethod
+    def build_task_snapshot(
+        cls, tasks: dict[str, dict[str, Any]], recent_limit: int = 20,
+    ) -> dict[str, Any]:
+        """Classify tasks once into complete active/queued lists and a bounded history.
+
+        The persisted status is the coordinator's authoritative state.  Tasks are
+        assigned to exactly one section so a slow transition can never duplicate a
+        row across Running, Queued and Recent.
+        """
+        if not isinstance(recent_limit, int) or isinstance(recent_limit, bool) or not 1 <= recent_limit <= 100:
+            raise ValueError("recent_limit must be an integer from 1 to 100")
+
+        running: list[dict[str, Any]] = []
+        queued: list[dict[str, Any]] = []
+        terminal: list[dict[str, Any]] = []
+        for task in tasks.values():
+            status = task.get("status")
+            if status in ACTIVE:
+                item = cls._public(task)
+                item["progress"] = cls._task_progress(task)
+                running.append(item)
+            elif status in QUEUED:
+                item = cls._public(task)
+                item["progress"] = cls._task_progress(task)
+                item["queue_state"] = (
+                    "approval_pending" if status == "approval_required" else "ready"
+                )
+                queued.append(item)
+            elif status in TERMINAL:
+                terminal.append(task)
+
+        running.sort(key=lambda item: (
+            item.get("started_at") or item.get("created_at") or "",
+            item.get("task_id", ""),
+        ))
+        queued.sort(key=lambda item: (
+            0 if item.get("queue_state") == "ready" else 1,
+            item.get("created_at") or "",
+            item.get("task_id", ""),
+        ))
+        newest = heapq.nlargest(recent_limit, terminal, key=lambda item: (
+            item.get("finished_at") or item.get("created_at") or "",
+            item.get("created_at") or "",
+            item.get("task_id", ""),
+        ))
+        recent = []
+        for task in newest:
+            item = cls._public(task)
+            item["progress"] = cls._task_progress(task)
+            item["terminal_at"] = (
+                item.get("finished_at") or item.get("created_at") or ""
+            )
+            recent.append(item)
+        ready_count = sum(item.get("queue_state") == "ready" for item in queued)
+        approval_count = sum(
+            item.get("queue_state") == "approval_pending" for item in queued
+        )
+        return {
+            "running": running,
+            "queued": queued,
+            "recent": recent,
+            "counts": {
+                "running": len(running),
+                "queued": len(queued),
+                "ready": ready_count,
+                "approval_pending": approval_count,
+                "recent": len(recent),
+                "recent_limit": recent_limit,
+            },
+        }
+
     def submit_task(
         self, request_id: str, title: str, instructions: str, worker: str,
         requires_approval: bool = True, repository_profile: str | None = None,
@@ -1180,6 +1287,24 @@ class TaskController:
         result = [self._public(task) for task in tasks[:limit]]
         self._audit("task.list", None, "allowed", {"status": status, "count": len(result)})
         return {"tasks": result}
+
+    def task_snapshot(self, recent_limit: int = 20) -> dict[str, Any]:
+        """Return every running and queued task plus bounded terminal history.
+
+        This is a read-only dashboard projection.  It deliberately classifies in
+        one pass instead of assuming a limited recent-task list contains all
+        active work, and it does not page or truncate running/queued tasks.
+        """
+        self._authorize("tasks:read", "task.snapshot")
+        self.tick()
+        result = self.build_task_snapshot(self.state["tasks"], recent_limit)
+        result["generated_at"] = utc_now()
+        self._audit("task.snapshot", None, "allowed", {
+            "running": result["counts"]["running"],
+            "queued": result["counts"]["queued"],
+            "recent": result["counts"]["recent"],
+        })
+        return result
 
     def task_result(self, task_id: str) -> dict[str, Any]:
         self._authorize("results:read", "task.result", task_id)

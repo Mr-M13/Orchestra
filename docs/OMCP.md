@@ -13,6 +13,7 @@ OMCP does not replace Desktop Commander or the GitHub Issue Mac Bridge. Keep bot
 | `submit_host_operation` | `host_operations:submit` | Request one owner-enabled built-in operation for an exact local commit. No command or arguments are accepted. |
 | `task_status` | `tasks:read` | Status for one task. |
 | `list_tasks` | `tasks:read` | Recent tasks, optionally filtered by status. |
+| `task_snapshot` | `tasks:read` | Every running and queued task plus bounded terminal history, classified once from coordinator state. |
 | `task_result` | `results:read` | Bounded final worker message for a terminal task. |
 | `worker_availability` | `workers:read` | Configured workers, active count and configured execution limit. |
 | `cancel_task` | `tasks:cancel` | Cancel queued work or request termination of a running process group. |

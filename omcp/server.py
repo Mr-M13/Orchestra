@@ -83,6 +83,18 @@ TOOLS = [
         }),
     },
     {
+        "name": "task_snapshot",
+        "description": (
+            "Read every running and queued task plus bounded terminal history. "
+            "Tasks are classified once from authoritative coordinator state."
+        ),
+        "inputSchema": _object({
+            "recent_limit": {
+                "type": "integer", "minimum": 1, "maximum": 100, "default": 20,
+            },
+        }),
+    },
+    {
         "name": "task_result",
         "description": "Retrieve a bounded final worker result for a terminal task.",
         "inputSchema": _object({"task_id": {"type": "string"}}, ["task_id"]),
@@ -126,6 +138,7 @@ class MCPServer:
             ),
             "task_status": lambda value: controller.task_status(value.get("task_id")),
             "list_tasks": lambda value: controller.list_tasks(value.get("status"), value.get("limit", 100)),
+            "task_snapshot": lambda value: controller.task_snapshot(value.get("recent_limit", 20)),
             "task_result": lambda value: controller.task_result(value.get("task_id")),
             "worker_availability": lambda _: controller.worker_availability(),
             "cancel_task": lambda value: controller.cancel_task(value.get("task_id"), value.get("reason")),
