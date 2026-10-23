@@ -38,6 +38,17 @@ class BridgeTests(unittest.TestCase):
         self.popen = Mock(side_effect=FakeProcess)
         self.bridge = Bridge(self.config, self.github, self.popen)
         self.bridge._prepare_workspace = Mock(return_value=self.root)
+        def fake_git(_directory, *args, **_kwargs):
+            if args[0] == "status":
+                return 0, ""
+            if args[0] == "rev-parse":
+                return 0, "base-sha"
+            if args[0] == "branch":
+                return 0, "bridge/issue-7"
+            if args[0] == "remote":
+                return 0, "https://github.com/owner/repo.git"
+            return 0, ""
+        self.bridge._git = Mock(side_effect=fake_git)
 
     def tearDown(self):
         self.bridge.lock_file.close()
@@ -52,6 +63,8 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(proc.kwargs["stdin"].closed)
         prompt = (self.state / "issue-7.prompt.txt").read_text()
         self.assertIn("GitHub issue #7: Bridge task", prompt)
+        self.assertIn("commit the completed changes on this branch", prompt)
+        self.assertIn("Exit 0 reports execution completion only", prompt)
         self.assertEqual(self.bridge.state["tasks"]["7"]["status"], "running")
 
     def test_unapproved_author_never_launches(self):
@@ -107,18 +120,61 @@ class BridgeTests(unittest.TestCase):
         self.github.remove_label.assert_called_once_with(7, "bridge-claimed")
         self.popen.assert_not_called()
 
-    def test_completion_publishes_status_but_not_output(self):
+    def test_completion_publishes_bounded_result_but_not_output(self):
         self.bridge.intake_once()
         proc, log_path, _, _ = self.bridge.children[12345]
         log_path.write_text("worker output including private details")
         proc.code = 0
         self.bridge.reap()
         self.bridge.publish_terminal_states()
-        self.assertEqual(self.bridge.state["tasks"]["7"]["status"], "succeeded")
+        self.assertEqual(self.bridge.state["tasks"]["7"]["status"], "completed")
         comments = [call.args[1] for call in self.github.comment.call_args_list]
         self.assertEqual(len(comments), 2)
-        self.assertTrue(any("finished with exit code 0" in value for value in comments))
+        self.assertTrue(any('"execution_exit_status":0' in value for value in comments))
         self.assertTrue(all("private details" not in value for value in comments))
+
+    def _complete_worker(self, exit_code=0, git_outputs=None):
+        self.bridge.intake_once()
+        proc, _, _, _ = self.bridge.children[12345]
+        proc.code = exit_code
+        if git_outputs is not None:
+            self.bridge._git.side_effect = git_outputs
+        self.bridge.reap()
+        return self.bridge.state["tasks"]["7"]["result"]
+
+    def test_result_no_changes_is_durable_and_not_task_success(self):
+        result = self._complete_worker()
+        self.assertFalse(result["files_changed"])
+        self.assertEqual(result["delivery"], "no_changes")
+        self.assertIn("no commit or file changes", result["blocker"])
+        self.assertTrue((self.state / "issue-7.result.json").is_file())
+        self.assertEqual(result["execution_exit_status"], 0)
+
+    def test_result_changed_but_uncommitted_is_blocked(self):
+        result = self._complete_worker(git_outputs=[(0, " M file.php"), (0, "base-sha")])
+        self.assertTrue(result["files_changed"])
+        self.assertIn("uncommitted", result["blocker"])
+        self.assertNotIn("push", [call.args[1] for call in self.bridge._git.call_args_list])
+
+    def test_committed_result_is_pushed_and_branch_reported(self):
+        result = self._complete_worker(git_outputs=[(0, ""), (0, "commit-sha"), (0, "bridge/issue-7"),
+                                                     (0, "https://github.com/owner/repo.git"), (0, "")])
+        self.assertTrue(result["files_changed"])
+        self.assertEqual(result["commit_sha"], "commit-sha")
+        self.assertEqual(result["delivery"], "delivered")
+        self.assertEqual(result["delivered_branch"], "bridge/issue-7")
+
+    def test_push_failure_has_actionable_blocker(self):
+        result = self._complete_worker(git_outputs=[(0, ""), (0, "commit-sha"), (0, "bridge/issue-7"),
+                                                     (0, "https://github.com/owner/repo.git"), (128, "")])
+        self.assertEqual(result["delivery"], "blocked")
+        self.assertIn("GitHub write credentials", result["blocker"])
+
+    def test_worker_failure_is_not_pushed(self):
+        result = self._complete_worker(exit_code=2, git_outputs=[(0, " M file.php"), (0, "base-sha")])
+        self.assertEqual(result["execution_exit_status"], 2)
+        self.assertIn("worker exited", result["blocker"])
+        self.assertFalse(any("push" in call.args[1:] for call in self.bridge._git.call_args_list))
 
     def test_explicit_reapproval_creates_a_new_attempt(self):
         self.bridge.state["tasks"]["7"] = {"status": "interrupted", "attempt": 1, "worker": "codex", "exit_code": None}
