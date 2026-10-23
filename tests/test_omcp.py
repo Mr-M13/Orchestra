@@ -22,8 +22,10 @@ from omcp.docker_gate import gated_command
 from omcp.host_runner import run as run_host_operation
 from omcp.local_control import LocalApprovalServer, approval_request
 from omcp.runner import (
-    OpenCodeDiagnosticCollector, PinnedProviderGateway, opencode_commands,
-    opencode_environment, opencode_policy, run as run_worker, run_opencode_process,
+    OpenCodeDiagnosticCollector, PinnedProviderGateway, WorkerSandboxStartupError,
+    opencode_commands, opencode_environment, opencode_policy,
+    probe_codex_sandbox, run as run_worker, run_opencode_process,
+    worker_log_has_sandbox_startup_failure,
 )
 from omcp.server import MCPServer, TOOLS, main as server_main
 
@@ -47,6 +49,14 @@ def codex_fixture(directory: Path) -> dict[str, str]:
     executable.write_text("#!/bin/sh\nexit 0\n")
     executable.chmod(0o700)
     return {**os.environ, "PATH": str(bin_dir)}
+
+
+def codex_success_side_effect(result_path: Path, text: str = "finished"):
+    """Simulate Codex writing its mandatory final-message file."""
+    def execute(*_args, **_kwargs):
+        Path(result_path).write_text(text)
+        return Mock(returncode=0)
+    return execute
 
 
 class ControllerTests(unittest.TestCase):
@@ -629,6 +639,40 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(result["result"], "verified result")
         self.assertFalse(result["truncated"])
         self.assertTrue(self.controller.worker_availability()["workers"][0]["available"])
+
+    def test_codex_spec_enables_the_sandbox_startup_probe(self):
+        submitted = self.submit("probe-spec")
+        spec_path = self.state / "tasks" / submitted["task_id"] / "runner.json"
+        spec = json.loads(spec_path.read_text())
+        self.assertIs(spec["sandbox_startup_probe"], True)
+
+    def test_exit_zero_without_required_result_is_reconciled_as_failed(self):
+        submitted = self.submit("missing-result")
+        task = self.controller.state["tasks"][submitted["task_id"]]
+        Path(task["completion_path"]).write_text(json.dumps({
+            "exit_code": 0, "finished_at": "2026-10-11T00:00:00+00:00",
+            "runner_error": None,
+        }))
+        self.controller.reconcile()
+        reconciled = self.controller.state["tasks"][submitted["task_id"]]
+        self.assertEqual(reconciled["status"], "failed")
+        self.assertEqual(reconciled["exit_code"], 125)
+        self.assertEqual(reconciled["failure"], {"type": "MissingWorkerResult"})
+
+    def test_sandbox_startup_failure_is_visible_in_task_diagnostics(self):
+        submitted = self.submit("sandbox-failure")
+        task = self.controller.state["tasks"][submitted["task_id"]]
+        Path(task["result_path"]).write_text("Worker sandbox failed to start.\n")
+        Path(task["completion_path"]).write_text(json.dumps({
+            "exit_code": 125, "finished_at": "2026-10-11T00:00:00+00:00",
+            "runner_error": "SandboxStartupError",
+        }))
+        self.controller.reconcile()
+        reconciled = self.controller.state["tasks"][submitted["task_id"]]
+        self.assertEqual(reconciled["status"], "failed")
+        self.assertEqual(reconciled["failure"], {"type": "SandboxStartupError"})
+        result = self.controller.task_result(submitted["task_id"])
+        self.assertEqual(result["result"], "Worker sandbox failed to start.\n")
 
     def test_cancelled_reaped_runner_without_completion_is_terminal(self):
         submitted = self.submit()
@@ -1846,6 +1890,150 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual((root / "result").read_text(),
                              "DeepSeek request failed; no provider response was retained.\n")
             self.assertNotIn("secret diagnostic", (root / "completion").read_text())
+    def test_sandbox_probe_fails_closed_on_nonzero_bubblewrap(self):
+        with patch("omcp.runner.host_platform", return_value="linux"), \
+                patch("omcp.runner.shutil.which",
+                      side_effect=lambda name: {"bwrap": "/usr/bin/bwrap",
+                                                "true": "/bin/true"}[name]), \
+                patch("omcp.runner.subprocess.run", return_value=Mock(returncode=1)):
+            with self.assertRaises(WorkerSandboxStartupError):
+                probe_codex_sandbox()
+        with patch("omcp.runner.host_platform", return_value="linux"), \
+                patch("omcp.runner.shutil.which",
+                      side_effect=lambda name: {"bwrap": "/usr/bin/bwrap",
+                                                "true": "/bin/true"}[name]), \
+                patch("omcp.runner.subprocess.run", return_value=Mock(returncode=0)):
+            probe_codex_sandbox()
+
+    def test_sandbox_log_detection_requires_a_bwrap_error_line(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "worker.log"
+            log.write_text("agent quoted: bwrap: Can't open source /: Function not implemented\n")
+            self.assertFalse(worker_log_has_sandbox_startup_failure(log))
+            log.write_text("  bwrap: Can't open source /: Function not implemented\n")
+            self.assertTrue(worker_log_has_sandbox_startup_failure(log))
+
+    def test_probe_failure_is_failed_and_skips_codex_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            marker = root / "codex-ran"
+            codex = bin_dir / "codex"
+            codex.write_text(f"#!/bin/sh\n: > {marker}\nexit 0\n")
+            codex.chmod(0o700)
+            prompt = root / "prompt"
+            prompt.write_text("task")
+            spec = root / "spec.json"
+            completion = root / "completion.json"
+            spec.write_text(json.dumps({
+                "command": ["codex"], "workspace": str(root),
+                "prompt_path": str(prompt), "log_path": str(root / "log"),
+                "result_path": str(root / "result"),
+                "completion_path": str(completion), "codex_home": None,
+                "sandbox_startup_probe": True,
+            }))
+            with patch.dict(os.environ, {"PATH": str(bin_dir)}, clear=True), \
+                    patch("omcp.runner.probe_codex_sandbox",
+                          side_effect=WorkerSandboxStartupError("failed")):
+                self.assertEqual(run_worker(spec), 125)
+            self.assertFalse(marker.exists())
+            record = json.loads(completion.read_text())
+            self.assertEqual(record["exit_code"], 125)
+            self.assertEqual(record["runner_error"], "SandboxStartupError")
+            self.assertIn("sandbox failed to start", (root / "result").read_text().lower())
+
+    def test_logged_bubblewrap_failure_overrides_a_zero_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            codex = bin_dir / "codex"
+            codex.write_text(
+                "#!/bin/sh\n"
+                "while [ \"$#\" -gt 0 ]; do\n"
+                "  if [ \"$1\" = \"--output-last-message\" ]; then shift; result=\"$1\"; fi\n"
+                "  shift\n"
+                "done\n"
+                "echo \"bwrap: Can't open source /: Function not implemented\" >&2\n"
+                "echo 'Both checks failed because the sandbox did not start.' > \"$result\"\n"
+                "exit 0\n"
+            )
+            codex.chmod(0o700)
+            prompt = root / "prompt"
+            prompt.write_text("task")
+            spec = root / "spec.json"
+            completion = root / "completion.json"
+            spec.write_text(json.dumps({
+                "command": ["codex"], "workspace": str(root),
+                "prompt_path": str(prompt), "log_path": str(root / "log"),
+                "result_path": str(root / "result"),
+                "completion_path": str(completion), "codex_home": None,
+            }))
+            with patch.dict(os.environ, {"PATH": str(bin_dir)}, clear=True):
+                self.assertEqual(run_worker(spec), 125)
+            record = json.loads(completion.read_text())
+            self.assertEqual(record["exit_code"], 125)
+            self.assertEqual(record["runner_error"], "SandboxStartupError")
+            self.assertIn("Both checks failed", (root / "result").read_text())
+            self.assertIn("bwrap: Can't open source", (root / "log").read_text())
+
+    def test_zero_exit_without_required_result_is_failed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            codex = bin_dir / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            prompt = root / "prompt"
+            prompt.write_text("task")
+            spec = root / "spec.json"
+            completion = root / "completion.json"
+            spec.write_text(json.dumps({
+                "command": ["codex"], "workspace": str(root),
+                "prompt_path": str(prompt), "log_path": str(root / "log"),
+                "result_path": str(root / "result"),
+                "completion_path": str(completion), "codex_home": None,
+            }))
+            with patch.dict(os.environ, {"PATH": str(bin_dir)}, clear=True):
+                self.assertEqual(run_worker(spec), 125)
+            record = json.loads(completion.read_text())
+            self.assertEqual(record["runner_error"], "MissingWorkerResult")
+            self.assertIn("required result", (root / "result").read_text())
+
+    def test_zero_exit_with_required_result_and_no_optional_artifact_succeeds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            codex = bin_dir / "codex"
+            codex.write_text(
+                "#!/bin/sh\n"
+                "while [ \"$#\" -gt 0 ]; do\n"
+                "  if [ \"$1\" = \"--output-last-message\" ]; then shift; result=\"$1\"; fi\n"
+                "  shift\n"
+                "done\n"
+                "echo 'read-only canary completed' > \"$result\"\n"
+                "exit 0\n"
+            )
+            codex.chmod(0o700)
+            prompt = root / "prompt"
+            prompt.write_text("task")
+            spec = root / "spec.json"
+            completion = root / "completion.json"
+            spec.write_text(json.dumps({
+                "command": ["codex"], "workspace": str(root),
+                "prompt_path": str(prompt), "log_path": str(root / "log"),
+                "result_path": str(root / "result"),
+                "completion_path": str(completion), "codex_home": None,
+            }))
+            with patch.dict(os.environ, {"PATH": str(bin_dir)}, clear=True):
+                self.assertEqual(run_worker(spec), 0)
+            record = json.loads(completion.read_text())
+            self.assertEqual(record["exit_code"], 0)
+            self.assertEqual((root / "result").read_text(), "read-only canary completed\n")
+
     def test_runner_passes_only_explicitly_permitted_environment(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1874,7 +2062,8 @@ class RunnerTests(unittest.TestCase):
                 "HTTPS_PROXY": "https://proxy.example", "GIT_TERMINAL_PROMPT": "1",
             }
             with patch.dict(os.environ, parent_environment, clear=True):
-                with patch("omcp.runner.subprocess.run", return_value=Mock(returncode=0)) as execute:
+                with patch("omcp.runner.subprocess.run",
+                           side_effect=codex_success_side_effect(root / "result")) as execute:
                     self.assertEqual(run_worker(spec), 0)
 
             environment = execute.call_args.kwargs["env"]
@@ -1908,7 +2097,8 @@ class RunnerTests(unittest.TestCase):
                 "codex_home": None,
             }))
             with patch.dict(os.environ, codex_fixture(root), clear=True), \
-                    patch("omcp.runner.subprocess.run", return_value=Mock(returncode=0)) as execute:
+                    patch("omcp.runner.subprocess.run",
+                          side_effect=codex_success_side_effect(root / "result")) as execute:
                 self.assertEqual(run_worker(spec), 0)
             self.assertEqual(json.loads(completion.read_text())["exit_code"], 0)
             command = execute.call_args.args[0]
@@ -1935,7 +2125,8 @@ class RunnerTests(unittest.TestCase):
                 "task_id": task_id, "lease_id": lease_id, "lease_path": str(lease),
             }))
             with patch("omcp.runner.canonical_codex_executable", return_value="/codex"), \
-                    patch("omcp.runner.subprocess.run", return_value=Mock(returncode=0)):
+                    patch("omcp.runner.subprocess.run",
+                          side_effect=codex_success_side_effect(root / "result")):
                 self.assertEqual(run_worker(spec), 0)
             record = json.loads(lease.read_text())
             self.assertEqual(record["task_id"], task_id)
@@ -2004,7 +2195,8 @@ class RunnerTests(unittest.TestCase):
                 },
             }))
             with patch.dict(os.environ, codex_fixture(root), clear=True), \
-                    patch("omcp.runner.subprocess.run", return_value=Mock(returncode=0)) as execute:
+                    patch("omcp.runner.subprocess.run",
+                          side_effect=codex_success_side_effect(root / "result")) as execute:
                 self.assertEqual(run_worker(spec), 0)
             command = execute.call_args.args[0]
             self.assertNotIn("--sandbox", command)

@@ -1547,6 +1547,18 @@ class TaskController:
                 changed = True
         return changed
 
+    @staticmethod
+    def _worker_result_present(task: dict[str, Any]) -> bool:
+        """A local worker's required result file must exist and be non-empty."""
+        raw_path = task.get("result_path")
+        if not isinstance(raw_path, str):
+            return False
+        try:
+            path = Path(raw_path)
+            return path.is_file() and not path.is_symlink() and path.stat().st_size > 0
+        except OSError:
+            return False
+
     def reconcile(self) -> None:
         changed = False
         for task in self.state["tasks"].values():
@@ -1557,20 +1569,30 @@ class TaskController:
             completion = Path(task["completion_path"]) if task.get("completion_path") else None
             if completion and completion.exists():
                 result = json.loads(completion.read_text())
+                exit_code = result["exit_code"]
+                runner_error = result.get("runner_error")
+                worker = self.config.workers.get(task.get("worker"))
+                # Defense in depth for completion records written by an older
+                # runner: a local worker that exits zero without its mandatory
+                # result is not a successful task.
+                if (exit_code == 0 and task.get("kind", "worker_task") == "worker_task"
+                        and worker is not None
+                        and worker.adapter in {"codex", "opencode", "deepseek"}
+                        and not self._worker_result_present(task)):
+                    exit_code, runner_error = 125, "MissingWorkerResult"
                 cancelled = task["status"] == "cancel_requested"
                 self._release_reservation(task, result["finished_at"])
                 task.update({
-                    "status": "cancelled" if cancelled else ("succeeded" if result["exit_code"] == 0 else "failed"),
-                    "exit_code": result["exit_code"], "finished_at": result["finished_at"],
+                    "status": "cancelled" if cancelled else ("succeeded" if exit_code == 0 else "failed"),
+                    "exit_code": exit_code, "finished_at": result["finished_at"],
                 })
-                if result.get("runner_error"):
-                    task["failure"] = {"type": result["runner_error"]}
-                worker = self.config.workers.get(task.get("worker"))
+                if runner_error:
+                    task["failure"] = {"type": runner_error}
                 diagnostic = (safe_opencode_diagnostic(result.get("worker_diagnostic"))
                               if worker is not None and worker.adapter == "opencode" else None)
-                if diagnostic is not None and result["exit_code"] != 0:
+                if diagnostic is not None and exit_code != 0:
                     task["failure"] = {
-                        "type": result.get("runner_error") or "OpenCodeExecutionFailed",
+                        "type": runner_error or "OpenCodeExecutionFailed",
                         **diagnostic,
                     }
                 changed = True
@@ -1739,6 +1761,10 @@ class TaskController:
                 "command": list(worker.command),
                 "codex_home": str(Path(worker.codex_home).expanduser()) if worker.codex_home else None,
                 "adapter": worker.adapter,
+                # Codex can exit zero after Bubblewrap rejected its first tool
+                # execution.  Probe the same seccomp/sandbox context before
+                # starting it so a startup failure cannot become a false success.
+                "sandbox_startup_probe": worker.adapter == "codex",
                 "provider": worker.provider,
                 "model": worker.model,
                 "credential_file": worker.credential_file,

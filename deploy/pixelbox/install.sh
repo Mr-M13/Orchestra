@@ -4,6 +4,10 @@
 set -euo pipefail
 
 SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+DEPLOY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=config-access.sh
+source "$DEPLOY_ROOT/config-access.sh"
+BROKER_USER="${ORCHESTRA_BROKER_USER:-orchestra-github}"
 INSTALL_ROOT="${ORCHESTRA_INSTALL_ROOT:-/opt/orchestra}"
 CONFIG_ROOT="${ORCHESTRA_CONFIG_ROOT:-/etc/orchestra}"
 STATE_ROOT="${ORCHESTRA_STATE_ROOT:-/home/hamed/orchestra-migration/state}"
@@ -237,6 +241,12 @@ stage_configuration() {
   sudo install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" \
     "$(dirname "$STATE_ROOT")/backup"
 
+  # install -d rewrites the ACL mask on an existing CONFIG_ROOT even when its
+  # mode is already 0700.  Re-apply the broker's traverse-only entry after the
+  # directory operations so repeated staging cannot strand the broker.
+  ensure_broker_traverse_acl "$CONFIG_ROOT" \
+    || fail "could not preserve dispatch broker configuration access"
+
   if [[ ! -f "$CONFIG_ROOT/omcp.json" ]]; then
     sudo install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_USER" \
       "$release_root/deploy/pixelbox/omcp.example.json" "$CONFIG_ROOT/omcp.json"
@@ -284,7 +294,7 @@ install_units() {
 }
 
 preflight_activation() {
-  local release_root="$RELEASES_ROOT/$RELEASE_SHA" mode
+  local release_root="$RELEASES_ROOT/$RELEASE_SHA" mode broker_uid
   [[ "$(uname -s)" == "Linux" ]] || fail "activation is supported only on Linux"
   [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]] \
     || fail "--apply requires a Linux ARM64 host"
@@ -304,6 +314,29 @@ preflight_activation() {
     mode="$(sudo stat -c '%a' "$CONFIG_ROOT/$file")"
     [[ "$mode" == "600" ]] || fail "$CONFIG_ROOT/$file must have mode 0600"
   done
+
+  # Keep an existing credential-isolated broker deployment intact across
+  # activate and rollback as well as staging.
+  ensure_broker_traverse_acl "$CONFIG_ROOT" \
+    || fail "could not preserve dispatch broker configuration access"
+  if id "$BROKER_USER" >/dev/null 2>&1 && sudo test -d "$CONFIG_ROOT/github-dispatch"; then
+    broker_uid="$(id -u "$BROKER_USER")"
+    [[ "$(sudo stat -c '%a' "$CONFIG_ROOT/github-dispatch")" == "700" ]] \
+      || fail "$CONFIG_ROOT/github-dispatch must have mode 0700"
+    [[ "$(sudo stat -c '%u' "$CONFIG_ROOT/github-dispatch")" == "$broker_uid" ]] \
+      || fail "$CONFIG_ROOT/github-dispatch must be owned by $BROKER_USER"
+    sudo -u "$BROKER_USER" /usr/bin/test -x "$CONFIG_ROOT" \
+      || fail "$BROKER_USER cannot traverse $CONFIG_ROOT"
+    for file in github-dispatch/config.json github-dispatch/github-actions.token; do
+      sudo test -f "$CONFIG_ROOT/$file" || fail "broker configuration is missing: $CONFIG_ROOT/$file"
+      [[ "$(sudo stat -c '%a' "$CONFIG_ROOT/$file")" == "600" ]] \
+        || fail "$CONFIG_ROOT/$file must have mode 0600"
+      [[ "$(sudo stat -c '%u' "$CONFIG_ROOT/$file")" == "$broker_uid" ]] \
+        || fail "$CONFIG_ROOT/$file must be owned by $BROKER_USER"
+      sudo -u "$BROKER_USER" /usr/bin/test -r "$CONFIG_ROOT/$file" \
+        || fail "$BROKER_USER cannot read $CONFIG_ROOT/$file"
+    done
+  fi
 }
 
 activate_release() {

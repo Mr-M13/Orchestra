@@ -264,6 +264,7 @@ so Codex fails before its first model request with:
 
 ```text
 bwrap: Can't mkdir parents for /: Function not implemented
+bwrap: Can't open source /: Function not implemented
 ```
 
 The worker service retains `ProtectSystem=strict`, `ProtectHome=read-only`,
@@ -309,8 +310,22 @@ sudo usermod -a -G orchestra-ipc hamed
 sudo usermod -a -G orchestra-ipc orchestra-github
 sudo install -d -m 0700 -o orchestra-github -g orchestra-github /etc/orchestra/github-dispatch
 sudo install -m 0600 -o orchestra-github -g orchestra-github github-dispatch.example.json /etc/orchestra/github-dispatch/config.json
+# Traverse-only parent access.  Do not grant read/list on /etc/orchestra.
+sudo setfacl -m u:orchestra-github:--x,m::--x /etc/orchestra
 # Enter the token locally without argv, shell history, chat, issue, PR, or log exposure.
 sudo systemctl enable --now orchestra-github-dispatch.service
+```
+
+`install -d -m 0700` rewrites the ACL mask on an existing `/etc/orchestra`,
+which disables the broker's named traverse entry. The installer re-applies this
+narrow ACL after every staging, activation preflight, and rollback preflight.
+Verify the effective entry, not just the mode bits:
+
+```sh
+getfacl -cp /etc/orchestra
+# user:orchestra-github:--x
+# mask::--x
+# other::---
 ```
 
 Edit the files locally. Do not paste secret values into a chat, issue, pull
