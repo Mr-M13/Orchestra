@@ -209,6 +209,13 @@ class TrustedProbeIntegrationTests(unittest.TestCase):
                     workspace, state, task_id, ("platform",), (str(probe_root),),
                     policy=policy,
                 )
+            report = json.loads(
+                (probe_root / "orchestra-security-probe.json").read_text(encoding="utf-8")
+            )
+            checks = {item["name"]: item for item in report["checks"]}
+            self.assertTrue(checks["read_orchestra_config"]["attempted"])
+            self.assertTrue(checks["read_orchestra_config"]["allowed"])
+            self.assertTrue(checks["read_orchestra_secret"]["allowed"])
 
 
 if __name__ == "__main__":
