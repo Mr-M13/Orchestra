@@ -24,6 +24,8 @@ from omcp.controller import (
     OPENCODE_PROVIDER_ENDPOINTS,
     canonical_codex_executable, canonical_opencode_executable,
 )
+from omcp import worker_contract
+from omcp.routine_policy import RoutineConfinementPolicy
 from omcp.platform import SandboxPolicy, host_platform, sandbox_command
 
 
@@ -325,40 +327,14 @@ def opencode_environment(runtime_dir: Path) -> dict[str, str]:
 
 
 def routine_command(executable: str, workspace: Path, result_path: Path,
-                    writable_paths: list[str], git_read_paths: list[str] | None = None) -> list[str]:
-    if not all(isinstance(value, str) and value and all(
-            part and part.replace("_", "").replace("-", "").isalnum() for part in Path(value).parts)
-            for value in writable_paths):
-        raise ValueError("invalid routine writable paths")
-    git_reads = list(git_read_paths or [])
-    if not all(isinstance(value, str) and Path(value).is_absolute()
-               and not any(character.isspace() or character in {'"', "\n", "\r", "{", "}", "="}
-                           for character in value)
-               for value in git_reads):
-        raise ValueError("invalid routine Git read paths")
-    rules = ','.join(['"."="read"', '".orchestra-tmp"="write"',
-                      *(f'"{value}"="write"' for value in writable_paths)])
-    git_rules: list[str] = []
-    for value in git_reads:
-        git_rules.extend([
-            "--config", f'permissions.orchestra-routine.filesystem.{value}="read"',
-        ])
-    return [
-        executable, "--ask-for-approval", "never", "exec", "--ignore-user-config",
-        "--ignore-rules", "--ephemeral", "--config", 'default_permissions="orchestra-routine"',
-        "--config", 'permissions.orchestra-routine.filesystem.:root="deny"',
-        "--config", 'permissions.orchestra-routine.filesystem.:minimal="read"',
-        # The minimal system read set includes /etc.  The owner-only OMCP
-        # configuration and credentials live there on PixelBox, so deny that
-        # subtree explicitly rather than relying on :root="deny".
-        "--config", 'permissions.orchestra-routine.filesystem./etc/orchestra="deny"',
-        *git_rules,
-        "--config", 'permissions.orchestra-routine.filesystem.:tmpdir="deny"',
-        "--config", 'permissions.orchestra-routine.filesystem.:slash_tmp="deny"',
-        "--config", "permissions.orchestra-routine.filesystem.:workspace_roots={" + rules + "}",
-        "--config", "permissions.orchestra-routine.network.enabled=false", "--cd", str(workspace),
-        "--output-last-message", str(result_path), "-",
-    ]
+                    writable_paths: list[str], git_read_paths: list[str] | None = None,
+                    read_only_paths: list[str] | None = None) -> list[str]:
+    """Build the Codex worker command from the shared routine policy."""
+    policy = RoutineConfinementPolicy(
+        tuple(writable_paths),
+        tuple(read_only_paths if read_only_paths is not None else (git_read_paths or ())),
+    )
+    return policy.worker_command(executable, workspace, result_path)
 
 
 def owner_only_credential(path: Path) -> None:
@@ -851,9 +827,12 @@ def run(spec_path: Path) -> int:
     if (not isinstance(seconds, int) or isinstance(seconds, bool) or not 60 <= seconds <= 7200
             or not isinstance(maximum, int) or isinstance(maximum, bool) or not 1024 <= maximum <= 1048576):
         raise ValueError("invalid worker bounds")
-    runtime_dir = routine_tmp = None
+    runtime_dir = routine_tmp = contract_tmp = None
     gateway: PinnedProviderGateway | None = None
     worker_diagnostic: dict[str, Any] | None = None
+    completion_contract: str | None = None
+    completion_contract_error: str | None = None
+    require_contract = adapter == "codex" and spec.get("require_completion_contract") is True
     exit_code, error_type = 125, None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     def terminate(signum: int, _frame: Any) -> None: raise RunnerTerminated(signum)
@@ -890,18 +869,26 @@ def run(spec_path: Path) -> int:
                 command = [executable, "--ask-for-approval", "never", "exec", "--sandbox", "workspace-write",
                            "--cd", str(workspace), "--output-last-message", str(result), "-"]
                 environment = worker_environment(spec.get("codex_home"))
+                contract_tmp = workspace / worker_contract.CONTRACT_DIR
+                contract_tmp.mkdir(mode=0o700, exist_ok=True)
+                routine_tmp = contract_tmp
+                environment["TMPDIR"] = str(contract_tmp)
             else:
                 if (not isinstance(capabilities, dict) or capabilities.get("profile") != "routine_development_v1"
                         or capabilities.get("network") is not False or capabilities.get("external_credentials") is not False
                         or capabilities.get("git_metadata") != "read_only" or not isinstance(capabilities.get("writable_paths"), list)):
                     raise ValueError("invalid routine execution capabilities")
-                routine_tmp = workspace / ".orchestra-tmp"; routine_tmp.mkdir(mode=0o700)
-                git_read_paths = spec.get("git_read_paths", [])
-                if not isinstance(git_read_paths, list):
-                    raise ValueError("invalid routine Git read paths")
+                contract_tmp = workspace / worker_contract.CONTRACT_DIR
+                contract_tmp.mkdir(mode=0o700, exist_ok=True)
+                routine_tmp = contract_tmp
+                read_only_paths = spec.get(
+                    "read_only_paths", spec.get("git_read_paths", []),
+                )
+                if not isinstance(read_only_paths, list):
+                    raise ValueError("invalid routine read paths")
                 command = routine_command(
                     executable, workspace, result, capabilities["writable_paths"],
-                    git_read_paths,
+                    read_only_paths=read_only_paths,
                 )
                 environment = worker_environment(spec.get("codex_home")); environment["TMPDIR"] = str(routine_tmp)
             if adapter == "opencode":
@@ -940,6 +927,19 @@ def run(spec_path: Path) -> int:
         signal.signal(signal.SIGTERM, previous_sigterm)
         if gateway is not None:
             gateway.close()
+        # Read the structured contract and security report while the private
+        # contract directory still exists.  These files are never interpreted
+        # as natural-language assertions.
+        if adapter == "codex" and contract_tmp is not None and require_contract:
+            try:
+                contract = worker_contract.read_completion_contract(
+                    worker_contract.contract_path(workspace),
+                )
+            except (worker_contract.CompletionContractError, OSError, ValueError) as exc:
+                completion_contract = "invalid"
+                completion_contract_error = type(exc).__name__
+            else:
+                completion_contract = contract["status"]
         if routine_tmp is not None:
             shutil.rmtree(routine_tmp, ignore_errors=True)
             if routine_tmp.exists():
@@ -962,6 +962,13 @@ def run(spec_path: Path) -> int:
                 write_failure_result(
                     result, "Worker sandbox failed to start; the task did not run.\n",
                 )
+        if (not sandbox_failure and exit_code == 0 and require_contract
+                and completion_contract != "success"):
+            exit_code = 125
+            error_type = (
+                "TaskContractFailed" if completion_contract == "failure"
+                else "TaskContractInvalid"
+            )
         # result.txt is mandatory for every local worker.  A process can exit
         # zero after its tool sandbox failed, or without emitting the requested
         # final message; neither is a successful task.
@@ -977,6 +984,10 @@ def run(spec_path: Path) -> int:
         record: dict[str, Any] = {
             "exit_code": exit_code, "finished_at": utc_now(), "runner_error": error_type,
         }
+        if require_contract:
+            record["completion_contract"] = completion_contract or "missing"
+            if completion_contract_error is not None:
+                record["completion_contract_error"] = completion_contract_error
         if worker_diagnostic is not None:
             record["worker_diagnostic"] = worker_diagnostic
         atomic_json(completion, record)

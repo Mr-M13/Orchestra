@@ -9,10 +9,12 @@ import sys
 import tempfile
 import threading
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import ANY, Mock, patch
 from urllib.parse import urlparse
 
+from omcp import worker_contract
 from omcp.approval import format_review
 from omcp.controller import (
     AuthorizationError, Config, HostOperation, Principal, RepositoryProfile, StandingAuthorization,
@@ -59,6 +61,30 @@ def codex_success_side_effect(result_path: Path, text: str = "finished"):
     return execute
 
 
+def codex_contract_fixture(
+    directory: Path, *, result: str = "worker finished",
+    contract: str | None = '{"status":"success"}',
+) -> dict[str, str]:
+    """Create a fake Codex that writes a result and optional structured files."""
+    bin_dir = directory / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    executable = bin_dir / "codex"
+    lines = [
+        "#!/bin/sh",
+        'while [ "$#" -gt 0 ]; do',
+        '  if [ "$1" = "--output-last-message" ]; then shift; result="$1"; fi',
+        "  shift",
+        "done",
+        f"printf '%s\\n' '{result}' > \"$result\"",
+    ]
+    if contract is not None:
+        lines.append(f"printf '%s\\n' '{contract}' > \"$TMPDIR/orchestra-completion.json\"")
+    lines.append("exit 0")
+    executable.write_text("\n".join(lines) + "\n")
+    executable.chmod(0o700)
+    return {**os.environ, "PATH": str(bin_dir)}
+
+
 class ControllerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -96,10 +122,13 @@ class ControllerTests(unittest.TestCase):
     def complete(self, task_id, exit_code=0, result="finished"):
         task = self.controller.state["tasks"][task_id]
         Path(task["result_path"]).write_text(result)
-        Path(task["completion_path"]).write_text(json.dumps({
+        record = {
             "exit_code": exit_code, "finished_at": "2026-10-11T00:00:00+00:00",
             "runner_error": None,
-        }))
+        }
+        if task.get("requires_completion_contract"):
+            record["completion_contract"] = "success" if exit_code == 0 else "failure"
+        Path(task["completion_path"]).write_text(json.dumps(record))
 
     def test_submission_is_durable_acknowledged_and_idempotent(self):
         first = self.submit()
@@ -130,7 +159,7 @@ class ControllerTests(unittest.TestCase):
         self.controller.config = replace(
             self.config, local_worker_git_mode="owner_synced", local_worker_source_sha=sha,
         )
-        profile = self.config.profile("default")
+        profile = self.controller.config.profile("default")
         def fake_git(_root, *args, **_kwargs):
             return (1, "") if "show-ref" in args else (0, sha)
         with patch.object(self.controller, "_verify_profile_origin"), \
@@ -148,8 +177,64 @@ class ControllerTests(unittest.TestCase):
                 patch.object(self.controller, "_git", return_value=(0, "b" * 40)):
             with self.assertRaisesRegex(RuntimeError, "differs from pinned"):
                 self.controller._prepare_workspace(
-                    "test-mismatch", "omcp/task-mismatch", self.config.profile("default"), False,
+                    "test-mismatch", "omcp/task-mismatch",
+                    self.controller.config.profile("default"), False,
                 )
+
+    def test_profiles_prepare_unrelated_repositories_independently(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root_a = base / "repo-a"; root_a.mkdir()
+            root_b = base / "repo-b"; root_b.mkdir()
+            profiles = {
+                "a": RepositoryProfile(
+                    "a", "owner/repo-a", root_a, "origin/main",
+                    "owner_synced", "a" * 40,
+                ),
+                "b": RepositoryProfile(
+                    "b", "owner/repo-b", root_b, "origin/main", "fetch", None,
+                ),
+            }
+            self.controller.config = replace(
+                self.config, repository_profiles=profiles, default_profile="a",
+                local_worker_git_mode="owner_synced",
+                local_worker_source_sha="a" * 40,
+            )
+            calls = []
+
+            def fake_git(root, *args, **_kwargs):
+                calls.append((Path(root).name, args))
+                if args[:2] == ("remote", "get-url"):
+                    repo = "repo-a" if Path(root).name == "repo-a" else "repo-b"
+                    return 0, f"https://github.com/owner/{repo}.git"
+                if args[0] == "fetch":
+                    return 0, ""
+                if args[:2] == ("rev-parse", "--verify"):
+                    return 0, "a" * 40
+                if args[0] == "show-ref":
+                    return 1, ""
+                return 0, ""
+
+            with patch.object(self.controller, "_git", side_effect=fake_git):
+                path_a = self.controller._prepare_workspace(
+                    "task-a", "omcp/task-a", self.controller.config.profile("a"), False,
+                )
+                calls_a = list(calls)
+                calls.clear()
+                path_b = self.controller._prepare_workspace(
+                    "task-b", "omcp/task-b", self.controller.config.profile("b"), True,
+                )
+                calls_b = list(calls)
+        self.assertEqual(path_a, self.state / "worktrees" / "a" / "task-a")
+        self.assertEqual(path_b, self.state / "worktrees" / "b" / "task-b")
+        self.assertFalse(any(args[0] == "fetch" for _root, args in calls_a))
+        self.assertTrue(any(args[0] == "fetch" for _root, args in calls_b))
+        self.assertTrue(any(
+            args[:2] == ("rev-parse", "--verify") for _root, args in calls_a
+        ))
+        self.assertFalse(any(
+            args[:2] == ("rev-parse", "--verify") for _root, args in calls_b
+        ))
 
     def test_owner_synced_local_worker_rejects_wrong_origin(self):
         self.controller.config = replace(
@@ -158,7 +243,8 @@ class ControllerTests(unittest.TestCase):
         with patch.object(self.controller, "_git", return_value=(0, "https://github.com/other/repo.git")):
             with self.assertRaisesRegex(RuntimeError, "origin must match"):
                 self.controller._prepare_workspace(
-                    "test-origin", "omcp/task-origin", self.config.profile("default"), False,
+                    "test-origin", "omcp/task-origin",
+                    self.controller.config.profile("default"), False,
                 )
 
     def test_systemd_user_worker_command_is_hardened(self):
@@ -409,6 +495,11 @@ class ControllerTests(unittest.TestCase):
         })
         self.assertEqual(self.controller.list_approvals()["approvals"], [])
         self.popen.assert_called_once()
+        self.assertTrue((self.root / "src").is_dir())
+        self.assertTrue((self.root / "tests").is_dir())
+        prompt = (self.state / "tasks" / submitted["task_id"] / "prompt.txt").read_text()
+        self.assertIn("ORCHESTRA STRUCTURED COMPLETION CONTRACT", prompt)
+        self.assertNotIn("orchestra-security-probe", prompt)
         audit = (self.state / "audit.jsonl").read_text()
         self.assertIn('"authorization_mode":"standing"', audit)
         self.assertNotIn("Change local code and run tests", audit)
@@ -658,6 +749,106 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(reconciled["status"], "failed")
         self.assertEqual(reconciled["exit_code"], 125)
         self.assertEqual(reconciled["failure"], {"type": "MissingWorkerResult"})
+
+    def test_exit_zero_without_completion_contract_is_failed(self):
+        submitted = self.submit("missing-contract")
+        task = self.controller.state["tasks"][submitted["task_id"]]
+        Path(task["result_path"]).write_text("required operation was denied\n")
+        Path(task["completion_path"]).write_text(json.dumps({
+            "exit_code": 0, "finished_at": "2026-10-11T00:00:00+00:00",
+            "runner_error": None,
+        }))
+        self.controller.reconcile()
+        reconciled = self.controller.state["tasks"][submitted["task_id"]]
+        self.assertEqual(reconciled["status"], "failed")
+        self.assertEqual(reconciled["failure"], {"type": "TaskContractFailed"})
+
+    def _standing_completion(self, request_id: str):
+        submitted = self.submit(request_id)
+        task = self.controller.state["tasks"][submitted["task_id"]]
+        task["requires_security_assertions"] = True
+        (self.root / ".orchestra-tmp").mkdir(exist_ok=True)
+        Path(task["result_path"]).write_text("worker diagnostic\n")
+        Path(task["completion_path"]).write_text(json.dumps({
+            "exit_code": 0, "finished_at": "2026-10-11T00:00:00+00:00",
+            "runner_error": None, "completion_contract": "success",
+        }))
+        return submitted, task
+
+    @staticmethod
+    def _trusted_checks():
+        return {
+            name: {
+                "name": name, "attempted": True, "allowed": False,
+                "error_type": "PermissionError", "command": "probe " + name,
+            }
+            for name in worker_contract.REQUIRED_SECURITY_CHECKS
+        }
+
+    def test_worker_cannot_forge_trusted_security_evidence(self):
+        actions = ("replace-probe", "delete-probe", "fabricate-report", "edit-report", "skip-probe")
+        for action in actions:
+            with self.subTest(action=action):
+                self.controller.close()
+                self.controller = TaskController(
+                    self.config, popen=self.popen,
+                    workspace_preparer=lambda *_: self.root,
+                    id_factory=lambda: str(uuid.uuid4()),
+                )
+                contract_dir = self.root / ".orchestra-tmp"
+                if contract_dir.exists():
+                    for child in contract_dir.iterdir():
+                        if child.is_file():
+                            child.unlink()
+                submitted, task = self._standing_completion("adversarial-" + action)
+                probe = self.root / ".orchestra-tmp/orchestra-security-probe.py"
+                report = self.root / ".orchestra-tmp/orchestra-security-probe.json"
+                if action == "replace-probe":
+                    probe.write_text("fake probe\n")
+                elif action == "delete-probe":
+                    probe.unlink(missing_ok=True)
+                elif action == "fabricate-report":
+                    report.write_text(json.dumps({"schema_version": 1, "checks": []}))
+                elif action == "edit-report":
+                    report.write_text(json.dumps({"schema_version": 1, "checks": []}))
+                    report.write_text(json.dumps({"schema_version": 1, "checks": []}) + " ")
+                with patch(
+                    "omcp.controller.trusted_probe.run_trusted_security_probe",
+                    side_effect=RuntimeError("trusted probe failed"),
+                ) as verify:
+                    self.controller.reconcile()
+                verify.assert_called_once()
+                reconciled = self.controller.state["tasks"][submitted["task_id"]]
+                self.assertEqual(reconciled["status"], "failed")
+                self.assertEqual(reconciled["failure"], {"type": "SecurityAssertionFailed"})
+                self.assertEqual(reconciled["security_assertions"], "failed")
+
+    def test_trusted_security_evidence_success_marks_task_succeeded(self):
+        submitted, task = self._standing_completion("trusted-success")
+        with patch(
+            "omcp.controller.trusted_probe.run_trusted_security_probe",
+            return_value=self._trusted_checks(),
+        ) as verify:
+            self.controller.reconcile()
+        verify.assert_called_once()
+        reconciled = self.controller.state["tasks"][submitted["task_id"]]
+        self.assertEqual(reconciled["status"], "succeeded")
+        self.assertEqual(reconciled["security_assertions"], "passed")
+        self.assertEqual(
+            {item["name"] for item in reconciled["security_checks"]},
+            set(worker_contract.REQUIRED_SECURITY_CHECKS),
+        )
+
+    def test_unexpectedly_allowed_trusted_assertion_fails_task(self):
+        submitted, task = self._standing_completion("trusted-allowed")
+        with patch(
+            "omcp.controller.trusted_probe.run_trusted_security_probe",
+            side_effect=ValueError("security probe allowed read_orchestra_config"),
+        ):
+            self.controller.reconcile()
+        reconciled = self.controller.state["tasks"][submitted["task_id"]]
+        self.assertEqual(reconciled["status"], "failed")
+        self.assertEqual(reconciled["failure"], {"type": "SecurityAssertionFailed"})
 
     def test_sandbox_startup_failure_is_visible_in_task_diagnostics(self):
         submitted = self.submit("sandbox-failure")
@@ -1125,6 +1316,163 @@ class ControllerTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_profiles_define_independent_git_preparation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "project"
+            a_root = base / "repo-a"
+            b_root = base / "repo-b"
+            for path in (root, a_root, b_root):
+                path.mkdir()
+            codex = base / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            config_path = base / "omcp.json"
+            config_path.write_text(json.dumps({
+                "repository": "owner/orchestra",
+                "project_root": str(root),
+                "state_dir": str(base / "state"),
+                "workers": {"ina": {"command": ["codex"]}},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+                "local_worker_git_mode": "owner_synced",
+                "local_worker_source_sha": "c" * 40,
+                "repository_profiles": {
+                    "orchestra": {
+                        "repository": "owner/orchestra",
+                        "project_root": str(a_root),
+                        "base_ref": "origin/main",
+                        "local_worker_git_mode": "owner_synced",
+                        "local_worker_source_sha": "a" * 40,
+                    },
+                    "delnavazan": {
+                        "repository": "owner/delnavazan",
+                        "project_root": str(b_root),
+                        "base_ref": "origin/main",
+                        "local_worker_git_mode": "fetch",
+                        "local_worker_source_sha": None,
+                    },
+                },
+                "default_profile": "orchestra",
+            }))
+            os.chmod(config_path, 0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                config = Config.load(config_path)
+        orchestra = config.profile("orchestra")
+        delnavazan = config.profile("delnavazan")
+        self.assertEqual(orchestra.local_worker_git_mode, "owner_synced")
+        self.assertEqual(orchestra.local_worker_source_sha, "a" * 40)
+        self.assertEqual(delnavazan.local_worker_git_mode, "fetch")
+        self.assertIsNone(delnavazan.local_worker_source_sha)
+        self.assertEqual(config.local_worker_git_mode, "owner_synced")
+        self.assertEqual(config.local_worker_source_sha, "c" * 40)
+
+    def test_legacy_profile_inherits_global_git_preparation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "project"
+            root.mkdir()
+            codex = base / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            config_path = base / "omcp.json"
+            config_path.write_text(json.dumps({
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(base / "state"),
+                "workers": {"ina": {"command": ["codex"]}},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+                "local_worker_git_mode": "owner_synced",
+                "local_worker_source_sha": "d" * 40,
+            }))
+            os.chmod(config_path, 0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                config = Config.load(config_path)
+        profile = config.profile(None)
+        self.assertEqual(profile.local_worker_git_mode, "owner_synced")
+        self.assertEqual(profile.local_worker_source_sha, "d" * 40)
+
+    def test_profile_owner_synced_requires_a_pin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "project"
+            repo = base / "repo"
+            root.mkdir(); repo.mkdir()
+            codex = base / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            config_path = base / "omcp.json"
+            config_path.write_text(json.dumps({
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(base / "state"),
+                "workers": {"ina": {"command": ["codex"]}},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+                "repository_profiles": {
+                    "repo": {
+                        "repository": "owner/repo", "project_root": str(repo),
+                        "base_ref": "origin/main", "local_worker_git_mode": "owner_synced",
+                    },
+                },
+                "default_profile": "repo",
+            }))
+            os.chmod(config_path, 0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                with self.assertRaisesRegex(ValueError, "owner_synced requires"):
+                    Config.load(config_path)
+
+    def test_deepseek_worker_cannot_receive_standing_authorization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "project"
+            root.mkdir()
+            credential = base / "deepseek.key"
+            credential.write_text("not-printed")
+            credential.chmod(0o600)
+            config_path = base / "omcp.json"
+            config_path.write_text(json.dumps({
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(base / "state"),
+                "workers": {"deepseek": {
+                    "adapter": "deepseek", "provider": "deepseek",
+                    "model": "deepseek/deepseek-chat",
+                    "credential_file": str(credential),
+                }},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+                "standing_authorizations": [{
+                    "id": "deepseek-routine",
+                    "consequence_class": "routine_development",
+                    "repository_profiles": ["default"],
+                    "workers": ["deepseek"],
+                    "writable_paths": ["platform"],
+                }],
+            }))
+            os.chmod(config_path, 0o600)
+            with self.assertRaisesRegex(ValueError, "only name Codex workers"):
+                Config.load(config_path)
+
+    def test_standing_authorization_rejects_unsafe_writable_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "project"
+            root.mkdir()
+            codex = base / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            config_path = base / "omcp.json"
+            config_path.write_text(json.dumps({
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(base / "state"),
+                "workers": {"ina": {"command": ["codex"]}},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+                "standing_authorizations": [{
+                    "id": "routine", "consequence_class": "routine_development",
+                    "repository_profiles": ["default"], "workers": ["ina"],
+                    "writable_paths": ["../outside"],
+                }],
+            }))
+            os.chmod(config_path, 0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                with self.assertRaisesRegex(ValueError, "safe relative paths"):
+                    Config.load(config_path)
+
     def test_config_loads_independent_allowlisted_opencode_and_deepseek_workers(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "project"
@@ -2034,6 +2382,56 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(record["exit_code"], 0)
             self.assertEqual((root / "result").read_text(), "read-only canary completed\n")
 
+    def _contract_spec(self, root: Path) -> Path:
+        prompt = root / "prompt"
+        prompt.write_text("task")
+        spec = root / "spec.json"
+        spec.write_text(json.dumps({
+            "command": ["codex"], "workspace": str(root),
+            "prompt_path": str(prompt), "log_path": str(root / "log"),
+            "result_path": str(root / "result"),
+            "completion_path": str(root / "completion"),
+            "codex_home": None,
+            "require_completion_contract": True,
+        }))
+        return spec
+
+    def test_runner_accepts_a_structured_success_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = self._contract_spec(root)
+            with patch.dict(os.environ, codex_contract_fixture(root), clear=True):
+                self.assertEqual(run_worker(spec), 0)
+            record = json.loads((root / "completion").read_text())
+            self.assertEqual(record["completion_contract"], "success")
+            self.assertNotIn("completion_contract_error", record)
+
+    def test_runner_contract_failure_overrides_a_zero_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = self._contract_spec(root)
+            fixture = codex_contract_fixture(
+                root, result="required filesystem operation was denied",
+                contract='{"status":"failure","reason":"required write denied"}',
+            )
+            with patch.dict(os.environ, fixture, clear=True):
+                self.assertEqual(run_worker(spec), 125)
+            record = json.loads((root / "completion").read_text())
+            self.assertEqual(record["runner_error"], "TaskContractFailed")
+            self.assertEqual(record["completion_contract"], "failure")
+            self.assertIn("required filesystem operation", (root / "result").read_text())
+
+    def test_runner_missing_contract_fails_even_when_result_exists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = self._contract_spec(root)
+            fixture = codex_contract_fixture(root, contract=None)
+            with patch.dict(os.environ, fixture, clear=True):
+                self.assertEqual(run_worker(spec), 125)
+            record = json.loads((root / "completion").read_text())
+            self.assertEqual(record["runner_error"], "TaskContractInvalid")
+            self.assertEqual(record["completion_contract"], "invalid")
+
     def test_runner_passes_only_explicitly_permitted_environment(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2054,7 +2452,7 @@ class RunnerTests(unittest.TestCase):
             }))
             parent_environment = {
                 "PATH": str(bin_dir), "HOME": "/Users/test",
-                "TMPDIR": "/tmp/test", "LANG": "en_AU.UTF-8",
+                "TMPDIR": str(root / ".orchestra-tmp"), "LANG": "en_AU.UTF-8",
                 "LC_ALL": "en_AU.UTF-8", "CODEX_HOME": "/parent/codex-home",
                 "CONTROL_PLANE_API_KEY": "tunnel-secret",
                 "OMCP_AUTHENTICATED_CALLER": "chatgpt:principal",
@@ -2069,7 +2467,7 @@ class RunnerTests(unittest.TestCase):
             environment = execute.call_args.kwargs["env"]
             self.assertEqual(environment, {
                 "PATH": str(bin_dir), "HOME": "/Users/test",
-                "TMPDIR": "/tmp/test", "LANG": "en_AU.UTF-8",
+                "TMPDIR": str(root / ".orchestra-tmp"), "LANG": "en_AU.UTF-8",
                 "LC_ALL": "en_AU.UTF-8", "CODEX_HOME": "/private/codex-home",
                 "GIT_TERMINAL_PROMPT": "0",
             })
