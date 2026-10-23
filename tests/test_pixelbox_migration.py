@@ -561,7 +561,8 @@ class PersistentSocketTests(unittest.TestCase):
                 connection.settimeout(5)
                 connection.connect(str(socket_path))
                 connection.sendall(json.dumps({
-                    "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {},
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"protocolVersion": "2025-06-18"},
                 }).encode() + b"\n")
                 response = json.loads(connection.makefile("rb").readline())
                 connection.close()
