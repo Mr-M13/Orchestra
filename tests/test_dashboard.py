@@ -10,13 +10,14 @@ from dashboard.app import Dashboard
 
 
 NOW = datetime.now(timezone.utc).isoformat()
+TASK_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 
 
 class FakeOMCP:
     def __init__(self, offline: bool = False) -> None:
         self.offline = offline
         self.calls = []
-        self.task = {"task_id": "a" * 36, "title": "<script>alert(1)</script>", "worker": "Ina", "repository_profile": "Delnavazan", "status": "running", "created_at": NOW, "started_at": NOW, "consequence_class": "routine_development", "authorization": {"mode": "standing", "authorization_id": "routine-1"}, "execution_capabilities": {"network": False, "external_credentials": False, "git_metadata": "read_only"}}
+        self.task = {"task_id": TASK_ID, "title": "<script>alert(1)</script>", "worker": "Ina", "repository_profile": "Delnavazan", "status": "running", "created_at": NOW, "started_at": NOW, "consequence_class": "routine_development", "authorization": {"mode": "standing", "authorization_id": "routine-1"}, "execution_capabilities": {"network": False, "external_credentials": False, "git_metadata": "read_only"}}
 
     def call(self, tool, arguments=None):
         self.calls.append((tool, arguments or {}))
@@ -25,7 +26,7 @@ class FakeOMCP:
             raise OMCPError("offline")
         if tool == "bridge_status": return {"status": "ok", "repository_profiles": ["Delnavazan"]}
         if tool == "worker_availability": return {"workers": [{"worker": "Ina", "available": False, "current_task_id": self.task["task_id"]}]}
-        if tool == "list_tasks": return {"tasks": [self.task, {**self.task, "task_id": "b" * 36, "title": "done", "status": "succeeded", "finished_at": NOW}]}
+        if tool == "list_tasks": return {"tasks": [self.task, {**self.task, "task_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "title": "done", "status": "succeeded", "finished_at": NOW}]}
         if tool == "list_approvals": return {"approvals": []}
         if tool == "task_status": return self.task
         if tool == "task_result": return {**self.task, "result": "<b>untrusted</b>"}
@@ -34,8 +35,8 @@ class FakeOMCP:
         raise AssertionError(tool)
 
 
-def request(app, path="/", method="GET", form=""):
-    environ = {}; setup_testing_defaults(environ); environ.update({"PATH_INFO": path, "REQUEST_METHOD": method, "CONTENT_LENGTH": str(len(form)), "wsgi.input": io.BytesIO(form.encode())})
+def request(app, path="/", method="GET", form="", content_length=None, body=None):
+    environ = {}; setup_testing_defaults(environ); environ.update({"PATH_INFO": path, "REQUEST_METHOD": method, "CONTENT_LENGTH": str(len(form)) if content_length is None else content_length, "wsgi.input": body or io.BytesIO(form.encode())})
     seen = {}; body = b"".join(app(environ, lambda status, headers: seen.update(status=status, headers=dict(headers)))).decode()
     return seen, body
 
@@ -49,7 +50,7 @@ class DashboardTests(unittest.TestCase):
 
     def test_detail_shows_structured_security_not_worker_output(self):
         client = FakeOMCP(); client.task["status"] = "succeeded"; client.task["finished_at"] = NOW
-        _, body = request(Dashboard(client), "/tasks/" + "a" * 36)
+        _, body = request(Dashboard(client), "/tasks/" + TASK_ID)
         self.assertIn("External credentials: denied", body)
         self.assertIn("&lt;b&gt;untrusted&lt;/b&gt;", body)
 
@@ -74,7 +75,7 @@ class DashboardTests(unittest.TestCase):
         seen, _ = request(app, "/new-task", "POST", "csrf=nope")
         self.assertTrue(seen["status"].startswith("403"))
         self.assertNotIn("submit_task", [name for name, _ in client.calls])
-        seen, _ = request(app, "/tasks/" + "a" * 36 + "/cancel", "POST", "csrf=nope")
+        seen, _ = request(app, "/tasks/" + TASK_ID + "/cancel", "POST", "csrf=nope")
         self.assertTrue(seen["status"].startswith("403"))
 
     def test_retrying_the_same_form_preserves_its_idempotency_key(self):
@@ -89,6 +90,29 @@ class DashboardTests(unittest.TestCase):
 
     def test_cancel_uses_fixed_operation(self):
         client = FakeOMCP(); app = Dashboard(client)
-        seen, _ = request(app, "/tasks/" + "a" * 36 + "/cancel", "POST", f"csrf={app.csrf_token}&reason=Stop")
+        seen, _ = request(app, "/tasks/" + TASK_ID + "/cancel", "POST", f"csrf={app.csrf_token}&reason=Stop")
         self.assertTrue(seen["status"].startswith("303"))
-        self.assertEqual(client.calls[-1], ("cancel_task", {"task_id": "a" * 36, "reason": "Stop"}))
+        self.assertEqual(client.calls[-1], ("cancel_task", {"task_id": TASK_ID, "reason": "Stop"}))
+
+    def test_malformed_task_ids_are_not_sent_to_omcp(self):
+        for path, method in (("/tasks/not-a-task", "GET"), ("/tasks/not-a-task/cancel", "POST"), ("/tasks/" + "A" * 36, "GET")):
+            client = FakeOMCP()
+            seen, _ = request(Dashboard(client), path, method)
+            self.assertTrue(seen["status"].startswith("404"))
+            self.assertEqual(client.calls, [])
+
+    def test_oversized_body_returns_413_without_reading_or_mutating(self):
+        class UnreadableBody:
+            def read(self, _):
+                raise AssertionError("oversized body must not be read")
+        client = FakeOMCP(); app = Dashboard(client)
+        seen, _ = request(app, "/new-task", "POST", content_length="70001", body=UnreadableBody())
+        self.assertTrue(seen["status"].startswith("413"))
+        self.assertNotIn("submit_task", [name for name, _ in client.calls])
+
+    def test_malformed_or_negative_content_length_is_a_client_error_without_mutation(self):
+        for content_length in ("not-a-number", "-1"):
+            client = FakeOMCP(); app = Dashboard(client)
+            seen, _ = request(app, "/new-task", "POST", content_length=content_length)
+            self.assertTrue(seen["status"].startswith("400"))
+            self.assertNotIn("submit_task", [name for name, _ in client.calls])

@@ -18,6 +18,12 @@ from dashboard.omcp import OMCPClient, OMCPError
 
 ACTIVE = {"starting", "running", "accepted", "approval_required", "cancel_requested"}
 TERMINAL = {"succeeded", "failed", "cancelled", "rejected", "interrupted"}
+TASK_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+class RequestBodyError(ValueError):
+    def __init__(self, status: HTTPStatus) -> None:
+        self.status = status
 
 
 def esc(value: Any) -> str:
@@ -60,6 +66,8 @@ class Dashboard:
     def __call__(self, environ: dict[str, Any], start_response: Callable[..., Any]) -> list[bytes]:
         path = environ.get("PATH_INFO", "/")
         method = environ.get("REQUEST_METHOD", "GET")
+        cancel_match = re.fullmatch(r"/tasks/(" + TASK_ID_RE.pattern + r")/cancel", path)
+        task_match = re.fullmatch(r"/tasks/(" + TASK_ID_RE.pattern + r")", path)
         try:
             if path == "/static/dashboard.css" and method == "GET":
                 return self._static(start_response)
@@ -69,11 +77,14 @@ class Dashboard:
                 return self._page(start_response, self.new_task())
             if path == "/new-task" and method == "POST":
                 return self.submit(environ, start_response)
-            if path.startswith("/tasks/") and path.endswith("/cancel") and method == "POST":
-                return self.cancel(path.split("/")[2], environ, start_response)
-            if path.startswith("/tasks/") and method == "GET":
-                return self._page(start_response, self.task_detail(path.split("/")[2]))
+            if cancel_match and method == "POST":
+                return self.cancel(cancel_match.group(1), environ, start_response)
+            if task_match and method == "GET":
+                return self._page(start_response, self.task_detail(task_match.group(1)))
             return self._page(start_response, self.layout("Not found", "<p>That page does not exist.</p>"), HTTPStatus.NOT_FOUND)
+        except RequestBodyError as exc:
+            message = "Request body is too large." if exc.status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE else "Invalid request body."
+            return self._page(start_response, self.layout("Request rejected", f"<p>{message}</p>"), exc.status)
         except OMCPError:
             return self._page(start_response, self.unavailable(), HTTPStatus.SERVICE_UNAVAILABLE)
 
@@ -144,12 +155,17 @@ class Dashboard:
         return self.layout("New Task", f'''<a class="back" href="/">← Dashboard</a><section class="panel"><h1>New Task</h1>{message}<form method="post" action="/new-task"><input type="hidden" name="csrf" value="{esc(self.csrf_token)}"><input type="hidden" name="request_id" value="{request_id}"><label>Project<select name="repository_profile" required>{options}</select></label><label>Worker<select name="worker" required>{worker_options}</select></label><label>Task type<input value="Routine development" disabled><input type="hidden" name="consequence_class" value="routine_development"></label><label>Title<input name="title" maxlength="200" required></label><label>Instructions<textarea name="instructions" required></textarea></label><section class="preview"><h2>Authority preview</h2><p>Orchestra will decide whether standing authorisation applies. Network, credentials, production, deployment, and Git merge/push are not granted by this dashboard.</p></section><button type="submit">Submit task</button></form></section>''')
 
     def _form(self, environ: dict[str, Any]) -> dict[str, str]:
+        raw_length = environ.get("CONTENT_LENGTH")
+        if not isinstance(raw_length, str):
+            raise RequestBodyError(HTTPStatus.BAD_REQUEST)
         try:
-            length = int(environ.get("CONTENT_LENGTH", "0"))
+            length = int(raw_length)
         except ValueError:
-            length = 0
+            raise RequestBodyError(HTTPStatus.BAD_REQUEST) from None
+        if length < 0:
+            raise RequestBodyError(HTTPStatus.BAD_REQUEST)
         if length > 70_000:
-            return {}
+            raise RequestBodyError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
         raw = environ["wsgi.input"].read(length).decode("utf-8", "replace")
         return {key: values[-1] for key, values in parse_qs(raw, keep_blank_values=True).items()}
 
