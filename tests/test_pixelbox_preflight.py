@@ -61,6 +61,35 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
         self.assertIn("--apply requires a Linux ARM64 host", source)
         self.assertIn("units use this path", source)
 
+    def test_installer_reapplies_broker_acl_after_config_directory_install(self):
+        source = (DEPLOY / "install.sh").read_text()
+        helper = DEPLOY / "config-access.sh"
+        self.assertTrue(helper.is_file())
+        subprocess.run(["bash", "-n", str(helper)], check=True)
+
+        install = source.index(
+            'install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$CONFIG_ROOT"'
+        )
+        staged_acl = source.index(
+            'ensure_broker_traverse_acl "$CONFIG_ROOT"', install,
+        )
+        self.assertLess(install, staged_acl)
+        preflight = source.index("preflight_activation()")
+        activation_acl = source.index(
+            'ensure_broker_traverse_acl "$CONFIG_ROOT"', preflight,
+        )
+        self.assertGreater(activation_acl, preflight)
+
+        # Verify the actual broker identity, not only the ACL text.
+        self.assertIn('sudo -u "$BROKER_USER" /usr/bin/test -x "$CONFIG_ROOT"', source)
+        self.assertIn(
+            'sudo -u "$BROKER_USER" /usr/bin/test -r "$CONFIG_ROOT/$file"', source,
+        )
+        helper_source = helper.read_text()
+        self.assertNotIn("chmod -R", helper_source)
+        self.assertNotIn("chown -R", helper_source)
+        self.assertIn('u:$broker_user:--x', helper_source)
+
     def test_units_fail_closed_without_inputs_and_tolerate_optional_paths(self):
         coordinator = (
             DEPLOY / "systemd" / "orchestra-omcp.service"
@@ -69,6 +98,7 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
         health = (DEPLOY / "systemd" / "orchestra-health.service").read_text()
 
         self.assertIn("ExecStartPre=/usr/bin/test -r /etc/orchestra/omcp.json", coordinator)
+        self.assertIn("RestrictSUIDSGID=yes", coordinator)
         self.assertNotIn("orchestra-github-dispatch", coordinator)
         self.assertIn("ExecStartPre=/usr/bin/test -S ", tunnel)
         self.assertIn("After=orchestra-omcp.service", health)

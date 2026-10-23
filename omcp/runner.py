@@ -24,7 +24,7 @@ from omcp.controller import (
     OPENCODE_PROVIDER_ENDPOINTS,
     canonical_codex_executable, canonical_opencode_executable,
 )
-from omcp.platform import SandboxPolicy, sandbox_command
+from omcp.platform import SandboxPolicy, host_platform, sandbox_command
 
 
 class RunnerTerminated(BaseException):
@@ -35,6 +35,10 @@ class RunnerTerminated(BaseException):
 
 class ProviderRequestError(Exception):
     """Detail-free provider failure: no remote response is retained."""
+
+
+class WorkerSandboxStartupError(RuntimeError):
+    """The worker's external sandbox could not start; no task ran."""
 
 
 class OpenCodeDiagnosticCollector:
@@ -222,6 +226,79 @@ def write_private_text(path: Path, text: str) -> None:
         os.close(fd)
     temporary.replace(path)
     os.chmod(path, 0o600)
+
+
+SANDBOX_STARTUP_PREFIXES = (
+    b"bwrap: Can't open source ",
+    b"bwrap: Can't mkdir parents ",
+    b"bwrap: No permissions to create new namespace",
+    b"bwrap: Creating new namespace failed",
+    b"bwrap: Failed to unshare",
+)
+MAX_WORKER_LOG_SCAN_BYTES = 4 * 1024 * 1024
+
+
+def probe_codex_sandbox() -> None:
+    """Fail closed unless Bubblewrap can start in the worker environment.
+
+    Codex reports a failed tool execution to the model and can still exit zero
+    after producing a final message.  A startup probe on the same host, service
+    and seccomp context makes that failure a runner failure instead of a
+    misleading successful task.
+    """
+    if host_platform() != "linux":
+        return
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        # Codex may use a different sandbox implementation when bwrap is absent.
+        return
+    true = shutil.which("true")
+    if not true:
+        raise WorkerSandboxStartupError("sandbox probe helper is unavailable")
+    command = [
+        bwrap, "--unshare-all", "--die-with-parent",
+        "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+        "--", true,
+    ]
+    try:
+        completed = subprocess.run(
+            command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, check=False, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise WorkerSandboxStartupError("sandbox startup probe failed") from None
+    if completed.returncode != 0:
+        raise WorkerSandboxStartupError("sandbox startup probe failed")
+
+
+def worker_log_has_sandbox_startup_failure(path: Path) -> bool:
+    """Detect a Bubblewrap startup failure in the bounded worker log head."""
+    try:
+        with path.open("rb") as log:
+            data = log.read(MAX_WORKER_LOG_SCAN_BYTES)
+    except OSError:
+        return False
+    for line in data.splitlines():
+        line = line.lstrip()
+        if any(line.startswith(prefix) for prefix in SANDBOX_STARTUP_PREFIXES):
+            return True
+    return False
+
+
+def required_result_present(path: Path) -> bool:
+    """True only for the non-empty result file every local worker must emit."""
+    try:
+        return path.is_file() and not path.is_symlink() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def write_failure_result(path: Path, message: str) -> None:
+    """Best-effort safe result text when the worker produced no output."""
+    try:
+        write_private_text(path, message)
+    except OSError:
+        pass
 
 
 def worker_environment(codex_home: str | None) -> dict[str, str]:
@@ -835,6 +912,20 @@ def run(spec_path: Path) -> int:
                 error_type = "WorkerTimeout" if exit_code == 124 else (
                     "OpenCodeExecutionFailed" if exit_code else None
                 )
+            elif adapter == "codex" and spec.get("sandbox_startup_probe") is True:
+                try:
+                    probe_codex_sandbox()
+                except WorkerSandboxStartupError:
+                    exit_code, error_type = 125, "SandboxStartupError"
+                    if not required_result_present(result):
+                        write_failure_result(
+                            result,
+                            "Worker sandbox failed to start; the task did not run.\n",
+                        )
+                else:
+                    with prompt.open("rb") as input_file, log.open("ab") as output:
+                        exit_code = subprocess.run(command, cwd=workspace, env=environment, stdin=input_file,
+                            stdout=output, stderr=subprocess.STDOUT, check=False, timeout=seconds).returncode
             else:
                 with prompt.open("rb") as input_file, log.open("ab") as output:
                     exit_code = subprocess.run(command, cwd=workspace, env=environment, stdin=input_file,
@@ -860,6 +951,29 @@ def run(spec_path: Path) -> int:
             elif not result.exists():
                 write_private_text(result, "OpenCode execution completed; provider output is intentionally not retained.\n"
                     if exit_code == 0 else f"OpenCode execution failed (exit {exit_code}); provider output is intentionally not retained.\n")
+        sandbox_failure = (
+            adapter == "codex" and worker_log_has_sandbox_startup_failure(log)
+        )
+        if sandbox_failure:
+            error_type = "SandboxStartupError"
+            if exit_code == 0:
+                exit_code = 125
+            if not required_result_present(result):
+                write_failure_result(
+                    result, "Worker sandbox failed to start; the task did not run.\n",
+                )
+        # result.txt is mandatory for every local worker.  A process can exit
+        # zero after its tool sandbox failed, or without emitting the requested
+        # final message; neither is a successful task.
+        if exit_code == 0 and not required_result_present(result):
+            exit_code, error_type = 125, "MissingWorkerResult"
+            write_failure_result(
+                result, "Worker exited without the required result output.\n",
+            )
+        elif exit_code != 0 and not required_result_present(result) and not sandbox_failure:
+            write_failure_result(
+                result, "Worker failed before producing a result; see task diagnostics.\n",
+            )
         record: dict[str, Any] = {
             "exit_code": exit_code, "finished_at": utc_now(), "runner_error": error_type,
         }

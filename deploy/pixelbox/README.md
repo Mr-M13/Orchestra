@@ -16,6 +16,10 @@ starts the tunnel or touches unrelated host services.
   `/opt/orchestra/current` symlink only during a separately approved
   activation. A stored full-tree digest detects later release drift;
   `--rollback` selects any validated release still on disk.
+- `config-access.sh` — sourced by `install.sh` to restore the dedicated
+  broker's traverse-only ACL after every `install -d` on `/etc/orchestra`.
+  It never grants read/list access or changes the owner, and it verifies that
+  `other` remains `---`.
 - `verify.sh` — read-only staging checks by default; `--live` makes missing or
   inactive installed services, tunnel health, platform, and exact active SHA a
   failure.
