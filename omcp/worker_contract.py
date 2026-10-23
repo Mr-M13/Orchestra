@@ -17,8 +17,6 @@ from typing import Any
 
 CONTRACT_DIR = ".orchestra-tmp"
 CONTRACT_FILE = "orchestra-completion.json"
-SECURITY_PROBE_FILE = "orchestra-security-probe.py"
-SECURITY_REPORT_FILE = "orchestra-security-probe.json"
 REQUIRED_SECURITY_CHECKS = (
     "read_orchestra_config",
     "read_orchestra_secret",
@@ -42,32 +40,15 @@ def contract_path(workspace: Path) -> Path:
     return Path(workspace) / CONTRACT_DIR / CONTRACT_FILE
 
 
-def security_probe_path(workspace: Path) -> Path:
-    return Path(workspace) / CONTRACT_DIR / SECURITY_PROBE_FILE
-
-
-def security_report_path(workspace: Path) -> Path:
-    return Path(workspace) / CONTRACT_DIR / SECURITY_REPORT_FILE
-
-
-def contract_instructions(workspace: Path, security_probe: bool) -> str:
+def contract_instructions(workspace: Path) -> str:
     path = contract_path(workspace)
-    lines = [
+    return "\n".join([
         "ORCHESTRA STRUCTURED COMPLETION CONTRACT (required):",
         f"- Before your final message, write exactly one JSON object to {path}.",
         '- Use {"status":"success"} only if every required operation completed successfully.',
         '- Use {"status":"failure","reason":"..."} if any required operation failed or was denied.',
         "- Do not write success for a partial, denied or unverified task.",
-    ]
-    if security_probe:
-        lines.extend([
-            "- Run the trusted security probe exactly as follows:",
-            f"  python3 {security_probe_path(workspace)} --worktree {Path(workspace)} "
-            f"--report {security_report_path(workspace)}",
-            "- The probe must exit 0 and record every required negative assertion as denied.",
-            "- Do not edit or bypass the probe.",
-        ])
-    return "\n".join(lines)
+    ])
 
 
 def _read_bounded_regular_file(path: Path, maximum: int) -> bytes:

@@ -857,10 +857,7 @@ def run(spec_path: Path) -> int:
     worker_diagnostic: dict[str, Any] | None = None
     completion_contract: str | None = None
     completion_contract_error: str | None = None
-    security_assertions: str | None = None
-    security_checks: list[dict[str, Any]] | None = None
     require_contract = adapter == "codex" and spec.get("require_completion_contract") is True
-    security_probe = adapter == "codex" and spec.get("security_probe") is True
     exit_code, error_type = 125, None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     def terminate(signum: int, _frame: Any) -> None: raise RunnerTerminated(signum)
@@ -917,12 +914,6 @@ def run(spec_path: Path) -> int:
                     git_read_paths,
                 )
                 environment = worker_environment(spec.get("codex_home")); environment["TMPDIR"] = str(routine_tmp)
-
-            if adapter == "codex" and security_probe:
-                probe_source = Path(__file__).with_name("routine_probe.py")
-                probe_target = worker_contract.security_probe_path(workspace)
-                shutil.copyfile(probe_source, probe_target)
-                os.chmod(probe_target, 0o600)
             if adapter == "opencode":
                 exit_code, worker_diagnostic = run_opencode_with_server(
                     server_command, command, workspace, environment, runtime_dir,
@@ -972,31 +963,6 @@ def run(spec_path: Path) -> int:
                 completion_contract_error = type(exc).__name__
             else:
                 completion_contract = contract["status"]
-        if adapter == "codex" and contract_tmp is not None and security_probe:
-            try:
-                checks = worker_contract.read_security_report(
-                    worker_contract.security_report_path(workspace),
-                )
-            except (worker_contract.SecurityAssertionError, OSError, ValueError) as exc:
-                security_assertions = "failed"
-                security_checks = [{
-                    "name": "probe",
-                    "attempted": True,
-                    "allowed": None,
-                    "error_type": type(exc).__name__,
-                }]
-            else:
-                security_assertions = "passed"
-                security_checks = [
-                    {
-                        "name": value["name"],
-                        "attempted": value["attempted"],
-                        "allowed": value["allowed"],
-                        "error_type": value["error_type"],
-                        "command": value.get("command"),
-                    }
-                    for value in checks.values()
-                ]
         if routine_tmp is not None:
             shutil.rmtree(routine_tmp, ignore_errors=True)
             if routine_tmp.exists():
@@ -1026,9 +992,6 @@ def run(spec_path: Path) -> int:
                 "TaskContractFailed" if completion_contract == "failure"
                 else "TaskContractInvalid"
             )
-        if (not sandbox_failure and exit_code == 0 and security_probe
-                and security_assertions != "passed"):
-            exit_code, error_type = 125, "SecurityAssertionFailed"
         # result.txt is mandatory for every local worker.  A process can exit
         # zero after its tool sandbox failed, or without emitting the requested
         # final message; neither is a successful task.
@@ -1048,10 +1011,6 @@ def run(spec_path: Path) -> int:
             record["completion_contract"] = completion_contract or "missing"
             if completion_contract_error is not None:
                 record["completion_contract_error"] = completion_contract_error
-        if security_probe:
-            record["security_assertions"] = security_assertions or "failed"
-            if security_checks is not None:
-                record["security_checks"] = security_checks
         if worker_diagnostic is not None:
             record["worker_diagnostic"] = worker_diagnostic
         atomic_json(completion, record)

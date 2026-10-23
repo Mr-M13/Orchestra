@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import ANY, Mock, patch
 from urllib.parse import urlparse
@@ -60,23 +61,9 @@ def codex_success_side_effect(result_path: Path, text: str = "finished"):
     return execute
 
 
-def security_probe_report(allowed_name: str | None = None) -> dict:
-    checks = []
-    for name in worker_contract.REQUIRED_SECURITY_CHECKS:
-        checks.append({
-            "name": name,
-            "attempted": True,
-            "allowed": name == allowed_name,
-            "error_type": "PermissionError",
-            "command": f"probe {name}",
-        })
-    return {"schema_version": 1, "worktree": "/tmp/workspace", "checks": checks}
-
-
 def codex_contract_fixture(
     directory: Path, *, result: str = "worker finished",
     contract: str | None = '{"status":"success"}',
-    security_report: dict | None = None,
 ) -> dict[str, str]:
     """Create a fake Codex that writes a result and optional structured files."""
     bin_dir = directory / "bin"
@@ -92,12 +79,6 @@ def codex_contract_fixture(
     ]
     if contract is not None:
         lines.append(f"printf '%s\\n' '{contract}' > \"$TMPDIR/orchestra-completion.json\"")
-    if security_report is not None:
-        lines.append('test -f "$TMPDIR/orchestra-security-probe.py" || exit 2')
-        payload = json.dumps(security_report, separators=(",", ":"))
-        lines.append(
-            f"printf '%s\\n' '{payload}' > \"$TMPDIR/orchestra-security-probe.json\""
-        )
     lines.append("exit 0")
     executable.write_text("\n".join(lines) + "\n")
     executable.chmod(0o700)
@@ -147,8 +128,6 @@ class ControllerTests(unittest.TestCase):
         }
         if task.get("requires_completion_contract"):
             record["completion_contract"] = "success" if exit_code == 0 else "failure"
-        if task.get("requires_security_assertions"):
-            record["security_assertions"] = "passed" if exit_code == 0 else "failed"
         Path(task["completion_path"]).write_text(json.dumps(record))
 
     def test_submission_is_durable_acknowledged_and_idempotent(self):
@@ -520,7 +499,7 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue((self.root / "tests").is_dir())
         prompt = (self.state / "tasks" / submitted["task_id"] / "prompt.txt").read_text()
         self.assertIn("ORCHESTRA STRUCTURED COMPLETION CONTRACT", prompt)
-        self.assertIn("orchestra-security-probe.py", prompt)
+        self.assertNotIn("orchestra-security-probe", prompt)
         audit = (self.state / "audit.jsonl").read_text()
         self.assertIn('"authorization_mode":"standing"', audit)
         self.assertNotIn("Change local code and run tests", audit)
@@ -784,17 +763,89 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(reconciled["status"], "failed")
         self.assertEqual(reconciled["failure"], {"type": "TaskContractFailed"})
 
-    def test_security_assertion_failure_is_reconciled_as_failed(self):
-        submitted = self.submit("security-assertion")
+    def _standing_completion(self, request_id: str):
+        submitted = self.submit(request_id)
         task = self.controller.state["tasks"][submitted["task_id"]]
         task["requires_security_assertions"] = True
-        Path(task["result_path"]).write_text("probe reported an allowed assertion\n")
+        (self.root / ".orchestra-tmp").mkdir(exist_ok=True)
+        Path(task["result_path"]).write_text("worker diagnostic\n")
         Path(task["completion_path"]).write_text(json.dumps({
             "exit_code": 0, "finished_at": "2026-10-11T00:00:00+00:00",
             "runner_error": None, "completion_contract": "success",
-            "security_assertions": "failed",
         }))
-        self.controller.reconcile()
+        return submitted, task
+
+    @staticmethod
+    def _trusted_checks():
+        return {
+            name: {
+                "name": name, "attempted": True, "allowed": False,
+                "error_type": "PermissionError", "command": "probe " + name,
+            }
+            for name in worker_contract.REQUIRED_SECURITY_CHECKS
+        }
+
+    def test_worker_cannot_forge_trusted_security_evidence(self):
+        actions = ("replace-probe", "delete-probe", "fabricate-report", "edit-report", "skip-probe")
+        for action in actions:
+            with self.subTest(action=action):
+                self.controller.close()
+                self.controller = TaskController(
+                    self.config, popen=self.popen,
+                    workspace_preparer=lambda *_: self.root,
+                    id_factory=lambda: str(uuid.uuid4()),
+                )
+                contract_dir = self.root / ".orchestra-tmp"
+                if contract_dir.exists():
+                    for child in contract_dir.iterdir():
+                        if child.is_file():
+                            child.unlink()
+                submitted, task = self._standing_completion("adversarial-" + action)
+                probe = self.root / ".orchestra-tmp/orchestra-security-probe.py"
+                report = self.root / ".orchestra-tmp/orchestra-security-probe.json"
+                if action == "replace-probe":
+                    probe.write_text("fake probe\n")
+                elif action == "delete-probe":
+                    probe.unlink(missing_ok=True)
+                elif action == "fabricate-report":
+                    report.write_text(json.dumps({"schema_version": 1, "checks": []}))
+                elif action == "edit-report":
+                    report.write_text(json.dumps({"schema_version": 1, "checks": []}))
+                    report.write_text(json.dumps({"schema_version": 1, "checks": []}) + " ")
+                with patch(
+                    "omcp.controller.trusted_probe.run_trusted_security_probe",
+                    side_effect=RuntimeError("trusted probe failed"),
+                ) as verify:
+                    self.controller.reconcile()
+                verify.assert_called_once()
+                reconciled = self.controller.state["tasks"][submitted["task_id"]]
+                self.assertEqual(reconciled["status"], "failed")
+                self.assertEqual(reconciled["failure"], {"type": "SecurityAssertionFailed"})
+                self.assertEqual(reconciled["security_assertions"], "failed")
+
+    def test_trusted_security_evidence_success_marks_task_succeeded(self):
+        submitted, task = self._standing_completion("trusted-success")
+        with patch(
+            "omcp.controller.trusted_probe.run_trusted_security_probe",
+            return_value=self._trusted_checks(),
+        ) as verify:
+            self.controller.reconcile()
+        verify.assert_called_once()
+        reconciled = self.controller.state["tasks"][submitted["task_id"]]
+        self.assertEqual(reconciled["status"], "succeeded")
+        self.assertEqual(reconciled["security_assertions"], "passed")
+        self.assertEqual(
+            {item["name"] for item in reconciled["security_checks"]},
+            set(worker_contract.REQUIRED_SECURITY_CHECKS),
+        )
+
+    def test_unexpectedly_allowed_trusted_assertion_fails_task(self):
+        submitted, task = self._standing_completion("trusted-allowed")
+        with patch(
+            "omcp.controller.trusted_probe.run_trusted_security_probe",
+            side_effect=ValueError("security probe allowed read_orchestra_config"),
+        ):
+            self.controller.reconcile()
         reconciled = self.controller.state["tasks"][submitted["task_id"]]
         self.assertEqual(reconciled["status"], "failed")
         self.assertEqual(reconciled["failure"], {"type": "SecurityAssertionFailed"})
@@ -2331,7 +2382,7 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(record["exit_code"], 0)
             self.assertEqual((root / "result").read_text(), "read-only canary completed\n")
 
-    def _contract_spec(self, root: Path, *, security: bool = False) -> Path:
+    def _contract_spec(self, root: Path) -> Path:
         prompt = root / "prompt"
         prompt.write_text("task")
         spec = root / "spec.json"
@@ -2342,7 +2393,6 @@ class RunnerTests(unittest.TestCase):
             "completion_path": str(root / "completion"),
             "codex_home": None,
             "require_completion_contract": True,
-            "security_probe": security,
         }))
         return spec
 
@@ -2381,48 +2431,6 @@ class RunnerTests(unittest.TestCase):
             record = json.loads((root / "completion").read_text())
             self.assertEqual(record["runner_error"], "TaskContractInvalid")
             self.assertEqual(record["completion_contract"], "invalid")
-
-    def test_runner_security_probe_denial_is_required(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            spec = self._contract_spec(root, security=True)
-            fixture = codex_contract_fixture(
-                root, security_report=security_probe_report(),
-            )
-            with patch.dict(os.environ, fixture, clear=True):
-                self.assertEqual(run_worker(spec), 0)
-            record = json.loads((root / "completion").read_text())
-            self.assertEqual(record["completion_contract"], "success")
-            self.assertEqual(record["security_assertions"], "passed")
-            self.assertEqual(
-                {item["name"] for item in record["security_checks"]},
-                set(worker_contract.REQUIRED_SECURITY_CHECKS),
-            )
-
-    def test_runner_security_probe_allowed_assertion_fails(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            spec = self._contract_spec(root, security=True)
-            fixture = codex_contract_fixture(
-                root,
-                result="required filesystem operation was denied",
-                security_report=security_probe_report("read_orchestra_config"),
-            )
-            with patch.dict(os.environ, fixture, clear=True):
-                self.assertEqual(run_worker(spec), 125)
-            record = json.loads((root / "completion").read_text())
-            self.assertEqual(record["runner_error"], "SecurityAssertionFailed")
-            self.assertEqual(record["security_assertions"], "failed")
-
-    def test_runner_missing_security_report_fails(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            spec = self._contract_spec(root, security=True)
-            fixture = codex_contract_fixture(root)
-            with patch.dict(os.environ, fixture, clear=True):
-                self.assertEqual(run_worker(spec), 125)
-            record = json.loads((root / "completion").read_text())
-            self.assertEqual(record["runner_error"], "SecurityAssertionFailed")
 
     def test_runner_passes_only_explicitly_permitted_environment(self):
         with tempfile.TemporaryDirectory() as directory:

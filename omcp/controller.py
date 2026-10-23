@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from omcp import worker_contract
+from omcp import trusted_probe, worker_contract
 from omcp.platform import (
     SandboxPolicy, canonical_git_executable, default_opencode_executable,
     describe_sandbox, host_platform, sandbox_command,
@@ -1613,9 +1613,30 @@ class TaskController:
                         and result.get("completion_contract") != "success"):
                     exit_code = 125
                     runner_error = result.get("completion_contract_error") or "TaskContractFailed"
-                if (exit_code == 0 and task.get("requires_security_assertions")
-                        and result.get("security_assertions") != "passed"):
-                    exit_code, runner_error = 125, "SecurityAssertionFailed"
+                if exit_code == 0 and task.get("requires_security_assertions"):
+                    workspace = task.get("workspace")
+                    try:
+                        if not isinstance(workspace, str):
+                            raise RuntimeError("task workspace is unavailable")
+                        checks = trusted_probe.run_trusted_security_probe(
+                            Path(workspace), self.config.state_dir, task["task_id"],
+                        )
+                    except Exception as exc:
+                        exit_code, runner_error = 125, "SecurityAssertionFailed"
+                        task["security_assertions"] = "failed"
+                        task["security_error"] = type(exc).__name__
+                    else:
+                        task["security_assertions"] = "passed"
+                        task["security_checks"] = [
+                            {
+                                "name": value["name"],
+                                "attempted": value["attempted"],
+                                "allowed": value["allowed"],
+                                "error_type": value["error_type"],
+                                "command": value.get("command"),
+                            }
+                            for value in checks.values()
+                        ]
                 cancelled = task["status"] == "cancel_requested"
                 self._release_reservation(task, result["finished_at"])
                 task.update({
@@ -1800,9 +1821,7 @@ class TaskController:
                 "or Orchestra authority.\n\n" + task["instructions"] + "\n"
             )
             if worker.adapter == "codex":
-                prompt_text += "\n\n" + worker_contract.contract_instructions(
-                    workspace, execution_capabilities is not None,
-                )
+                prompt_text += "\n\n" + worker_contract.contract_instructions(workspace)
             prompt_path.write_text(prompt_text)
             os.chmod(prompt_path, 0o600)
             spec: dict[str, Any] = {
@@ -1814,9 +1833,6 @@ class TaskController:
                 # starting it so a startup failure cannot become a false success.
                 "sandbox_startup_probe": worker.adapter == "codex",
                 "require_completion_contract": worker.adapter == "codex",
-                "security_probe": (
-                    worker.adapter == "codex" and execution_capabilities is not None
-                ),
                 "provider": worker.provider,
                 "model": worker.model,
                 "credential_file": worker.credential_file,

@@ -149,8 +149,10 @@ writable or create paths outside the task worktree.
 
 Every local Codex task must emit a structured `.orchestra-tmp/completion.json`
 contract; natural-language output is not used to decide success. Standing
-routine tasks also execute a trusted security probe that actually attempts the
-required negative assertions and records structured evidence. See
+routine tasks are also verified by a coordinator-controlled security probe.
+The probe and its report live under coordinator state, outside worker-writable
+paths; the coordinator runs it in a separate transient sandbox with the same
+confinement properties as the routine worker. See
 [OMCP standing authorization](OMCP.md#standing-authorization).
 
 ## 4. GitHub Actions worker setup

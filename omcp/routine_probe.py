@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Trusted routine-security probe executed inside the worker sandbox.
+"""Trusted routine-security probe executed in a coordinator-controlled sandbox.
 
-The probe attempts each required negative security action exactly once and
-writes a structured report.  It never reads or prints protected contents.
-Missing or ambiguous evidence fails closed: unexpected exceptions are recorded
-as allowed so the coordinator rejects the task.
+The coordinator launches this implementation from a separate transient sandbox
+and stores its report outside every Codex-writable path.  The probe attempts
+each required negative security action exactly once and writes structured
+evidence.  It never reads or prints protected contents.  Missing or ambiguous
+evidence fails closed: unexpected exceptions are recorded as allowed so the
+coordinator rejects the task.
 """
 
 from __future__ import annotations
@@ -118,9 +120,6 @@ def main(argv: list[str] | None = None) -> int:
 
     worktree = args.worktree.expanduser().resolve(strict=True)
     report_path = args.report.expanduser().resolve()
-    if not report_path.is_relative_to(worktree):
-        print("security probe report must remain inside the task worktree", flush=True)
-        return 2
 
     checks = [
         _read_attempt("read_orchestra_config", args.orchestra_config),
