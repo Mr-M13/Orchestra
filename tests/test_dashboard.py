@@ -35,6 +35,15 @@ class FakeOMCP:
         raise AssertionError(tool)
 
 
+class FakeApproval:
+    def __init__(self):
+        self.calls = []
+
+    def resolve(self, task_id, decision, reason):
+        self.calls.append((task_id, decision, reason))
+        return {"task_id": task_id, "status": "accepted"}
+
+
 def request(app, path="/", method="GET", form="", content_length=None, body=None):
     environ = {}; setup_testing_defaults(environ); environ.update({"PATH_INFO": path, "REQUEST_METHOD": method, "CONTENT_LENGTH": str(len(form)) if content_length is None else content_length, "wsgi.input": body or io.BytesIO(form.encode())})
     seen = {}; body = b"".join(app(environ, lambda status, headers: seen.update(status=status, headers=dict(headers)))).decode()
@@ -69,6 +78,7 @@ class DashboardTests(unittest.TestCase):
         arguments = client.calls[-1][1]
         self.assertEqual(arguments["consequence_class"], "routine_development")
         self.assertEqual(arguments["request_id"], request_id)
+        self.assertNotIn("requires_approval", arguments)
 
     def test_invalid_csrf_cannot_submit_or_cancel(self):
         client = FakeOMCP(); app = Dashboard(client)
@@ -93,6 +103,23 @@ class DashboardTests(unittest.TestCase):
         seen, _ = request(app, "/tasks/" + TASK_ID + "/cancel", "POST", f"csrf={app.csrf_token}&reason=Stop")
         self.assertTrue(seen["status"].startswith("303"))
         self.assertEqual(client.calls[-1], ("cancel_task", {"task_id": TASK_ID, "reason": "Stop"}))
+
+    def test_dashboard_approval_uses_only_configured_local_approval_client(self):
+        client = FakeOMCP(); client.task["status"] = "approval_required"
+        approval = FakeApproval(); app = Dashboard(client, approval)
+        _, page = request(app, "/tasks/" + TASK_ID)
+        self.assertIn("Approve", page)
+        form = f"csrf={app.csrf_token}&decision=approve&reason=Owner+reviewed"
+        seen, _ = request(app, "/tasks/" + TASK_ID + "/approval", "POST", form)
+        self.assertTrue(seen["status"].startswith("303"))
+        self.assertEqual(approval.calls, [(TASK_ID, "approve", "Owner reviewed")])
+
+    def test_unconfigured_dashboard_cannot_resolve_approval(self):
+        client = FakeOMCP(); client.task["status"] = "approval_required"; app = Dashboard(client)
+        seen, page = request(app, "/tasks/" + TASK_ID)
+        self.assertIn("configured local approval interface", page)
+        seen, _ = request(app, "/tasks/" + TASK_ID + "/approval", "POST", "")
+        self.assertTrue(seen["status"].startswith("404"))
 
     def test_malformed_task_ids_are_not_sent_to_omcp(self):
         for path, method in (("/tasks/not-a-task", "GET"), ("/tasks/not-a-task/cancel", "POST"), ("/tasks/" + "A" * 36, "GET")):

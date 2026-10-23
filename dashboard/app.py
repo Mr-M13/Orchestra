@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs
 
-from dashboard.omcp import OMCPClient, OMCPError
+from dashboard.omcp import LocalApprovalClient, OMCPClient, OMCPError
 
 
 ACTIVE = {"starting", "running", "accepted", "approval_required", "cancel_requested"}
@@ -58,8 +58,10 @@ def state_badge(status: Any) -> str:
 class Dashboard:
     """A WSGI app whose routes map to explicit OMCP operations only."""
 
-    def __init__(self, client: Any, static_root: Path | None = None) -> None:
+    def __init__(self, client: Any, approval_client: Any | None = None,
+                 static_root: Path | None = None) -> None:
         self.client = client
+        self.approval_client = approval_client
         self.static_root = static_root or Path(__file__).with_name("static")
         self.csrf_token = secrets.token_urlsafe(32)
 
@@ -67,6 +69,7 @@ class Dashboard:
         path = environ.get("PATH_INFO", "/")
         method = environ.get("REQUEST_METHOD", "GET")
         cancel_match = re.fullmatch(r"/tasks/(" + TASK_ID_RE.pattern + r")/cancel", path)
+        approval_match = re.fullmatch(r"/tasks/(" + TASK_ID_RE.pattern + r")/approval", path)
         task_match = re.fullmatch(r"/tasks/(" + TASK_ID_RE.pattern + r")", path)
         try:
             if path == "/static/dashboard.css" and method == "GET":
@@ -79,6 +82,8 @@ class Dashboard:
                 return self.submit(environ, start_response)
             if cancel_match and method == "POST":
                 return self.cancel(cancel_match.group(1), environ, start_response)
+            if approval_match and method == "POST":
+                return self.resolve_approval(approval_match.group(1), environ, start_response)
             if task_match and method == "GET":
                 return self._page(start_response, self.task_detail(task_match.group(1)))
             return self._page(start_response, self.layout("Not found", "<p>That page does not exist.</p>"), HTTPStatus.NOT_FOUND)
@@ -142,7 +147,13 @@ class Dashboard:
         details = "".join(f"<dt>{esc(name)}</dt><dd>{value if name in {'Created', 'Started', 'Completed'} else esc(value or '—')}</dd>" for name, value in fields)
         output = "" if result is None else f'<section><h2>Final result</h2><pre>{esc(result.get("result") or task.get("failure") or "No result supplied.")}</pre></section>'
         cancel = "" if task.get("status") not in ACTIVE else f'<form method="post" action="/tasks/{esc(task_id)}/cancel"><input type="hidden" name="csrf" value="{esc(self.csrf_token)}"><input type="hidden" name="reason" value="Cancelled from dashboard"><button class="danger">Cancel task</button></form>'
-        return self.layout(str(task.get("title", "Task")), f'<a class="back" href="/">← Dashboard</a><section class="panel"><h1>{esc(task.get("title"))}</h1>{state_badge(task.get("status"))}<dl>{details}</dl>{cancel}</section><section><h2>Security</h2>{evidence}</section>{output}')
+        approval_controls = ""
+        if task.get("status") == "approval_required":
+            if self.approval_client is None:
+                approval_controls = "<section><h2>Approval</h2><p>Approval is available only from the configured local approval interface.</p></section>"
+            else:
+                approval_controls = f'<section class="panel"><h2>Approval required</h2><form method="post" action="/tasks/{esc(task_id)}/approval"><input type="hidden" name="csrf" value="{esc(self.csrf_token)}"><label>Reason<input name="reason" maxlength="1000" required></label><button name="decision" value="approve" type="submit">Approve</button><button class="danger" name="decision" value="reject" type="submit">Reject</button></form></section>'
+        return self.layout(str(task.get("title", "Task")), f'<a class="back" href="/">← Dashboard</a><section class="panel"><h1>{esc(task.get("title"))}</h1>{state_badge(task.get("status"))}<dl>{details}</dl>{cancel}</section>{approval_controls}<section><h2>Security</h2>{evidence}</section>{output}')
 
     def new_task(self, error: str = "") -> str:
         status = self.client.call("bridge_status")
@@ -178,7 +189,7 @@ class Dashboard:
         if (not title or not instructions or len(title) > 200 or "\n" in title
                 or not re.fullmatch(r"dashboard-[0-9a-f]{32}", request_id)):
             return self._page(start_response, self.new_task("Enter a single-line title and instructions."), HTTPStatus.BAD_REQUEST)
-        acknowledgement = self.client.call("submit_task", {"request_id": request_id, "title": title, "instructions": instructions, "worker": form.get("worker", ""), "repository_profile": form.get("repository_profile", ""), "consequence_class": "routine_development", "requires_approval": True})
+        acknowledgement = self.client.call("submit_task", {"request_id": request_id, "title": title, "instructions": instructions, "worker": form.get("worker", ""), "repository_profile": form.get("repository_profile", ""), "consequence_class": "routine_development"})
         return self._page(start_response, self.layout("Task submitted", f'<section class="panel"><h1>Task submitted</h1><p>{state_badge(acknowledgement.get("status"))}</p><p><a href="/tasks/{esc(acknowledgement.get("task_id"))}">View task {esc(acknowledgement.get("task_id"))}</a></p></section>'))
 
     def cancel(self, task_id: str, environ: dict[str, Any], start_response: Callable[..., Any]) -> list[bytes]:
@@ -189,15 +200,34 @@ class Dashboard:
         start_response("303 See Other", [("Location", f"/tasks/{task_id}"), ("Cache-Control", "no-store")])
         return [b""]
 
+    def resolve_approval(self, task_id: str, environ: dict[str, Any], start_response: Callable[..., Any]) -> list[bytes]:
+        if self.approval_client is None:
+            return self._page(start_response, self.layout("Unavailable", "<p>Approval is unavailable.</p>"), HTTPStatus.NOT_FOUND)
+        form = self._form(environ)
+        if not secrets.compare_digest(form.get("csrf", ""), self.csrf_token):
+            return self._page(start_response, self.layout("Request rejected", "<p>Invalid form request.</p>"), HTTPStatus.FORBIDDEN)
+        decision, reason = form.get("decision", ""), form.get("reason", "").strip()
+        if decision not in {"approve", "reject"} or not reason or len(reason) > 1_000:
+            return self._page(start_response, self.layout("Request rejected", "<p>Enter an approval reason.</p>"), HTTPStatus.BAD_REQUEST)
+        self.approval_client.resolve(task_id, decision, reason)
+        start_response("303 See Other", [("Location", f"/tasks/{task_id}"), ("Cache-Control", "no-store")])
+        return [b""]
+
 
 def main() -> None:
     from wsgiref.simple_server import make_server
     socket_path = os.environ.get("ORCHESTRA_OMCP_SOCKET", "/run/user/1000/orchestra/omcp.sock")
+    approval_state_dir = os.environ.get("ORCHESTRA_DASHBOARD_APPROVAL_STATE_DIR")
+    approver_identity = os.environ.get("ORCHESTRA_DASHBOARD_APPROVER_IDENTITY")
     host = os.environ.get("ORCHESTRA_DASHBOARD_HOST", "127.0.0.1")
     port = int(os.environ.get("ORCHESTRA_DASHBOARD_PORT", "8081"))
     if host not in {"127.0.0.1", "::1", "localhost"}:
         raise SystemExit("dashboard must bind to loopback; use the approved private access layer")
-    with make_server(host, port, Dashboard(OMCPClient(socket_path))) as server:
+    if bool(approval_state_dir) != bool(approver_identity):
+        raise SystemExit("dashboard approval requires both state directory and approver identity")
+    approval_client = (LocalApprovalClient(approval_state_dir, approver_identity)
+                       if approval_state_dir else None)
+    with make_server(host, port, Dashboard(OMCPClient(socket_path), approval_client)) as server:
         server.serve_forever()
 
 

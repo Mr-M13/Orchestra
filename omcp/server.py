@@ -52,10 +52,6 @@ TOOLS = [
                 "default": "unclassified",
                 "description": "Declared consequence class. In required mode only owner-configured routine_development scopes may use standing authorization; disabled mode automatically authorizes all valid classes.",
             },
-            "requires_approval": {
-                "type": "boolean", "default": True,
-                "description": "Compatibility marker. Owner-only server configuration decides whether task approval is required.",
-            },
         }, ["request_id", "title", "instructions", "worker", "repository_profile"]),
     },
     {
@@ -122,7 +118,7 @@ class MCPServer:
             "bridge_status": lambda _: controller.bridge_status(),
             "submit_task": lambda value: controller.submit_task(
                 value.get("request_id"), value.get("title"), value.get("instructions"),
-                value.get("worker"), value.get("requires_approval", True), value.get("repository_profile"),
+                value.get("worker"), True, value.get("repository_profile"),
                 value.get("consequence_class", "unclassified"),
             ),
             "submit_host_operation": lambda value: controller.submit_host_operation(

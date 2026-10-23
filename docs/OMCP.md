@@ -240,7 +240,7 @@ Use Python 3.11 or newer and a current Codex CLI. Create a state directory outsi
   "max_worker_seconds": 1800,
   "max_parallel_tasks": 2,
   "startup_lease_seconds": 30,
-  "task_approval_mode": "required",
+  "task_approval_mode": "disabled",
   "standing_authorizations": [
     {
       "id": "routine-development-v1",

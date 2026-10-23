@@ -650,6 +650,35 @@ class ControllerTests(unittest.TestCase):
         audit = (self.state / "audit.jsonl").read_text()
         self.assertIn('"authorization_mode":"explicit"', audit)
 
+    def test_disabled_approval_policy_runs_routine_coding_without_manual_approval(self):
+        self.controller.close()
+        self.controller = TaskController(
+            Config(
+                "owner/repo", self.root, self.state, "origin/main",
+                {"ina": Worker("ina", ("codex",))},
+                Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+                task_approval_mode="disabled",
+            ),
+            popen=self.popen, workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: "11111111-1111-1111-1111-111111111111",
+        )
+        submitted = self.controller.submit_task(
+            "routine-coding", "Adjust CSS", "Update the stylesheet and tests", "ina",
+            True, "default", "routine_development",
+        )
+        self.assertEqual(submitted["status"], "running")
+        self.assertEqual(submitted["authorization"]["mode"], "automatic")
+        self.assertEqual(submitted["approval"]["status"], "not_required")
+        self.assertEqual(self.controller.list_approvals()["approvals"], [])
+        self.popen.assert_called_once()
+        self.complete(submitted["task_id"], result="routine task completed")
+        self.controller.reconcile()
+        self.assertEqual(self.controller.task_status(submitted["task_id"])["status"], "succeeded")
+        self.assertEqual(
+            self.controller.task_result(submitted["task_id"])["result"],
+            "routine task completed",
+        )
+
     def test_disabled_approval_policy_releases_existing_pending_request(self):
         submitted = self.controller.submit_task(
             "pending-before-policy-change", "Queued work", "Perform bounded work", "ina",
@@ -2945,7 +2974,7 @@ class ServerLifecycleTests(unittest.TestCase):
         )
         self.assertNotIn("command", host_schema["properties"])
         self.assertNotIn("arguments", host_schema["properties"])
-        self.assertNotIn("const", schema["properties"]["requires_approval"])
+        self.assertNotIn("requires_approval", schema["properties"])
 
     def test_multi_repository_health_and_submission_scope_through_mcp(self):
         archive = Path(self.temp.name) / "archive"

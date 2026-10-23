@@ -611,7 +611,7 @@ class DeploymentAssetTests(unittest.TestCase):
         self.assertEqual(set(example["workers"]), {
             "ina-codex", "hamed-codex", "deepseek-primary", "deepseek-secondary",
         })
-        self.assertEqual(example["task_approval_mode"], "required")
+        self.assertEqual(example["task_approval_mode"], "disabled")
         self.assertEqual(example["local_worker_launcher"], "systemd-user")
         self.assertNotEqual(
             Path(example["state_dir"]), Path(example["project_root"]),

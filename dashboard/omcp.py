@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import socket
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,31 @@ from typing import Any
 
 class OMCPError(RuntimeError):
     """The dashboard-safe description of an OMCP communication failure."""
+
+
+class LocalApprovalClient:
+    """Use only OMCP's owner-only local approval capability, server-side."""
+
+    def __init__(self, state_dir: str, approver_identity: str) -> None:
+        path = Path(state_dir)
+        if not path.is_absolute():
+            raise ValueError("approval state directory must be absolute")
+        if not re.fullmatch(r"local:dashboard:[A-Za-z0-9_.-]{1,64}", approver_identity):
+            raise ValueError("dashboard approver identity must be a local dashboard identity")
+        self.state_dir = path
+        self.approver_identity = approver_identity
+
+    def resolve(self, task_id: str, decision: str, reason: str) -> dict[str, Any]:
+        if decision not in {"approve", "reject"}:
+            raise OMCPError("invalid approval decision")
+        try:
+            from omcp.local_control import approval_request
+            return approval_request(self.state_dir, {
+                "action": "resolve", "task_id": task_id, "decision": decision,
+                "reason": reason, "approver_identity": self.approver_identity,
+            })
+        except (OSError, RuntimeError, ValueError, PermissionError) as exc:
+            raise OMCPError("local approval is unavailable") from exc
 
 
 class OMCPClient:
