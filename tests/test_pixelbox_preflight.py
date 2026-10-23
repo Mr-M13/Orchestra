@@ -257,7 +257,7 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
         self.assertEqual(set(example["workers"]), {
             "ina-codex", "hamed-codex", "deepseek-primary", "deepseek-secondary",
         })
-        self.assertEqual(example["task_approval_mode"], "required")
+        self.assertEqual(example["task_approval_mode"], "disabled")
         for worker in example["workers"].values():
             self.assertNotIn("github_dispatch_socket", worker)
             self.assertNotIn("github_service_uid", worker)

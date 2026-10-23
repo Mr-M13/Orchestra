@@ -5,7 +5,7 @@ authority:
 
 | Policy | Current status | Effect |
 | --- | --- | --- |
-| OMCP worker task approval | **Active when the owner-managed configuration sets `task_approval_mode` to `disabled`.** | An otherwise-valid `routine_development` task is automatically authorised and queued without a per-task approval prompt. |
+| OMCP worker task approval | **Routine development is automatic in the reviewed PixelBox configuration (`task_approval_mode: "disabled"`).** | An otherwise-valid local coding, CSS, test, documentation or PR-preparation task declared `routine_development` is automatically authorised and queued without a per-task approval prompt. |
 | Automatic merge and deployment | **Proposed; not active.** Implementation is being developed in OMCP task `ecae5369-8d70-4ff7-b97c-513bc7c7e763`. It has not been independently verified, merged, deployed or enabled. | No task may currently infer authority to merge or deploy. The eligibility and operating rules below describe the intended policy, not current capability. |
 
 Worker completion, merge, deployment and verified production health are
@@ -32,7 +32,8 @@ of those controls rejects it.
 
 This setting does not authorize production deployment, destructive operations,
 security changes or unclassified work; those task classes remain in
-`approval_required`. It also does not grant Git write, push, merge, deployment, credential
+`approval_required`. Direct DeepSeek tasks and all host operations also remain
+explicitly approved. It also does not grant Git write, push, merge, deployment, credential
 or machine-wide authority to a worker. A successful worker result means only
 that the isolated worker process completed successfully.
 

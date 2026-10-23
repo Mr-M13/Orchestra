@@ -259,8 +259,9 @@ credential, config, socket, service activation or cutover.
 Start from `deploy/pixelbox/omcp.example.json` and adjust paths and IDs. Minimum
 production settings:
 
-- `task_approval_mode: "required"` until the owner explicitly accepts a broader
-  policy;
+- `task_approval_mode: "disabled"` for automatic `routine_development` work;
+  protected consequence classes, direct DeepSeek work and host operations remain
+  explicitly approved;
 - `max_parallel_tasks: 2` initially;
 - `sandbox_backend: "bubblewrap"` on PixelBox;
 - `local_worker_launcher: "systemd-user"` on PixelBox so local Codex workers
@@ -617,8 +618,9 @@ of the following evidence is recorded:
 5. The dedicated tunnel profile passes `tunnel-client doctor` and `/readyz`.
 6. ChatGPT discovers all nine OMCP tools and `bridge_status` reports
    `platform=linux`, `sandbox.backend=bubblewrap`, and the expected workers.
-7. An unclassified harmless task remains `approval_required`; approving it
-   locally runs it and returns a terminal result.
+7. A harmless `routine_development` local Codex task starts without approval
+   and returns a terminal result. An unclassified harmless task remains
+   `approval_required`; approving it locally runs it and returns a terminal result.
 8. Idempotent replay returns the same task ID.
 9. A queued task and a running task both cancel terminally; a remote run is
    cancelled in GitHub.

@@ -19,6 +19,25 @@ Do not expose its port publicly, put OMCP credentials in the browser, or alter
 OMCP, tunnel, Docker, Nextcloud, Tailscale, firewall, or systemd configuration
 as part of this dashboard checkout.
 
+## High-risk approval decisions
+
+Routine-development work follows OMCP's configured automatic policy. Protected
+tasks remain pending. To display working Approve and Reject controls, start the
+dashboard only as the trusted local approver with both values below configured
+by its owner-controlled service launcher:
+
+```sh
+ORCHESTRA_DASHBOARD_APPROVAL_STATE_DIR=/owner-only/omcp-state
+ORCHESTRA_DASHBOARD_APPROVER_IDENTITY=local:dashboard:owner
+```
+
+The dashboard then calls the existing owner-only local approval socket and
+capability token server-side. It never exposes that token to a browser and does
+not add an OMCP approval RPC. Do not enable these values unless the dashboard is
+behind an independently authenticated private access boundary; it deliberately
+does not trust forwarded identity headers. Without both values, approvals are
+read-only and remain available through OMCP's existing local approval interface.
+
 ## V1 integration gaps
 
 OMCP's published responses do not include the current task title in
@@ -29,5 +48,5 @@ The smallest future addition would be a read-only `task_submission_preview`
 tool accepting the same bounded submit fields and returning only the server's
 policy decision and structured execution capabilities.
 
-OMCP exposes approvals as read-only here: approval resolution stays on its
-existing local human approval channel.
+OMCP exposes no network approval RPC. Dashboard controls, when explicitly
+configured as above, use the existing local human approval channel.
