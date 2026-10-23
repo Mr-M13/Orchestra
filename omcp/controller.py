@@ -1620,6 +1620,11 @@ class TaskController:
                             raise RuntimeError("task workspace is unavailable")
                         checks = trusted_probe.run_trusted_security_probe(
                             Path(workspace), self.config.state_dir, task["task_id"],
+                            tuple(task.get("routine_writable_paths", ())),
+                            tuple(task.get("routine_read_only_paths", ())),
+                            read_write_paths=tuple(
+                                task.get("routine_read_write_paths", ())
+                            ),
                         )
                     except Exception as exc:
                         exit_code, runner_error = 125, "SecurityAssertionFailed"
@@ -1775,11 +1780,22 @@ class TaskController:
                 and profile.local_worker_git_mode == "fetch",
             )
             execution_capabilities = task.get("execution_capabilities")
+            writable_paths: list[str] = []
             if execution_capabilities is not None:
                 writable_paths = execution_capabilities.get("writable_paths")
                 if not isinstance(writable_paths, list):
                     raise RuntimeError("standing task is missing its writable paths")
                 materialize_writable_paths(workspace, writable_paths)
+            probe_root: Path | None = None
+            if worker.adapter == "codex" and execution_capabilities is not None:
+                probe_root, _, _ = trusted_probe.prepare_probe_root(
+                    self.config.state_dir, task_id,
+                )
+            read_only_paths: list[str] = []
+            if worker.adapter == "codex":
+                read_only_paths.append(str(profile.project_root))
+                if probe_root is not None:
+                    read_only_paths.append(str(probe_root))
             source_sha: str | None = None
             if worker.adapter == "github_actions":
                 source_code, source_sha = self._git(
@@ -1847,8 +1863,8 @@ class TaskController:
                 # A linked worktree's .git file points outside the workspace.
                 # Routine Codex may read the owner checkout (never write it) so
                 # Git can resolve its own read-only metadata.
-                "git_read_paths": ([str(profile.project_root)]
-                                   if worker.adapter == "codex" else []),
+                "git_read_paths": read_only_paths,
+                "read_only_paths": read_only_paths,
                 "task_id": task_id,
                 "request_id": task["request_id"],
                 "lease_id": task["startup_lease"]["lease_id"],
@@ -1876,6 +1892,12 @@ class TaskController:
                 "requires_security_assertions": (
                     worker.adapter == "codex" and execution_capabilities is not None
                 ),
+                "routine_writable_paths": writable_paths,
+                "routine_read_only_paths": read_only_paths,
+                "routine_read_write_paths": [
+                    str(workspace), *[str(path) for path in git_metadata_paths],
+                ],
+                "security_probe_root": str(probe_root) if probe_root is not None else None,
             })
             if worker.adapter == "github_actions":
                 assert source_sha is not None

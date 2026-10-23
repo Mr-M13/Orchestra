@@ -25,6 +25,7 @@ from omcp.controller import (
     canonical_codex_executable, canonical_opencode_executable,
 )
 from omcp import worker_contract
+from omcp.routine_policy import RoutineConfinementPolicy
 from omcp.platform import SandboxPolicy, host_platform, sandbox_command
 
 
@@ -326,40 +327,14 @@ def opencode_environment(runtime_dir: Path) -> dict[str, str]:
 
 
 def routine_command(executable: str, workspace: Path, result_path: Path,
-                    writable_paths: list[str], git_read_paths: list[str] | None = None) -> list[str]:
-    if not all(isinstance(value, str) and value and all(
-            part and part.replace("_", "").replace("-", "").isalnum() for part in Path(value).parts)
-            for value in writable_paths):
-        raise ValueError("invalid routine writable paths")
-    git_reads = list(git_read_paths or [])
-    if not all(isinstance(value, str) and Path(value).is_absolute()
-               and not any(character.isspace() or character in {'"', "\n", "\r", "{", "}", "="}
-                           for character in value)
-               for value in git_reads):
-        raise ValueError("invalid routine Git read paths")
-    rules = ','.join(['"."="read"', '".orchestra-tmp"="write"',
-                      *(f'"{value}"="write"' for value in writable_paths)])
-    git_rules: list[str] = []
-    for value in git_reads:
-        git_rules.extend([
-            "--config", f'permissions.orchestra-routine.filesystem.{value}="read"',
-        ])
-    return [
-        executable, "--ask-for-approval", "never", "exec", "--ignore-user-config",
-        "--ignore-rules", "--ephemeral", "--config", 'default_permissions="orchestra-routine"',
-        "--config", 'permissions.orchestra-routine.filesystem.:root="deny"',
-        "--config", 'permissions.orchestra-routine.filesystem.:minimal="read"',
-        # The minimal system read set includes /etc.  The owner-only OMCP
-        # configuration and credentials live there on PixelBox, so deny that
-        # subtree explicitly rather than relying on :root="deny".
-        "--config", 'permissions.orchestra-routine.filesystem./etc/orchestra="deny"',
-        *git_rules,
-        "--config", 'permissions.orchestra-routine.filesystem.:tmpdir="deny"',
-        "--config", 'permissions.orchestra-routine.filesystem.:slash_tmp="deny"',
-        "--config", "permissions.orchestra-routine.filesystem.:workspace_roots={" + rules + "}",
-        "--config", "permissions.orchestra-routine.network.enabled=false", "--cd", str(workspace),
-        "--output-last-message", str(result_path), "-",
-    ]
+                    writable_paths: list[str], git_read_paths: list[str] | None = None,
+                    read_only_paths: list[str] | None = None) -> list[str]:
+    """Build the Codex worker command from the shared routine policy."""
+    policy = RoutineConfinementPolicy(
+        tuple(writable_paths),
+        tuple(read_only_paths if read_only_paths is not None else (git_read_paths or ())),
+    )
+    return policy.worker_command(executable, workspace, result_path)
 
 
 def owner_only_credential(path: Path) -> None:
@@ -906,12 +881,14 @@ def run(spec_path: Path) -> int:
                 contract_tmp = workspace / worker_contract.CONTRACT_DIR
                 contract_tmp.mkdir(mode=0o700, exist_ok=True)
                 routine_tmp = contract_tmp
-                git_read_paths = spec.get("git_read_paths", [])
-                if not isinstance(git_read_paths, list):
-                    raise ValueError("invalid routine Git read paths")
+                read_only_paths = spec.get(
+                    "read_only_paths", spec.get("git_read_paths", []),
+                )
+                if not isinstance(read_only_paths, list):
+                    raise ValueError("invalid routine read paths")
                 command = routine_command(
                     executable, workspace, result, capabilities["writable_paths"],
-                    git_read_paths,
+                    read_only_paths=read_only_paths,
                 )
                 environment = worker_environment(spec.get("codex_home")); environment["TMPDIR"] = str(routine_tmp)
             if adapter == "opencode":

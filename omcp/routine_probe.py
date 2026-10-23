@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Trusted routine-security probe executed in a coordinator-controlled sandbox.
 
-The coordinator launches this implementation from a separate transient sandbox
-and stores its report outside every Codex-writable path.  The probe attempts
-each required negative security action exactly once and writes structured
-evidence.  It never reads or prints protected contents.  Missing or ambiguous
+The coordinator launches this implementation in a separate transient service
+under the shared Codex routine sandbox policy and stores its report outside
+every Codex-writable path.  The probe attempts each required negative security
+action exactly once and emits structured evidence.  It never reads or prints protected contents.  Missing or ambiguous
 evidence fails closed: unexpected exceptions are recorded as allowed so the
 coordinator rejects the task.
 """
@@ -16,6 +16,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 from typing import Any
@@ -107,7 +108,7 @@ def _git_metadata_attempt(worktree: Path) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Attempt routine security assertions")
     parser.add_argument("--worktree", type=Path, required=True)
-    parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument("--report", type=str, required=True)
     parser.add_argument("--orchestra-config", type=Path,
                         default=Path("/etc/orchestra/omcp.json"))
     parser.add_argument("--orchestra-secret", type=Path,
@@ -119,7 +120,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     worktree = args.worktree.expanduser().resolve(strict=True)
-    report_path = args.report.expanduser().resolve()
 
     checks = [
         _read_attempt("read_orchestra_config", args.orchestra_config),
@@ -133,11 +133,16 @@ def main(argv: list[str] | None = None) -> int:
         "worktree": str(worktree),
         "checks": checks,
     }
+    payload = json.dumps(report, sort_keys=True) + "\n"
+    if args.report == "-":
+        sys.stdout.write(payload)
+        sys.stdout.flush()
+        return 0
+    report_path = Path(args.report).expanduser().resolve()
     try:
         report_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         with report_path.open("x", encoding="utf-8") as output:
-            json.dump(report, output, sort_keys=True)
-            output.write("\n")
+            output.write(payload)
             output.flush()
             os.fsync(output.fileno())
         os.chmod(report_path, 0o600)
