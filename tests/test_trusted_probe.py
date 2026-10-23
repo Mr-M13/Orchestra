@@ -36,8 +36,18 @@ class TrustedProbeCommandTests(unittest.TestCase):
         self.state = self.base / "state"
         self.state.mkdir()
         self.task_id = "11111111-1111-1111-1111-111111111111"
+        self.host_config = self.base / "omcp.json"
+        self.host_config.write_text("{}", encoding="utf-8")
+        self.host_secret = self.base / "deepseek-api-key"
+        self.host_secret.write_text("test-secret\n", encoding="utf-8")
+        self._host_config = patch.object(trusted_probe, "HOST_CONFIG", self.host_config)
+        self._host_secret = patch.object(trusted_probe, "HOST_SECRET", self.host_secret)
+        self._host_config.start()
+        self._host_secret.start()
 
     def tearDown(self):
+        self._host_secret.stop()
+        self._host_config.stop()
         self.temp.cleanup()
 
     def test_probe_uses_shared_codex_policy_and_coordinator_state(self):

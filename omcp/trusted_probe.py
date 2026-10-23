@@ -74,6 +74,9 @@ def _build_command(
     systemd_run = shutil.which("systemd-run")
     if not codex or not systemd_run:
         raise TrustedProbeError("codex and systemd-run are required for trusted verification")
+    for path in (HOST_CONFIG, HOST_SECRET):
+        if not path.is_file() or path.is_symlink():
+            raise TrustedProbeError("owner-only security probe input is unavailable")
     runtime_dir = _runtime_dir()
     probe_command = [
         sys.executable, str(probe_script),
