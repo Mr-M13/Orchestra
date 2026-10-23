@@ -2963,6 +2963,10 @@ class ServerLifecycleTests(unittest.TestCase):
         self.assertIn("repository_profile", schema["required"])
         self.assertEqual(schema["properties"]["repository_profile"]["type"], "string")
         self.assertEqual(schema["properties"]["consequence_class"]["default"], "unclassified")
+        description = schema["properties"]["consequence_class"]["description"]
+        self.assertIn("eligible routine_development only", description)
+        self.assertIn("unclassified work still require explicit approval", description)
+        self.assertNotIn("automatically authorizes all valid classes", description)
         self.assertEqual(set(schema["properties"]["consequence_class"]["enum"]), {
             "routine_development", "production_deployment", "destructive_operation",
             "security_change", "unclassified",
