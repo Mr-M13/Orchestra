@@ -36,11 +36,14 @@ class InstallerSourceTests(unittest.TestCase):
         self.assertIn("Group=orchestra-mcp", unit)
         self.assertNotIn("Group=orchestra-mcp-http", unit)
         self.assertIn("WorkingDirectory=/opt/orchestra/current", unit)
-        self.assertIn("Environment=PYTHONPATH=/opt/orchestra/current", unit)
+        self.assertIn("PartOf=orchestra-omcp.service", unit)
+        self.assertIn("StartLimitIntervalSec=60", unit)
         self.assertIn(
-            'ExecStartPre=/usr/bin/python3 -c "import omcp.http_gateway"', unit,
+            'ExecStartPre=/usr/bin/python3 -E -B -c "import omcp.http_gateway"', unit,
         )
+        self.assertIn("/usr/bin/python3 -E -B -m omcp.http_gateway", unit)
         self.assertIn("ExecStartPre=/usr/bin/test -r /etc/orchestra/mcp-http.env", unit)
+        self.assertIn("grep -Ec \"^ORCHESTRA_MCP_HTTP_TOKEN=\"", unit)
         self.assertIn("ExecStartPre=/usr/bin/test -S /run/orchestra/omcp.sock", unit)
         self.assertIn("--host 127.0.0.1", unit)
         self.assertIn("IPAddressDeny=any", unit)
@@ -97,7 +100,9 @@ class InstallerSourceTests(unittest.TestCase):
         self.assertIn("systemctl daemon-reload", failure)
         helper = source[source.index("stop_gateway_or_fail()"):source.index("install_units()")]
         self.assertIn('rm -f "$UNIT_ROOT/orchestra-mcp-http.service"', helper)
-        self.assertIn("a listener remains on port 8090", helper)
+        self.assertIn("assert_no_gateway_listener", helper)
+        listener = source[source.index("assert_no_gateway_listener()"):source.index("stop_gateway_or_fail()")]
+        self.assertIn("a listener remains on port 8090", listener)
 
     def test_activation_waits_for_gateway_health_before_declaring_success(self):
         source = INSTALL.read_text()
@@ -106,8 +111,10 @@ class InstallerSourceTests(unittest.TestCase):
         self.assertIn("wait_for_omcp_socket", activation)
         health = source[source.index("wait_for_gateway_health()"):source.index("preflight_activation()")]
         self.assertIn("omcp.http_gateway_verify", health)
+        self.assertIn("VERIFIER_PATH", health)
         self.assertIn("--cycles 1", health)
         self.assertIn("--env-file", health)
+        self.assertIn("install_gateway_verifier", activation)
         unit = (ROOT / "deploy/pixelbox/systemd/orchestra-mcp-http.service").read_text()
         self.assertIn("WorkingDirectory=/opt/orchestra/current", unit)
 
@@ -121,8 +128,24 @@ class InstallerSourceTests(unittest.TestCase):
     def test_rollback_validation_does_not_require_newer_helper_files(self):
         source = INSTALL.read_text()
         validation = source[source.index("validate_release_tree()"):source.index("stage_release()")]
+        gateway_requirements = validation[
+            validation.index("if release_has_gateway_unit"):validation.index("recorded_digest=")
+        ]
         self.assertNotIn("config-access.sh", validation)
+        self.assertNotIn("http_gateway_verify.py", gateway_requirements)
+        self.assertNotIn("verify_mcp_http.sh", gateway_requirements)
         self.assertIn("release_has_gateway_unit", validation)
+        self.assertIn("omcp/http_gateway.py", gateway_requirements)
+
+    def test_stable_verifier_is_installed_independently_of_target_release(self):
+        source = INSTALL.read_text()
+        self.assertIn('VERIFIER_PATH="$VERIFIER_ROOT/http_gateway_verify.py"', source)
+        installer = source[source.index("install_gateway_verifier()"):source.index("stage_configuration()")]
+        self.assertIn("$SOURCE_ROOT/omcp/http_gateway_verify.py", installer)
+        self.assertIn("$RELEASES_ROOT/$RELEASE_SHA/omcp/http_gateway_verify.py", installer)
+        self.assertIn("install_gateway_verifier", source[source.index("activate_release()"):source.index("main()")])
+        verifier = (ROOT / "deploy/pixelbox/verify_mcp_http.sh").read_text()
+        self.assertIn("STABLE_VERIFIER", verifier)
 
     def test_portable_staging_rejects_gateway_releases(self):
         source = INSTALL.read_text()
@@ -139,8 +162,9 @@ class InstallerSourceTests(unittest.TestCase):
         self.assertIn("coordinator socket identity/mode does not match policy", verifier)
         self.assertIn("omcp.http_gateway_verify", verifier)
         self.assertIn("python3 -E", verifier)
-        self.assertIn("wrong-token", module)
+        self.assertIn("accepted a missing or wrong token", module)
         self.assertIn("JSON-RPC response id mismatch", module)
+        self.assertIn("FragmentPath", verifier)
         self.assertIn("127.0.0.1:8090", verifier)
 
 
@@ -153,17 +177,27 @@ calls="$(mktemp)"
 unit_root="$(mktemp -d)"
 release="$(mktemp -d)"
 mkdir -p "$release/deploy/pixelbox/systemd"
+for unit in orchestra-omcp.service orchestra-github-dispatch.service \
+            orchestra-tunnel.service orchestra-health.service orchestra-health.timer; do
+  cp "deploy/pixelbox/systemd/$unit" "$release/deploy/pixelbox/systemd/"
+done
 cp deploy/pixelbox/systemd/orchestra-mcp-http.service "$release/deploy/pixelbox/systemd/"
 sudo() {
   printf '%s\n' "$*" >> "$calls"
   [[ "$*" == "systemctl is-active --quiet orchestra-mcp-http.service" ]] && return 1
+  [[ "$*" == "systemctl is-enabled --quiet orchestra-mcp-http.service" ]] && return 1
   return 0
 }
+ss() { return 0; }
 UNIT_ROOT="$unit_root"
 install_units "$release"
 printf '%s\n' '---rollback---' >> "$calls"
 old="$(mktemp -d)"
 mkdir -p "$old/deploy/pixelbox/systemd"
+for unit in orchestra-omcp.service orchestra-tunnel.service \
+            orchestra-health.service orchestra-health.timer; do
+  cp "deploy/pixelbox/systemd/$unit" "$old/deploy/pixelbox/systemd/"
+done
 install_units "$old"
 cat "$calls"
 ''')
@@ -172,6 +206,77 @@ cat "$calls"
         self.assertIn("orchestra-mcp-http.service", upgrade)
         self.assertIn("rm -f", rollback)
         self.assertIn("orchestra-mcp-http.service", rollback)
+        self.assertIn("orchestra-github-dispatch.service", rollback)
+
+    def test_enabled_but_inactive_gateway_is_disabled_and_removed(self):
+        result = run_bash(r'''
+set -euo pipefail
+source deploy/pixelbox/install.sh
+calls="$(mktemp)"
+state="$(mktemp)"
+old="$(mktemp -d)"
+mkdir -p "$old/deploy/pixelbox/systemd"
+cp deploy/pixelbox/systemd/orchestra-omcp.service \
+  "$old/deploy/pixelbox/systemd/orchestra-omcp.service"
+sudo() {
+  printf '%s\n' "$*" >> "$calls"
+  if [[ "$*" == "systemctl is-active --quiet orchestra-mcp-http.service" ]]; then
+    return 1
+  fi
+  if [[ "$*" == "systemctl is-enabled --quiet orchestra-mcp-http.service" ]]; then
+    [[ -f "$state" ]]
+    return
+  fi
+  if [[ "$*" == "systemctl disable --now orchestra-mcp-http.service" ]]; then
+    rm -f "$state"
+    return 0
+  fi
+  return 0
+}
+ss() { return 0; }
+UNIT_ROOT="$(mktemp -d)"
+install_units "$old"
+cat "$calls"
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("disable --now orchestra-mcp-http.service", result.stdout)
+        self.assertIn("rm -f", result.stdout)
+
+    def test_listener_on_8090_blocks_gateway_rollback(self):
+        result = run_bash(r'''
+set -euo pipefail
+source deploy/pixelbox/install.sh
+old="$(mktemp -d)"
+mkdir -p "$old/deploy/pixelbox/systemd"
+cp deploy/pixelbox/systemd/orchestra-omcp.service \
+  "$old/deploy/pixelbox/systemd/orchestra-omcp.service"
+sudo() {
+  [[ "$*" == "systemctl is-active --quiet orchestra-mcp-http.service" ]] && return 1
+  [[ "$*" == "systemctl is-enabled --quiet orchestra-mcp-http.service" ]] && return 1
+  return 0
+}
+ss() { printf 'LISTEN 0 5 127.0.0.1:8090 0.0.0.0:*\n'; }
+UNIT_ROOT="$(mktemp -d)"
+install_units "$old"
+''')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("listener remains on port 8090", result.stderr)
+
+    def test_old_gateway_unit_is_replaced_with_the_invoking_hardened_unit(self):
+        result = run_bash(r'''
+set -euo pipefail
+source deploy/pixelbox/install.sh
+release="$(mktemp -d)"
+mkdir -p "$release/deploy/pixelbox/systemd"
+printf '%s\n' '[Service]' 'SocketBindAllow=inet:8090' \
+  > "$release/deploy/pixelbox/systemd/orchestra-mcp-http.service"
+gateway_unit_source "$release"
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.strip(),
+            str(ROOT / "deploy/pixelbox/systemd/orchestra-mcp-http.service"),
+        )
 
     def test_rollback_stop_failure_fails_closed(self):
         result = run_bash(r'''
@@ -193,7 +298,7 @@ UNIT_ROOT="$unit_root"
 install_units "$old"
 ''')
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("could not stop the HTTP gateway", result.stderr)
+        self.assertIn("could not stop/disable the HTTP gateway", result.stderr)
 
     def test_prepare_identity_creates_group_and_nologin_user(self):
         result = run_bash(r'''

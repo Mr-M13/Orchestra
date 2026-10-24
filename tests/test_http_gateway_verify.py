@@ -38,6 +38,28 @@ class GatewayVerifierTests(unittest.TestCase):
         result = verify("127.0.0.1", self.server.server_port, TOKEN, cycles=2)
         self.assertEqual(result, {"cycles": 2, "status": "ok"})
 
+    def test_verifier_rejects_a_gateway_that_accepts_any_long_token(self):
+        class WeakGateway(Gateway):
+            def allowed(self, header):
+                return bool(
+                    header
+                    and header.startswith("Bearer ")
+                    and len(header[7:]) >= 32
+                )
+
+        gateway = WeakGateway(self.path, TOKEN)
+        server = GatewayServer(("127.0.0.1", 0), make_handler(gateway))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with self.assertRaises(VerificationError):
+                verify("127.0.0.1", server.server_port, TOKEN, cycles=1)
+        finally:
+            gateway.shutdown()
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+
     def test_verifier_rejects_http_200_json_rpc_error(self):
         with self.assertRaises(VerificationError):
             _rpc(Response(
@@ -65,6 +87,11 @@ class GatewayVerifierTests(unittest.TestCase):
                 path.write_text("ORCHESTRA_MCP_HTTP_TOKEN=" + value + "\n")
                 with self.assertRaises(VerificationError):
                     read_token_file(path)
+            path.write_text(
+                "PYTHONPATH=/tmp\nORCHESTRA_MCP_HTTP_TOKEN=" + "x" * 40 + "\n",
+            )
+            with self.assertRaises(VerificationError):
+                read_token_file(path)
 
 
 if __name__ == "__main__":

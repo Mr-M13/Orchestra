@@ -18,8 +18,8 @@ No router forwarding, public PixelBox bind, DNS migration, or new domain is requ
    `/etc/orchestra/mcp-http.env` is owned by `orchestra-mcp-http`, group
    `orchestra-mcp`, mode `0600`. The installer preserves existing token
    contents, grants only group traverse access on `/etc/orchestra`, and never
-   prints the token. Generate a token of at least 32 non-whitespace characters,
-   for example:
+   prints the token. Generate a token of at least 32 characters from the
+   URL-safe/header-safe alphabet `[A-Za-z0-9._~+/=-]`, for example:
    `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'`.
 5. The service unit binds only `127.0.0.1:8090`, denies all network addresses
    except IPv4 loopback, restricts socket families to `AF_UNIX AF_INET`,
@@ -28,7 +28,8 @@ No router forwarding, public PixelBox bind, DNS migration, or new domain is requ
    `/run/orchestra/omcp.sock` through the `orchestra-mcp` group only. Do not
    change the listener to `0.0.0.0`, `::`, or a LAN address, and do not expose
    the port through any other proxy.
-6. Run `verify_mcp_http.sh` locally, then verify
+6. Run `verify_mcp_http.sh` locally (it prefers the installer-managed
+   `/usr/local/lib/orchestra/http_gateway_verify.py`), then verify
    `https://mcp.<domain>/healthz` and authenticated `/mcp`. `/readyz` also
    requires the bearer token; use `/healthz` for an unauthenticated liveness
    probe. The verifier checks the exact loopback listener, the gateway

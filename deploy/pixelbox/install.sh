@@ -15,6 +15,8 @@ CONFIG_ROOT="${ORCHESTRA_CONFIG_ROOT:-/etc/orchestra}"
 STATE_ROOT="${ORCHESTRA_STATE_ROOT:-/home/hamed/orchestra-migration/state}"
 SERVICE_USER="${ORCHESTRA_SERVICE_USER:-hamed}"
 UNIT_ROOT="${ORCHESTRA_SYSTEMD_UNIT_ROOT:-/etc/systemd/system}"
+VERIFIER_ROOT="${ORCHESTRA_VERIFIER_ROOT:-/usr/local/lib/orchestra}"
+VERIFIER_PATH="$VERIFIER_ROOT/http_gateway_verify.py"
 RELEASES_ROOT="$INSTALL_ROOT/releases"
 CURRENT_LINK="$INSTALL_ROOT/current"
 PREVIOUS_LINK="$INSTALL_ROOT/previous"
@@ -79,19 +81,26 @@ validate_source_commit() {
   done
   if git -C "$SOURCE_ROOT" cat-file -e \
       "$RELEASE_SHA:deploy/pixelbox/systemd/orchestra-mcp-http.service" 2>/dev/null; then
-    for required in \
-      omcp/http_gateway.py \
-      omcp/http_gateway_verify.py \
-      deploy/pixelbox/mcp-http.env.example \
-      deploy/pixelbox/verify_mcp_http.sh; do
-      git -C "$SOURCE_ROOT" cat-file -e "$RELEASE_SHA:$required" 2>/dev/null \
-        || fail "release commit is missing reviewed HTTPS MCP file: $required"
-    done
+    git -C "$SOURCE_ROOT" cat-file -e \
+      "$RELEASE_SHA:omcp/http_gateway.py" 2>/dev/null \
+      || fail "release commit is missing reviewed HTTPS MCP runtime"
   fi
 }
 
 release_has_gateway_unit() {
   [[ -f "$1/deploy/pixelbox/systemd/orchestra-mcp-http.service" ]]
+}
+
+gateway_unit_source() {
+  local release_root="$1"
+  local target="$release_root/deploy/pixelbox/systemd/orchestra-mcp-http.service"
+  local stable="$SOURCE_ROOT/deploy/pixelbox/systemd/orchestra-mcp-http.service"
+  if grep -Eq '^SocketBindAllow=inet:' "$target" 2>/dev/null \
+      && [[ -f "$stable" ]]; then
+    printf '%s\n' "$stable"
+  else
+    printf '%s\n' "$target"
+  fi
 }
 
 cleanup() {
@@ -158,14 +167,8 @@ validate_release_tree() {
       || fail "staged release is missing reviewed file: $required"
   done
   if release_has_gateway_unit "$release_root"; then
-    for required in \
-      omcp/http_gateway.py \
-      omcp/http_gateway_verify.py \
-      deploy/pixelbox/mcp-http.env.example \
-      deploy/pixelbox/verify_mcp_http.sh; do
-      sudo test -r "$release_root/$required" \
-        || fail "staged release is missing reviewed HTTPS MCP file: $required"
-    done
+    sudo test -r "$release_root/omcp/http_gateway.py" \
+      || fail "staged release is missing the reviewed HTTPS MCP runtime"
   fi
   recorded_digest="$(sudo cat "$release_root/.orchestra-release-digest" 2>/dev/null)" \
     || fail "release digest is missing: $release_root"
@@ -176,7 +179,7 @@ validate_release_tree() {
     || fail "staged release content differs from its validated digest"
   bash -n "$release_root/deploy/pixelbox/install.sh"
   bash -n "$release_root/deploy/pixelbox/verify.sh"
-  if release_has_gateway_unit "$release_root"; then
+  if [[ -r "$release_root/deploy/pixelbox/verify_mcp_http.sh" ]]; then
     bash -n "$release_root/deploy/pixelbox/verify_mcp_http.sh"
   fi
   cache_root="$(mktemp -d "${TMPDIR:-/tmp}/orchestra-pycache.XXXXXX")"
@@ -230,6 +233,16 @@ install_environment_file() {
     "$release_root/deploy/pixelbox/$env_file.example" "$destination"
   echo "Installed $destination; fill it locally and do not commit secrets."
   STAGED_ONLY=1
+}
+
+install_gateway_verifier() {
+  local candidate="$SOURCE_ROOT/omcp/http_gateway_verify.py"
+  if [[ ! -f "$candidate" ]]; then
+    candidate="$RELEASES_ROOT/$RELEASE_SHA/omcp/http_gateway_verify.py"
+  fi
+  [[ -f "$candidate" ]] || return 0
+  sudo install -d -m 0755 -o root -g root "$VERIFIER_ROOT"
+  sudo install -m 0644 -o root -g root "$candidate" "$VERIFIER_PATH"
 }
 
 stage_configuration() {
@@ -291,40 +304,64 @@ release_sha_from_link() {
   printf '%s\n' "${BASH_REMATCH[1]}"
 }
 
-gateway_listener_present() {
-  command -v ss >/dev/null 2>&1 || return 1
-  ss -ltnH | awk '$4 ~ /:8090$/ { found=1 } END { exit !found }'
-}
-
-stop_gateway_or_fail() {
-  if sudo systemctl is-active --quiet orchestra-mcp-http.service 2>/dev/null; then
-    sudo systemctl disable --now orchestra-mcp-http.service \
-      || fail "could not stop the HTTP gateway during rollback"
-  fi
-  sudo rm -f "$UNIT_ROOT/orchestra-mcp-http.service"
-  if sudo systemctl is-active --quiet orchestra-mcp-http.service 2>/dev/null; then
-    fail "the HTTP gateway is still active after rollback"
-  fi
-  if gateway_listener_present; then
+assert_no_gateway_listener() {
+  command -v ss >/dev/null 2>&1 \
+    || fail "ss is required to verify port 8090 cleanup"
+  local listeners
+  listeners="$(ss -ltnH)" || fail "could not inspect listeners during rollback"
+  if awk '$4 ~ /:8090$/ { found=1 } END { exit !found }' <<<"$listeners"; then
     fail "a listener remains on port 8090 after gateway rollback"
   fi
 }
 
+stop_gateway_or_fail() {
+  local active=0 enabled=0
+  if sudo systemctl is-active --quiet orchestra-mcp-http.service 2>/dev/null; then
+    active=1
+  fi
+  if sudo systemctl is-enabled --quiet orchestra-mcp-http.service 2>/dev/null; then
+    enabled=1
+  fi
+  if (( active || enabled )); then
+    sudo systemctl disable --now orchestra-mcp-http.service \
+      || fail "could not stop/disable the HTTP gateway during rollback"
+  fi
+  sudo systemctl is-active --quiet orchestra-mcp-http.service 2>/dev/null \
+    && fail "the HTTP gateway is still active after rollback"
+  sudo systemctl is-enabled --quiet orchestra-mcp-http.service 2>/dev/null \
+    && fail "the HTTP gateway is still enabled after rollback"
+  assert_no_gateway_listener
+  sudo rm -f "$UNIT_ROOT/orchestra-mcp-http.service"
+  sudo rm -rf "$UNIT_ROOT/orchestra-mcp-http.service.d"
+  sudo rm -f "$UNIT_ROOT/multi-user.target.wants/orchestra-mcp-http.service"
+  sudo systemctl daemon-reload || fail "could not reload systemd after gateway removal"
+}
+
 install_units() {
   local release_root="$1" unit
+  # Remove the newer gateway capability before installing other units so a
+  # later missing-file failure cannot leave port 8090 active.
+  if ! release_has_gateway_unit "$release_root"; then
+    stop_gateway_or_fail
+  fi
   for unit in orchestra-omcp.service orchestra-github-dispatch.service orchestra-tunnel.service \
               orchestra-health.service orchestra-health.timer; do
-    sudo install -m 0644 "$release_root/deploy/pixelbox/systemd/$unit" \
-      "$UNIT_ROOT/$unit"
+    if sudo test -f "$release_root/deploy/pixelbox/systemd/$unit"; then
+      sudo install -m 0644 "$release_root/deploy/pixelbox/systemd/$unit" \
+        "$UNIT_ROOT/$unit"
+    else
+      sudo systemctl disable --now "$unit" 2>/dev/null || true
+      sudo rm -f "$UNIT_ROOT/$unit"
+    fi
   done
   if release_has_gateway_unit "$release_root"; then
-    sudo install -m 0644 \
-      "$release_root/deploy/pixelbox/systemd/orchestra-mcp-http.service" \
+    local gateway_source
+    gateway_source="$(gateway_unit_source "$release_root")"
+    if [[ "$gateway_source" != "$release_root/deploy/pixelbox/systemd/orchestra-mcp-http.service" ]]; then
+      echo "WARNING: replacing an older gateway unit with the invoking hardened unit." >&2
+    fi
+    sudo install -m 0644 "$gateway_source" \
       "$UNIT_ROOT/orchestra-mcp-http.service"
-  else
-    # A pre-HTTPS release must not leave the gateway service enabled, its unit
-    # file behind, or an unmanaged listener on the reviewed port.
-    stop_gateway_or_fail
   fi
 }
 
@@ -373,8 +410,11 @@ from pathlib import Path
 values = []
 for raw in Path(sys.argv[1]).read_text().splitlines():
     line = raw.strip()
-    if line.startswith("ORCHESTRA_MCP_HTTP_TOKEN="):
-        values.append(line.split("=", 1)[1])
+    if not line or line.startswith("#"):
+        continue
+    if not line.startswith("ORCHESTRA_MCP_HTTP_TOKEN="):
+        raise SystemExit(1)
+    values.append(line.split("=", 1)[1])
 if (len(values) != 1
         or re.fullmatch(r"[A-Za-z0-9._~+/=-]{32,}", values[0]) is None):
     raise SystemExit(1)
@@ -396,10 +436,15 @@ wait_for_omcp_socket() {
 }
 
 wait_for_gateway_health() {
-  local attempt
+  local attempt verifier_args=()
+  if [[ -f "$VERIFIER_PATH" ]]; then
+    verifier_args=("$VERIFIER_PATH")
+  else
+    verifier_args=(-m omcp.http_gateway_verify)
+  fi
   for attempt in {1..50}; do
-    if (cd /opt/orchestra/current && \
-        sudo -u "$MCP_HTTP_USER" /usr/bin/python3 -E -m omcp.http_gateway_verify \
+    if (cd "$SOURCE_ROOT" && \
+        sudo -u "$MCP_HTTP_USER" /usr/bin/python3 -E "${verifier_args[@]}" \
           --host 127.0.0.1 --port 8090 --cycles 1 \
           --env-file "$CONFIG_ROOT/mcp-http.env" >/dev/null 2>&1); then
       return 0
@@ -479,7 +524,10 @@ activate_release() {
   fi
 
   install_units "$release_root"
-  if release_has_gateway_unit "$release_root"; then prepare_mcp_identity; fi
+  if release_has_gateway_unit "$release_root"; then
+    prepare_mcp_identity
+    install_gateway_verifier
+  fi
   sudo systemctl daemon-reload
   atomic_symlink "releases/$RELEASE_SHA" "$CURRENT_LINK"
 
@@ -507,19 +555,34 @@ activate_release() {
     atomic_symlink "releases/$old_sha" "$CURRENT_LINK"
     install_units "$old_root"
     sudo systemctl daemon-reload
-    sudo systemctl restart orchestra-omcp.service || true
-    sudo systemctl start orchestra-health.timer || true
+    sudo systemctl restart orchestra-omcp.service \
+      || fail "activation failed and the prior coordinator could not restart"
+    sudo systemctl start orchestra-health.timer \
+      || fail "activation failed and the prior health timer could not restart"
     if release_has_gateway_unit "$old_root"; then
-      sudo systemctl restart orchestra-mcp-http.service || true
+      sudo systemctl restart orchestra-mcp-http.service \
+        || fail "activation failed and the prior gateway could not restart"
+      wait_for_omcp_socket || fail "activation failed and the prior gateway socket is unavailable"
+      wait_for_gateway_health || fail "activation failed and the prior gateway is unhealthy"
     fi
     fail "activation failed; current was restored to $old_sha"
   fi
   sudo unlink "$CURRENT_LINK" 2>/dev/null || true
   sudo systemctl stop orchestra-mcp-http.service 2>/dev/null || true
   stop_gateway_or_fail
-  sudo systemctl stop orchestra-omcp.service orchestra-health.timer || true
-  sudo systemctl disable orchestra-omcp.service orchestra-health.timer || true
-  sudo systemctl daemon-reload || true
+  for unit in orchestra-omcp.service orchestra-health.timer; do
+    if sudo systemctl is-active --quiet "$unit" 2>/dev/null; then
+      sudo systemctl stop "$unit" || fail "first activation failed and $unit could not stop"
+    fi
+    if sudo systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+      sudo systemctl disable "$unit" || fail "first activation failed and $unit could not be disabled"
+    fi
+    sudo systemctl is-active --quiet "$unit" 2>/dev/null \
+      && fail "first activation failed and $unit is still active"
+    sudo systemctl is-enabled --quiet "$unit" 2>/dev/null \
+      && fail "first activation failed and $unit is still enabled"
+  done
+  sudo systemctl daemon-reload || fail "first activation failed and systemd reload failed"
   fail "first activation failed; no prior managed release was available"
 }
 

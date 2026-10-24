@@ -15,7 +15,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from omcp.http_gateway import TOKEN_RE
+
+TOKEN_RE = re.compile(r"[A-Za-z0-9._~+/=-]{32,}")
 
 
 class VerificationError(RuntimeError):
@@ -38,8 +39,11 @@ def read_token_file(path: Path) -> str:
     values = []
     for raw in path.read_text().splitlines():
         line = raw.strip()
-        if line.startswith("ORCHESTRA_MCP_HTTP_TOKEN="):
-            values.append(line.split("=", 1)[1])
+        if not line or line.startswith("#"):
+            continue
+        if not line.startswith("ORCHESTRA_MCP_HTTP_TOKEN="):
+            raise VerificationError("gateway environment contains an unexpected key")
+        values.append(line.split("=", 1)[1])
     _require(len(values) == 1, "gateway environment must define exactly one token")
     token = values[0]
     _require(TOKEN_RE.fullmatch(token) is not None, "gateway token is invalid")
@@ -97,17 +101,25 @@ def verify(host: str, port: int, token: str, cycles: int = 20) -> dict:
 
     health = _json_body(_request(host, port, "GET", "/healthz"))
     _require(health.get("status") == "ok", "health endpoint is not ok")
-    _require(_request(host, port, "GET", "/readyz").status == 401,
-             "readyz must require authentication")
+    wrong = "z" * 64
+    wrong_headers = {
+        "Authorization": "Bearer " + wrong,
+        "Content-Type": "application/json",
+    }
+    for method, path, body, auth_headers in (
+        ("GET", "/readyz", None, None),
+        ("GET", "/readyz", None, wrong_headers),
+        ("POST", "/mcp", b"{}", None),
+        ("POST", "/mcp", b"{}", wrong_headers),
+        ("DELETE", "/mcp", None, None),
+        ("DELETE", "/mcp", None, wrong_headers),
+    ):
+        _require(
+            _request(host, port, method, path, body, auth_headers).status == 401,
+            f"{method} {path} accepted a missing or wrong token",
+        )
     ready = _json_body(_request(host, port, "GET", "/readyz", headers=headers))
     _require(ready.get("ready") is True, "gateway backend is not ready")
-    _require(
-        _request(host, port, "POST", "/mcp", b"{}", {
-            "Authorization": "Bearer wrong-token",
-            "Content-Type": "application/json",
-        }).status == 401,
-        "wrong bearer token was accepted",
-    )
 
     for cycle in range(cycles):
         initialize = _request(

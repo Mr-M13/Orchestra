@@ -475,12 +475,15 @@ def make_handler(gateway: Gateway,
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Connection", "close")
                 if session:
                     self.send_header("Mcp-Session-Id", session)
                 self.end_headers()
                 if body:
                     self.wfile.write(body)
             except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            finally:
                 self.close_connection = True
 
         def do_GET(self) -> None:
@@ -501,21 +504,16 @@ def make_handler(gateway: Gateway,
             if not gateway.allowed(self.headers.get("Authorization")):
                 audit("auth_failure", logging.WARNING, status=401)
                 return self.send(401, b'{"error":"unauthorized"}')
-            if self.headers.get("Transfer-Encoding"):
+            if self.headers.get_all("Transfer-Encoding") is not None:
                 audit("request_rejected", logging.WARNING, status=400,
-                      code="invalid_request_size")
+                      code="invalid_transfer_encoding")
                 return self.send(400, b'{"error":"invalid request size"}')
             lengths = self.headers.get_all("Content-Length") or []
-            if len(lengths) != 1:
-                audit("request_rejected", logging.WARNING,
-                      status=400, code="duplicate_content_length")
-                return self.send(400, b'{"error":"invalid request size"}')
-            try:
-                size = int(lengths[0])
-            except ValueError:
+            if len(lengths) != 1 or re.fullmatch(r"[0-9]+", lengths[0]) is None:
                 audit("request_rejected", logging.WARNING,
                       status=400, code="invalid_content_length")
                 return self.send(400, b'{"error":"invalid request size"}')
+            size = int(lengths[0])
             if size < 1 or size > MAX_BODY_BYTES:
                 audit("request_rejected", logging.WARNING,
                       status=413, code="invalid_request_size")

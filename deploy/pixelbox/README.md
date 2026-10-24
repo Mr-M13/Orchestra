@@ -41,7 +41,8 @@ Staging an HTTPS-capable release creates the `orchestra-mcp` group and
 The gateway token file is owned by that identity, mode `0600`, and the
 configuration root grants only group traverse access. Existing token contents
 are preserved; activation fails if the token is still a placeholder or shorter
-than 32 non-whitespace characters. Staging an HTTPS-capable release therefore
+than 32 characters from the header-safe alphabet `[A-Za-z0-9._~+/=-]`.
+Staging an HTTPS-capable release therefore
 requires Linux account tools (`getent`, `groupadd`, `useradd`) and POSIX ACL
 tools (`setfacl`, `getfacl`). Portable staging on another platform is limited to
 pre-HTTPS releases. Rolling back to a pre-HTTPS release disables and removes the

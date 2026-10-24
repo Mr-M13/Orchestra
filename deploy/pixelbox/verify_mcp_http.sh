@@ -20,6 +20,7 @@ ENV_FILE="${ORCHESTRA_MCP_HTTP_ENV:-/etc/orchestra/mcp-http.env}"
 MCP_HTTP_USER="${ORCHESTRA_MCP_HTTP_USER:-orchestra-mcp-http}"
 MCP_HTTP_GROUP="${ORCHESTRA_MCP_HTTP_GROUP:-orchestra-mcp}"
 OMCP_USER="${ORCHESTRA_SERVICE_USER:-hamed}"
+STABLE_VERIFIER="${ORCHESTRA_VERIFIER_PATH:-/usr/local/lib/orchestra/http_gateway_verify.py}"
 [[ -f "$ENV_FILE" && ! -L "$ENV_FILE" ]] \
   || { echo "missing or unsafe gateway environment" >&2; exit 1; }
 [[ "$("$STAT" -c '%a' "$ENV_FILE" 2>/dev/null || "$STAT" -f '%Lp' "$ENV_FILE")" == "600" ]] \
@@ -47,8 +48,11 @@ from pathlib import Path
 values = []
 for raw in Path(sys.argv[1]).read_text().splitlines():
     line = raw.strip()
-    if line.startswith("ORCHESTRA_MCP_HTTP_TOKEN="):
-        values.append(line.split("=", 1)[1])
+    if not line or line.startswith("#"):
+        continue
+    if not line.startswith("ORCHESTRA_MCP_HTTP_TOKEN="):
+        raise SystemExit(1)
+    values.append(line.split("=", 1)[1])
 if (len(values) != 1
         or re.fullmatch(r"[A-Za-z0-9._~+/=-]{32,}", values[0]) is None):
     raise SystemExit(1)
@@ -61,6 +65,26 @@ read_token >/dev/null \
 
 "$SYSTEMCTL" is-active --quiet orchestra-mcp-http.service
 "$SYSTEMCTL" is-enabled --quiet orchestra-mcp-http.service
+UNIT_SHOW="$("$SYSTEMCTL" show orchestra-mcp-http.service \
+  -p User -p Group -p NoNewPrivileges -p ProtectSystem -p ProtectHome \
+  -p PrivateNetwork -p RestrictAddressFamilies)"
+for expected in \
+  "User=orchestra-mcp-http" \
+  "Group=orchestra-mcp" \
+  "NoNewPrivileges=yes" \
+  "ProtectSystem=strict" \
+  "ProtectHome=yes" \
+  "PrivateNetwork=no" \
+  "RestrictAddressFamilies=AF_UNIX AF_INET"; do
+  "$GREP" -qx "$expected" <<<"$UNIT_SHOW" \
+    || { echo "gateway unit property mismatch: $expected" >&2; exit 1; }
+done
+UNIT_PATH="$("$SYSTEMCTL" show orchestra-mcp-http.service -p FragmentPath --value)"
+[[ -n "$UNIT_PATH" && -f "$UNIT_PATH" ]] \
+  || { echo "gateway unit file is unavailable" >&2; exit 1; }
+[[ "$("$STAT" -c '%u' "$UNIT_PATH" 2>/dev/null || "$STAT" -f '%u' "$UNIT_PATH")" == "0" \
+   && "$("$STAT" -c '%a' "$UNIT_PATH" 2>/dev/null || "$STAT" -f '%Lp' "$UNIT_PATH")" == "644" ]] \
+  || { echo "gateway unit file must be root-owned mode 0644" >&2; exit 1; }
 LISTENERS="$("$SS" -ltnH)" || { echo "could not inspect listening sockets" >&2; exit 1; }
 LOCAL_ADDRESSES="$("$AWK" '{print $4}' <<<"$LISTENERS")"
 "$GREP" -qx '127\.0\.0\.1:8090' <<<"$LOCAL_ADDRESSES" \
@@ -83,6 +107,11 @@ read -r SOCKET_UID SOCKET_GID SOCKET_MODE <<<"$SOCKET_METADATA"
 "$SUDO" -u "$MCP_HTTP_USER" /usr/bin/test -w /run/orchestra/omcp.sock
 (
   cd "$ROOT"
-  "$SUDO" -u "$MCP_HTTP_USER" /usr/bin/python3 -E -m omcp.http_gateway_verify \
-    --host 127.0.0.1 --port 8090 --cycles 20 --env-file "$ENV_FILE"
+  if [[ -f "$STABLE_VERIFIER" ]]; then
+    "$SUDO" -u "$MCP_HTTP_USER" /usr/bin/python3 -E "$STABLE_VERIFIER" \
+      --host 127.0.0.1 --port 8090 --cycles 20 --env-file "$ENV_FILE"
+  else
+    "$SUDO" -u "$MCP_HTTP_USER" /usr/bin/python3 -E -m omcp.http_gateway_verify \
+      --host 127.0.0.1 --port 8090 --cycles 20 --env-file "$ENV_FILE"
+  fi
 )

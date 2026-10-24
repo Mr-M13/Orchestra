@@ -616,8 +616,9 @@ exposed directly.
   `orchestra-mcp-http` service identity before installing gateway configuration.
 - `/etc/orchestra/mcp-http.env` is owned by `orchestra-mcp-http`, group
   `orchestra-mcp`, mode `0600`; the installer preserves existing contents and
-  never prints or replaces the token. Activation rejects a placeholder or a
-  token shorter than 32 non-whitespace characters.
+  never prints or replaces the token. Activation rejects a placeholder, a
+  token shorter than 32 characters, duplicate token lines, non-token keys, or
+  characters outside `[A-Za-z0-9._~+/=-]`.
 - The service binds only `127.0.0.1:8090`, allows only IPv4 loopback network
   traffic, accepts only `AF_UNIX` and `AF_INET`, and reaches the coordinator
   socket through the `orchestra-mcp` group. Cloudflare ingress is the only
@@ -632,6 +633,12 @@ exposed directly.
 - Staging an HTTPS-capable release requires Linux account tools (`getent`,
   `groupadd`, `useradd`) and POSIX ACL tools (`setfacl`, `getfacl`). Portable
   staging on another platform is limited to pre-HTTPS releases.
+- The installer places a self-contained verifier at
+  `/usr/local/lib/orchestra/http_gateway_verify.py`. Activation and rollback use
+  that stable copy, not the target release's historical verifier. When rolling
+  back to an older gateway release whose unit has the invalid
+  `SocketBindAllow=inet:` form, the installer installs the invoking hardened
+  unit instead; the historical code remains the rollback target.
 - Verify with `deploy/pixelbox/verify_mcp_http.sh` and the Cloudflare ingress
   checks in [CLOUDFLARE-MCP.md](CLOUDFLARE-MCP.md).
 
