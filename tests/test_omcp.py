@@ -2868,8 +2868,37 @@ class ServerTests(unittest.TestCase):
         session = self.server.new_session()
         early = session.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
         self.assertEqual(early["error"]["code"], -32002)
-        unsupported = session.handle({"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {"protocolVersion": "2026-07-28"}})
+        unsupported = session.handle({"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {"protocolVersion": "2027-01-01"}})
         self.assertEqual(unsupported["error"]["code"], -32602)
+
+    def test_current_tunnel_initialize_uses_the_normal_mcp_handshake(self):
+        session = self.server.new_session()
+        initialized = session.handle({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2026-07-28",
+                "capabilities": {},
+                "clientInfo": {"name": "secure-mcp-tunnel", "version": "test"},
+            },
+        })
+        self.assertEqual(initialized["result"]["protocolVersion"], "2026-07-28")
+        self.assertEqual(session.state, session.NEGOTIATED)
+        session.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        listed = session.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        self.assertEqual({tool["name"] for tool in TOOLS},
+                         {tool["name"] for tool in listed["result"]["tools"]})
+
+    def test_current_tunnel_initialize_with_stateless_metadata_is_not_dispatched_as_a_tool(self):
+        session = self.server.new_session()
+        initialized = session.handle({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": self.stateless_params(
+                protocolVersion="2026-07-28", capabilities={},
+                clientInfo={"name": "secure-mcp-tunnel", "version": "test"},
+            ),
+        })
+        self.assertEqual(initialized["result"]["protocolVersion"], "2026-07-28")
+        self.assertEqual(session.state, session.NEGOTIATED)
 
     def test_legacy_reconnect_requires_new_handshake(self):
         first = self.server.new_session()
