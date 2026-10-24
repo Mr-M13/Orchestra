@@ -37,4 +37,4 @@ class GatewayTests(unittest.TestCase):
   self.assertEqual(req('POST','/mcp',b'{bad',headers)[0],400)
   s,b,heads=req('POST','/mcp',b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}',headers); self.assertEqual(s,200)
   hh={**headers,'Mcp-Session-Id':heads['Mcp-Session-Id']}; self.assertEqual(req('POST','/mcp',b'{"jsonrpc":"2.0","method":"notifications/initialized"}',hh)[0],200)
-  self.assertEqual(req('POST','/mcp',b'{"jsonrpc":"2.0","id":2,"method":"tools/list"}',hh)[0],200); h.shutdown()
+  self.assertEqual(req('POST','/mcp',b'{"jsonrpc":"2.0","id":2,"method":"tools/list"}',hh)[0],200); h.shutdown(); h.server_close()
