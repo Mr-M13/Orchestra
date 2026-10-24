@@ -386,7 +386,7 @@ tunnel-client init \
   --sample sample_mcp_stdio_local \
   --profile pixelbox \
   --tunnel-id tunnel_REPLACE_WITH_VERIFIED_TUNNEL_ID \
-  --mcp-command "python3 -m omcp.mcp_proxy --socket /home/hamed/orchestra-migration/state/mcp.sock"
+  --mcp-command "python3 -m omcp.mcp_proxy --socket /run/orchestra/omcp.sock"
 unset CONTROL_PLANE_API_KEY
 ```
 
@@ -464,12 +464,13 @@ Activation is refused unless the host is Linux ARM64 and the reviewed PixelBox
 paths and service user are in use. Static broker configuration and ownership
 validation completes before any systemd state changes. The installer then
 installs units that point at `/opt/orchestra/current`, replaces that symlink
-with one atomic rename, starts the broker, validates the coordinator against the
-live owner-checked socket, and only then restarts the coordinator and health
-timer. A failed activation restores the prior symlink and unit files and
-restarts the prior broker/coordinator. It does not touch Nextcloud, Docker,
-Tailscale, the Mac coordinator, or the tunnel. Enable the tunnel separately
-only after its profile is verified.
+with one atomic rename, restarts the coordinator and health timer, starts the
+gateway when the release includes it, and verifies an authenticated backend
+cycle before reporting success. A failed activation restores the prior symlink
+and unit files, re-enables and health-checks the prior gateway when applicable,
+and reports a hard failure if restoration is incomplete. It does not touch
+Nextcloud, Docker, Tailscale, the Mac coordinator, or the tunnel. Enable the
+tunnel separately only after its profile is verified.
 
 `--apply` stages and activates in one invocation for compatibility. If it
 creates templates or finds the dedicated broker config/token absent, it exits with status `3`
@@ -606,7 +607,43 @@ A restore is a new deployment action: restore into an empty state directory,
 validate permissions, start the coordinator, and verify health before
 submitting work.
 
-## 12. Cutover gate
+## 12. Optional HTTPS MCP gateway
+
+The HTTPS MCP gateway is an optional second ingress for clients that cannot use
+the Secure MCP Tunnel. It is not required for the tunnel path and must not be
+exposed directly.
+
+- Staging an HTTPS-capable release creates the `orchestra-mcp` group and
+  `orchestra-mcp-http` service identity before installing gateway configuration.
+- `/etc/orchestra/mcp-http.env` is owned by `orchestra-mcp-http`, group
+  `orchestra-mcp`, mode `0600`; the installer preserves existing contents and
+  never prints or replaces the token. Activation rejects a placeholder, a
+  token shorter than 32 characters, duplicate token lines, non-token keys, or
+  characters outside `[A-Za-z0-9._~+/=-]`.
+- The service binds only `127.0.0.1:8090`, allows only IPv4 loopback network
+  traffic, accepts only `AF_UNIX` and `AF_INET`, and reaches the coordinator
+  socket through the `orchestra-mcp` group. Cloudflare ingress is the only
+  intended external path.
+- Idle MCP sessions expire after 15 minutes, a background sweeper removes stale
+  sessions, concurrent sessions are capped, and shutdown/`DELETE` closes backend
+  sockets.
+- Rollback to a pre-HTTPS release disables and removes the gateway unit. The
+  `orchestra-mcp-http` identity, group traverse ACL, and token file remain
+  dormant; treat a security rollback as token-rotation event and remove those
+  residual objects through an owner-approved cleanup.
+- Staging an HTTPS-capable release requires Linux account tools (`getent`,
+  `groupadd`, `useradd`) and POSIX ACL tools (`setfacl`, `getfacl`). Portable
+  staging on another platform is limited to pre-HTTPS releases.
+- The installer places a self-contained verifier at
+  `/usr/local/lib/orchestra/http_gateway_verify.py`. Activation and rollback use
+  that stable copy, not the target release's historical verifier. When rolling
+  back to an older gateway release whose unit has the invalid
+  `SocketBindAllow=inet:` form, the installer installs the invoking hardened
+  unit instead; the historical code remains the rollback target.
+- Verify with `deploy/pixelbox/verify_mcp_http.sh` and the Cloudflare ingress
+  checks in [CLOUDFLARE-MCP.md](CLOUDFLARE-MCP.md).
+
+## 13. Cutover gate
 
 Do not cut over on unit tests alone. The owner must explicitly approve after all
 of the following evidence is recorded:
@@ -616,7 +653,7 @@ of the following evidence is recorded:
 3. `Config.load` validates the reviewed owner-only configuration.
 4. `omcp.health` reports `ok` (or a documented, accepted degraded reason).
 5. The dedicated tunnel profile passes `tunnel-client doctor` and `/readyz`.
-6. ChatGPT discovers all nine OMCP tools and `bridge_status` reports
+6. ChatGPT discovers the configured OMCP tools and `bridge_status` reports
    `platform=linux`, `sandbox.backend=bubblewrap`, and the expected workers.
 7. A harmless `routine_development` local Codex task starts without approval
    and returns a terminal result. An unclassified harmless task remains
@@ -658,9 +695,21 @@ ORCHESTRA_DEPLOY_APPROVED=1 ORCHESTRA_CUTOVER_APPROVED=1 \
 ```
 
 Rollback revalidates configuration against that release, atomically selects
-it, reinstalls its unit files, and restarts only the coordinator and health
-timer. The release being replaced becomes `previous`, so the operation is
-reversible. An activation failure also attempts this restoration automatically.
+it, installs the units present in that release, and restarts the coordinator
+and health timer. When the target is a pre-HTTPS release, it stops/removes the
+gateway and fails closed if the service remains enabled/active or a listener
+remains on port 8090. When the target includes the gateway, successful
+activation waits for the socket and an authenticated backend check; an
+automatic restoration after failure re-enables and restarts the prior gateway,
+then verifies its health, and reports a hard failure if that cannot be done.
+The release being replaced becomes `previous`, so the operation is reversible.
+An activation failure also attempts this restoration automatically.
+
+Activation and rollback use the self-contained verifier at
+`/usr/local/lib/orchestra/http_gateway_verify.py`, not a verifier supplied by
+the target release. For multi-step rollback, invoke the reviewed/hardened
+installer from the release you are leaving (or the verified `previous` release)
+rather than an older target's historical installer.
 
 Routing rollback remains a separate, explicitly approved operation:
 
@@ -670,7 +719,7 @@ Routing rollback remains a separate, explicitly approved operation:
 4. Re-run the Mac health and harmless-task checks.
 5. Do not delete PixelBox state until the owner authorises retention cleanup.
 
-## 13. Security notes and limitations
+## 14. Security notes and limitations
 
 - Never commit credentials. Never print a token, API key or capability value in
   a command, log, issue or task.

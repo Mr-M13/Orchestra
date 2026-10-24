@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import getpass
+import grp
 import os
 import shutil
 import subprocess
@@ -128,6 +129,7 @@ class BrokerConfigAccessTests(unittest.TestCase):
             "#!/usr/bin/env bash\n"
             "set -e\n"
             "if [[ \"${1:-}\" == \"-u\" ]]; then shift 2; fi\n"
+            "if [[ \"${1:-}\" == \"chown\" ]]; then exit 0; fi\n"
             "if [[ \"${1:-}\" == \"install\" ]]; then\n"
             "  shift\n"
             "  args=()\n"
@@ -154,6 +156,8 @@ class BrokerConfigAccessTests(unittest.TestCase):
             "ORCHESTRA_STATE_ROOT": str(self.base / "state"),
             "ORCHESTRA_SERVICE_USER": getpass.getuser(),
             "ORCHESTRA_BROKER_USER": self.broker,
+            "ORCHESTRA_MCP_HTTP_USER": getpass.getuser(),
+            "ORCHESTRA_MCP_HTTP_GROUP": grp.getgrgid(os.getgid()).gr_name,
             "ORCHESTRA_ACL_SUDO": "",
         }
         command = [

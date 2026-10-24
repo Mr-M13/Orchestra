@@ -1,0 +1,58 @@
+[Unit]
+Description=Orchestra loopback HTTP MCP gateway
+After=orchestra-omcp.service
+Requires=orchestra-omcp.service
+PartOf=orchestra-omcp.service
+StartLimitIntervalSec=60
+StartLimitBurst=10
+Conflicts=shutdown.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/orchestra/current
+User=orchestra-mcp-http
+Group=orchestra-mcp
+EnvironmentFile=/etc/orchestra/mcp-http.env
+# -E ignores PYTHON* variables from the owner-managed environment file; -B
+# avoids writing bytecode under ProtectSystem=strict.
+ExecStartPre=/usr/bin/python3 -E -B -c "import omcp.http_gateway"
+ExecStartPre=/usr/bin/test -r /etc/orchestra/mcp-http.env
+ExecStartPre=/bin/sh -c 'test "$(/usr/bin/grep -Ec "^ORCHESTRA_MCP_HTTP_TOKEN=" /etc/orchestra/mcp-http.env)" -eq 1 && ! /usr/bin/grep -Ev "^(#|$|ORCHESTRA_MCP_HTTP_TOKEN=)" /etc/orchestra/mcp-http.env >/dev/null && /usr/bin/grep -Eq "^ORCHESTRA_MCP_HTTP_TOKEN=[A-Za-z0-9._~+/=-]{32,}$" /etc/orchestra/mcp-http.env'
+ExecStartPre=/usr/bin/test -S /run/orchestra/omcp.sock
+ExecStart=/usr/bin/python3 -E -B -m omcp.http_gateway --socket /run/orchestra/omcp.sock --socket-owner hamed --socket-group orchestra-mcp --host 127.0.0.1 --port 8090
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+KillMode=control-group
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=200
+UMask=0077
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=no
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+CapabilityBoundingSet=
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressDeny=any
+IPAddressAllow=127.0.0.1/32
+# systemd >= 249: the gateway may bind only its reviewed loopback listener.
+SocketBindDeny=any
+SocketBindAllow=ipv4:tcp:8090
+
+[Install]
+WantedBy=multi-user.target
