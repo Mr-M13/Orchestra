@@ -51,4 +51,6 @@ jobs:
       - name: Validate deployment shell scripts
         run: |
           bash -n deploy/pixelbox/install.sh
+          bash -n deploy/pixelbox/config-access.sh
           bash -n deploy/pixelbox/verify.sh
+          bash -n deploy/pixelbox/verify_mcp_http.sh
