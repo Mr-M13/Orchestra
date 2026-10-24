@@ -40,6 +40,9 @@ class LocalApprovalClient:
 class OMCPClient:
     """Call only the dashboard's fixed, audited OMCP tool allowlist."""
 
+    _PROTOCOL_VERSION = "2025-06-18"
+    _CLIENT_INFO = {"name": "orchestra-dashboard", "version": "0.2.0"}
+
     _TOOLS = {
         "bridge_status", "worker_availability", "list_tasks", "task_snapshot",
         "task_status", "task_result", "list_approvals", "submit_task", "cancel_task",
@@ -55,20 +58,22 @@ class OMCPClient:
     def call(self, tool: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         if tool not in self._TOOLS:
             raise OMCPError("operation is not available in the dashboard")
-        self._request_number += 1
-        request = {
-            "jsonrpc": "2.0", "id": self._request_number, "method": "tools/call",
-            "params": {"name": tool, "arguments": arguments or {}},
-        }
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                 connection.settimeout(self.timeout)
                 connection.connect(self.socket_path)
-                connection.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
+                self._initialize(connection)
+                request_id = self._next_request_id()
+                request = {
+                    "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+                    "params": {"name": tool, "arguments": arguments or {}},
+                }
+                self._send(connection, request)
                 response = self._receive_line(connection)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             raise OMCPError("Orchestra is unavailable") from exc
-        if not isinstance(response, dict) or response.get("id") != self._request_number:
+        if (not isinstance(response, dict) or response.get("jsonrpc") != "2.0"
+                or response.get("id") != request_id):
             raise OMCPError("invalid response from Orchestra")
         result = response.get("result")
         if not isinstance(result, dict) or result.get("isError"):
@@ -77,6 +82,38 @@ class OMCPClient:
         if not isinstance(content, dict):
             raise OMCPError("invalid response from Orchestra")
         return content
+
+    def _next_request_id(self) -> int:
+        self._request_number += 1
+        return self._request_number
+
+    @staticmethod
+    def _send(connection: socket.socket, request: dict[str, Any]) -> None:
+        connection.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
+
+    def _initialize(self, connection: socket.socket) -> None:
+        request_id = self._next_request_id()
+        self._send(connection, {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": self._PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": self._CLIENT_INFO,
+            },
+        })
+        response = self._receive_line(connection)
+        if (not isinstance(response, dict) or response.get("jsonrpc") != "2.0"
+                or response.get("id") != request_id):
+            raise OMCPError("invalid response from Orchestra")
+        result = response.get("result")
+        if (not isinstance(result, dict)
+                or result.get("protocolVersion") != self._PROTOCOL_VERSION):
+            raise OMCPError("Orchestra initialization failed")
+        self._send(connection, {
+            "jsonrpc": "2.0", "method": "notifications/initialized",
+        })
 
     @staticmethod
     def _receive_line(connection: socket.socket) -> dict[str, Any]:
