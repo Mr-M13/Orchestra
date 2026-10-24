@@ -2819,14 +2819,19 @@ class ServerTests(unittest.TestCase):
         self.server = MCPServer(self.controller)
 
     def test_initialize_and_tool_discovery(self):
-        initialized = self.server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        session = self.server.new_session()
+        initialized = session.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
         self.assertEqual(initialized["result"]["serverInfo"]["name"], "orchestra-omcp")
-        listed = self.server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        session.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        listed = session.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
         self.assertEqual({tool["name"] for tool in TOOLS},
                          {tool["name"] for tool in listed["result"]["tools"]})
 
     def test_tool_call_returns_structured_content(self):
-        response = self.server.handle({
+        session = self.server.new_session()
+        session.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+        session.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        response = session.handle({
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
             "params": {"name": "bridge_status", "arguments": {}},
         })
@@ -2853,8 +2858,26 @@ class ServerTests(unittest.TestCase):
                 server_main(["--config", "/unused/config.json"])
 
     def test_unknown_method_uses_json_rpc_error(self):
-        response = self.server.handle({"jsonrpc": "2.0", "id": 4, "method": "unknown"})
+        session = self.server.new_session()
+        session.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+        session.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        response = session.handle({"jsonrpc": "2.0", "id": 4, "method": "unknown"})
         self.assertEqual(response["error"]["code"], -32601)
+
+    def test_handshake_rejects_unsupported_version_and_pre_ready_requests(self):
+        session = self.server.new_session()
+        early = session.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+        self.assertEqual(early["error"]["code"], -32002)
+        unsupported = session.handle({"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {"protocolVersion": "2026-07-28"}})
+        self.assertEqual(unsupported["error"]["code"], -32602)
+
+    def test_reconnect_requires_new_handshake(self):
+        first = self.server.new_session()
+        first.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+        first.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self.assertIn("result", first.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}))
+        second = self.server.new_session()
+        self.assertEqual(second.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}})["error"]["code"], -32002)
 
 
 class LocalApprovalChannelTests(unittest.TestCase):
@@ -2942,6 +2965,8 @@ class ServerLifecycleTests(unittest.TestCase):
             workspace_preparer=lambda *_: self.root, id_factory=lambda: next(ids),
         )
         self.server = MCPServer(self.controller)
+        self.server.handle({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+        self.server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
         self.call_id = 0
 
     def tearDown(self):
@@ -2998,6 +3023,8 @@ class ServerLifecycleTests(unittest.TestCase):
             id_factory=lambda: "11111111-1111-1111-1111-111111111111",
         )
         self.server = MCPServer(self.controller)
+        self.server.handle({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+        self.server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
         status = self.call("bridge_status")
         self.assertEqual(status["default_profile"], "orchestra")
@@ -3068,7 +3095,7 @@ class StdioIntegrationTests(unittest.TestCase):
             }))
             os.chmod(config_path, 0o600)
             requests = "\n".join(json.dumps(item) for item in [
-                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
                 {"jsonrpc": "2.0", "method": "notifications/initialized"},
                 {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
                 {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
