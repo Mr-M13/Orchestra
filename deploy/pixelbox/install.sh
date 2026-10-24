@@ -286,11 +286,22 @@ release_sha_from_link() {
 
 install_units() {
   local release_root="$1" unit
-  for unit in orchestra-omcp.service orchestra-github-dispatch.service orchestra-tunnel.service orchestra-mcp-http.service \
+  for unit in orchestra-omcp.service orchestra-github-dispatch.service orchestra-tunnel.service \
               orchestra-health.service orchestra-health.timer; do
     sudo install -m 0644 "$release_root/deploy/pixelbox/systemd/$unit" \
       "/etc/systemd/system/$unit"
   done
+  if [[ -f "$release_root/deploy/pixelbox/systemd/orchestra-mcp-http.service" ]]; then
+    sudo install -m 0644 "$release_root/deploy/pixelbox/systemd/orchestra-mcp-http.service" /etc/systemd/system/orchestra-mcp-http.service
+  else
+    sudo systemctl disable --now orchestra-mcp-http.service 2>/dev/null || true
+    sudo rm -f /etc/systemd/system/orchestra-mcp-http.service
+  fi
+}
+
+prepare_mcp_identity() {
+  getent group orchestra-mcp >/dev/null || sudo groupadd --system orchestra-mcp
+  id orchestra-mcp-http >/dev/null 2>&1 || sudo useradd --system --no-create-home --shell /usr/sbin/nologin --gid orchestra-mcp orchestra-mcp-http
 }
 
 preflight_activation() {
@@ -309,11 +320,15 @@ preflight_activation() {
   command -v systemctl >/dev/null || fail "systemctl is required"
   [[ -x /usr/bin/python3 ]] || fail "/usr/bin/python3 is required by the systemd units"
   validate_release_tree "$release_root"
-  for file in omcp.json omcp.env tunnel.env mcp-http.env; do
+  for file in omcp.json omcp.env tunnel.env; do
     [[ -f "$CONFIG_ROOT/$file" ]] || fail "required owner configuration is missing: $CONFIG_ROOT/$file"
     mode="$(sudo stat -c '%a' "$CONFIG_ROOT/$file")"
     [[ "$mode" == "600" ]] || fail "$CONFIG_ROOT/$file must have mode 0600"
   done
+  if [[ -f "$release_root/deploy/pixelbox/systemd/orchestra-mcp-http.service" ]]; then
+    [[ -f "$CONFIG_ROOT/mcp-http.env" ]] || fail "required gateway configuration is missing: $CONFIG_ROOT/mcp-http.env"
+    [[ "$(sudo stat -c '%a' "$CONFIG_ROOT/mcp-http.env")" == "600" ]] || fail "$CONFIG_ROOT/mcp-http.env must have mode 0600"
+  fi
 
   # Keep an existing credential-isolated broker deployment intact across
   # activate and rollback as well as staging.
@@ -349,6 +364,7 @@ activate_release() {
   fi
 
   install_units "$release_root"
+  if [[ -f "$release_root/deploy/pixelbox/systemd/orchestra-mcp-http.service" ]]; then prepare_mcp_identity; fi
   sudo systemctl daemon-reload
   atomic_symlink "releases/$RELEASE_SHA" "$CURRENT_LINK"
 
@@ -358,9 +374,7 @@ activate_release() {
       && sudo systemctl enable orchestra-omcp.service \
       && sudo systemctl enable --now orchestra-health.timer \
       && sudo systemctl restart orchestra-omcp.service \
-      && sudo systemctl enable orchestra-mcp-http.service \
-      && sudo systemctl restart orchestra-mcp-http.service \
-      && sudo systemctl is-active --quiet orchestra-mcp-http.service \
+      && { [[ ! -f "$release_root/deploy/pixelbox/systemd/orchestra-mcp-http.service" ]] || { sudo systemctl enable orchestra-mcp-http.service && sudo systemctl restart orchestra-mcp-http.service && sudo systemctl is-active --quiet orchestra-mcp-http.service; }; } \
       && sudo systemctl is-active --quiet orchestra-omcp.service \
       && sudo systemctl is-active --quiet orchestra-health.timer; then
     if [[ -n "$old_sha" && "$old_sha" != "$RELEASE_SHA" ]]; then
