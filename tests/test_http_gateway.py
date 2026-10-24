@@ -1,6 +1,6 @@
-import json, socket, tempfile, threading, unittest
+import json, socket, tempfile, threading, unittest, http.client
 from pathlib import Path
-from omcp.http_gateway import Gateway
+from omcp.http_gateway import Gateway, make_handler
 
 class GatewayTests(unittest.TestCase):
  def setUp(self):
@@ -26,3 +26,15 @@ class GatewayTests(unittest.TestCase):
  def test_rejects_early_and_unsupported(self):
   with self.assertRaises(PermissionError): self.g.rpc(None,b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}')
   with self.assertRaises(ValueError): self.g.rpc(None,b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28"}}')
+ def test_real_http_health_auth_and_lifecycle(self):
+  from http.server import ThreadingHTTPServer
+  h=ThreadingHTTPServer(('127.0.0.1',0),make_handler(self.g)); threading.Thread(target=h.serve_forever,daemon=True).start()
+  def req(method,path,body=None,headers={}):
+   c=http.client.HTTPConnection('127.0.0.1',h.server_port); c.request(method,path,body,headers); r=c.getresponse(); x=r.read(); heads=dict(r.getheaders()); c.close(); return r.status,x,heads
+  self.assertEqual(req('GET','/healthz')[0],200); self.assertEqual(req('GET','/readyz')[0],200)
+  self.assertEqual(req('POST','/mcp',b'{}')[0],401)
+  headers={'Authorization':'Bearer secret','Content-Type':'application/json'}
+  self.assertEqual(req('POST','/mcp',b'{bad',headers)[0],400)
+  s,b,heads=req('POST','/mcp',b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}',headers); self.assertEqual(s,200)
+  hh={**headers,'Mcp-Session-Id':heads['Mcp-Session-Id']}; self.assertEqual(req('POST','/mcp',b'{"jsonrpc":"2.0","method":"notifications/initialized"}',hh)[0],200)
+  self.assertEqual(req('POST','/mcp',b'{"jsonrpc":"2.0","id":2,"method":"tools/list"}',hh)[0],200); h.shutdown()
