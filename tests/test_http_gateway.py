@@ -461,6 +461,9 @@ class GatewayHTTPTests(GatewayTestBase):
             "POST", "/mcp", b"{}", {**self.headers, "Content-Length": "+2"},
         )[0], 400)
         self.assertEqual(self.request(
+            "POST", "/mcp", b"{}", {**self.headers, "Content-Length": "9" * 5000},
+        )[0], 400)
+        self.assertEqual(self.request(
             "POST", "/mcp", b"",
             {**self.headers, "Content-Length": str(MAX_BODY_BYTES + 1)},
         )[0], 413)

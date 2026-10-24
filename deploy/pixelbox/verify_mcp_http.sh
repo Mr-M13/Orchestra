@@ -12,7 +12,8 @@ ID="$(command -v id || true)"
 GREP="$(command -v grep || true)"
 AWK="$(command -v awk || true)"
 SUDO="$(command -v sudo || true)"
-for tool in SYSTEMCTL SS STAT GETENT ID GREP AWK SUDO; do
+SHA256SUM="$(command -v sha256sum || true)"
+for tool in SYSTEMCTL SS STAT GETENT ID GREP AWK SUDO SHA256SUM; do
   [[ -n "${!tool}" ]] || { echo "required verifier tool is unavailable: $tool" >&2; exit 1; }
 done
 
@@ -46,8 +47,7 @@ import sys
 from pathlib import Path
 
 values = []
-for raw in Path(sys.argv[1]).read_text().splitlines():
-    line = raw.strip()
+for line in Path(sys.argv[1]).read_text().splitlines():
     if not line or line.startswith("#"):
         continue
     if not line.startswith("ORCHESTRA_MCP_HTTP_TOKEN="):
@@ -67,7 +67,8 @@ read_token >/dev/null \
 "$SYSTEMCTL" is-enabled --quiet orchestra-mcp-http.service
 UNIT_SHOW="$("$SYSTEMCTL" show orchestra-mcp-http.service \
   -p User -p Group -p NoNewPrivileges -p ProtectSystem -p ProtectHome \
-  -p PrivateNetwork -p RestrictAddressFamilies)"
+  -p PrivateNetwork -p RestrictAddressFamilies -p PartOf \
+  -p IPAddressDeny -p IPAddressAllow -p SocketBindDeny -p SocketBindAllow)"
 for expected in \
   "User=orchestra-mcp-http" \
   "Group=orchestra-mcp" \
@@ -75,7 +76,12 @@ for expected in \
   "ProtectSystem=strict" \
   "ProtectHome=yes" \
   "PrivateNetwork=no" \
-  "RestrictAddressFamilies=AF_UNIX AF_INET"; do
+  "RestrictAddressFamilies=AF_UNIX AF_INET" \
+  "PartOf=orchestra-omcp.service" \
+  "IPAddressDeny=any" \
+  "IPAddressAllow=127.0.0.1/32" \
+  "SocketBindDeny=any" \
+  "SocketBindAllow=ipv4:tcp:8090"; do
   "$GREP" -qx "$expected" <<<"$UNIT_SHOW" \
     || { echo "gateway unit property mismatch: $expected" >&2; exit 1; }
 done
@@ -105,6 +111,18 @@ read -r SOCKET_UID SOCKET_GID SOCKET_MODE <<<"$SOCKET_METADATA"
   || { echo "coordinator socket identity/mode does not match policy" >&2; exit 1; }
 "$SUDO" -u "$MCP_HTTP_USER" /usr/bin/test -r /run/orchestra/omcp.sock
 "$SUDO" -u "$MCP_HTTP_USER" /usr/bin/test -w /run/orchestra/omcp.sock
+if [[ -f "$STABLE_VERIFIER" ]]; then
+  [[ "$("$STAT" -c '%u' "$STABLE_VERIFIER" 2>/dev/null || "$STAT" -f '%u' "$STABLE_VERIFIER")" == "0" \
+     && "$("$STAT" -c '%a' "$STABLE_VERIFIER" 2>/dev/null || "$STAT" -f '%Lp' "$STABLE_VERIFIER")" == "644" \
+     && "$("$STAT" -c '%s' "$STABLE_VERIFIER" 2>/dev/null || "$STAT" -f '%z' "$STABLE_VERIFIER")" -gt 0 ]] \
+    || { echo "stable verifier metadata is unsafe" >&2; exit 1; }
+  [[ -f "$STABLE_VERIFIER.sha256" ]] \
+    || { echo "stable verifier digest is missing" >&2; exit 1; }
+  EXPECTED_VERIFIER_HASH="$("$AWK" 'NR == 1 {print $1}' "$STABLE_VERIFIER.sha256")"
+  ACTUAL_VERIFIER_HASH="$("$SHA256SUM" "$STABLE_VERIFIER" | "$AWK" '{print $1}')"
+  [[ "$EXPECTED_VERIFIER_HASH" == "$ACTUAL_VERIFIER_HASH" ]] \
+    || { echo "stable verifier digest mismatch" >&2; exit 1; }
+fi
 (
   cd "$ROOT"
   if [[ -f "$STABLE_VERIFIER" ]]; then

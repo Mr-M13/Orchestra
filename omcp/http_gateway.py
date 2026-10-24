@@ -509,7 +509,8 @@ def make_handler(gateway: Gateway,
                       code="invalid_transfer_encoding")
                 return self.send(400, b'{"error":"invalid request size"}')
             lengths = self.headers.get_all("Content-Length") or []
-            if len(lengths) != 1 or re.fullmatch(r"[0-9]+", lengths[0]) is None:
+            if (len(lengths) != 1
+                    or re.fullmatch(r"[0-9]{1,12}", lengths[0]) is None):
                 audit("request_rejected", logging.WARNING,
                       status=400, code="invalid_content_length")
                 return self.send(400, b'{"error":"invalid request size"}')

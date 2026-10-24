@@ -37,7 +37,7 @@ ensure_group_traverse_acl() {
   local allowed_group="$2"
   local sudo_spec="${ORCHESTRA_ACL_SUDO-sudo}"
   local -a privilege=()
-  local entry mask current_mask new_mask other
+  local entry mask current_mask new_mask other owner_group
 
   [[ -d "$config_root" && ! -L "$config_root" ]] || return 0
   [[ -n "$allowed_group" ]] || return 1
@@ -49,8 +49,9 @@ ensure_group_traverse_acl() {
     || { echo "ERROR: getfacl is required to verify group traverse access" >&2; return 1; }
 
   other="$(_acl_permissions "$config_root" "other:")"
-  [[ "$other" == "---" ]] \
-    || { echo "ERROR: $config_root is not other-private" >&2; return 1; }
+  owner_group="$(_acl_permissions "$config_root" "group::")"
+  [[ "$other" == "---" && "$owner_group" == "---" ]] \
+    || { echo "ERROR: $config_root owning group or other access is not private" >&2; return 1; }
 
   if [[ -n "$sudo_spec" ]]; then
     read -r -a privilege <<< "$sudo_spec"
@@ -79,7 +80,7 @@ ensure_broker_traverse_acl() {
   local broker_user="${ORCHESTRA_BROKER_USER:-orchestra-github}"
   local sudo_spec="${ORCHESTRA_ACL_SUDO-sudo}"
   local -a privilege=()
-  local entry mask current_mask new_mask other
+  local entry mask current_mask new_mask other owner_group
 
   [[ -d "$config_root" && ! -L "$config_root" ]] || return 0
   # This helper only repairs an existing broker deployment.  It never creates
@@ -95,8 +96,9 @@ ensure_broker_traverse_acl() {
   # Fail closed if the root has already been opened to other users.  Repairing
   # the broker entry must never be used to bless a broader permission change.
   other="$(_acl_permissions "$config_root" "other:")"
-  [[ "$other" == "---" ]] \
-    || { echo "ERROR: $config_root is not other-private" >&2; return 1; }
+  owner_group="$(_acl_permissions "$config_root" "group::")"
+  [[ "$other" == "---" && "$owner_group" == "---" ]] \
+    || { echo "ERROR: $config_root owning group or other access is not private" >&2; return 1; }
 
   if [[ -n "$sudo_spec" ]]; then
     read -r -a privilege <<< "$sudo_spec"

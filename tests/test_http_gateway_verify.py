@@ -8,7 +8,7 @@ from pathlib import Path
 
 from omcp.http_gateway import Gateway, GatewayServer, make_handler
 from omcp.http_gateway_verify import (
-    Response, VerificationError, _rpc, read_token_file, verify,
+    Response, VerificationError, _notification_ack, _rpc, read_token_file, verify,
 )
 from tests.test_http_gateway import FakeBackend, TOKEN
 
@@ -71,6 +71,16 @@ class GatewayVerifierTests(unittest.TestCase):
                 {},
             ), 1)
 
+    def test_verifier_rejects_notification_error_bodies(self):
+        _notification_ack(Response(200, b"{}", {}))
+        _notification_ack(Response(200, b"", {}))
+        with self.assertRaises(VerificationError):
+            _notification_ack(Response(
+                200,
+                b'{"jsonrpc":"2.0","id":null,"error":{"code":-32600}}',
+                {},
+            ))
+
     def test_verifier_rejects_mismatched_ids_and_missing_results(self):
         with self.assertRaises(VerificationError):
             _rpc(Response(200, b'{"jsonrpc":"2.0","id":2,"result":{}}', {}), 1)
@@ -90,6 +100,12 @@ class GatewayVerifierTests(unittest.TestCase):
             path.write_text(
                 "PYTHONPATH=/tmp\nORCHESTRA_MCP_HTTP_TOKEN=" + "x" * 40 + "\n",
             )
+            with self.assertRaises(VerificationError):
+                read_token_file(path)
+            path.write_text("ORCHESTRA_MCP_HTTP_TOKEN=" + "x" * 40 + " \n")
+            with self.assertRaises(VerificationError):
+                read_token_file(path)
+            path.write_text(" \nORCHESTRA_MCP_HTTP_TOKEN=" + "x" * 40 + "\n")
             with self.assertRaises(VerificationError):
                 read_token_file(path)
 

@@ -91,12 +91,22 @@ release_has_gateway_unit() {
   [[ -f "$1/deploy/pixelbox/systemd/orchestra-mcp-http.service" ]]
 }
 
+gateway_unit_is_hardened() {
+  local unit="$1"
+  grep -qx 'User=orchestra-mcp-http' "$unit" 2>/dev/null \
+    && grep -qx 'Group=orchestra-mcp' "$unit" 2>/dev/null \
+    && grep -qx 'WorkingDirectory=/opt/orchestra/current' "$unit" 2>/dev/null \
+    && grep -q -- '--socket-owner hamed --socket-group orchestra-mcp' "$unit" 2>/dev/null \
+    && grep -qx 'RestrictAddressFamilies=AF_UNIX AF_INET' "$unit" 2>/dev/null \
+    && grep -qx 'IPAddressDeny=any' "$unit" 2>/dev/null \
+    && grep -qx 'PartOf=orchestra-omcp.service' "$unit" 2>/dev/null
+}
+
 gateway_unit_source() {
   local release_root="$1"
   local target="$release_root/deploy/pixelbox/systemd/orchestra-mcp-http.service"
   local stable="$SOURCE_ROOT/deploy/pixelbox/systemd/orchestra-mcp-http.service"
-  if grep -Eq '^SocketBindAllow=inet:' "$target" 2>/dev/null \
-      && [[ -f "$stable" ]]; then
+  if ! gateway_unit_is_hardened "$target" && [[ -f "$stable" ]]; then
     printf '%s\n' "$stable"
   else
     printf '%s\n' "$target"
@@ -241,8 +251,12 @@ install_gateway_verifier() {
     candidate="$RELEASES_ROOT/$RELEASE_SHA/omcp/http_gateway_verify.py"
   fi
   [[ -f "$candidate" ]] || return 0
+  command -v sha256sum >/dev/null || fail "sha256sum is required for the stable verifier"
   sudo install -d -m 0755 -o root -g root "$VERIFIER_ROOT"
   sudo install -m 0644 -o root -g root "$candidate" "$VERIFIER_PATH"
+  sha256sum "$VERIFIER_PATH" | awk '{print $1}' \
+    | sudo tee "$VERIFIER_PATH.sha256" >/dev/null
+  sudo chmod 0644 "$VERIFIER_PATH.sha256"
 }
 
 stage_configuration() {
@@ -255,6 +269,9 @@ stage_configuration() {
   sudo install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$STATE_ROOT"
   sudo install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" \
     "$(dirname "$STATE_ROOT")/backup"
+  [[ "$(sudo stat -c '%u' "$CONFIG_ROOT")" == "$(id -u "$SERVICE_USER")" \
+     && "$(sudo stat -c '%g' "$CONFIG_ROOT")" == "$(id -g "$SERVICE_USER")" ]] \
+    || fail "$CONFIG_ROOT must be owned by $SERVICE_USER"
 
   # install -d rewrites the ACL mask on an existing CONFIG_ROOT even when its
   # mode is already 0700.  Re-apply traverse-only entries after the directory
@@ -350,8 +367,9 @@ install_units() {
       sudo install -m 0644 "$release_root/deploy/pixelbox/systemd/$unit" \
         "$UNIT_ROOT/$unit"
     else
-      sudo systemctl disable --now "$unit" 2>/dev/null || true
-      sudo rm -f "$UNIT_ROOT/$unit"
+      # Non-gateway capabilities are owner-managed outside this rollback. Do
+      # not silently disable the tunnel, broker, or health services.
+      echo "NOTE: target release has no $unit; leaving the current unit untouched." >&2
     fi
   done
   if release_has_gateway_unit "$release_root"; then
@@ -408,8 +426,7 @@ import sys
 from pathlib import Path
 
 values = []
-for raw in Path(sys.argv[1]).read_text().splitlines():
-    line = raw.strip()
+for line in Path(sys.argv[1]).read_text().splitlines():
     if not line or line.startswith("#"):
         continue
     if not line.startswith("ORCHESTRA_MCP_HTTP_TOKEN="):
@@ -438,6 +455,10 @@ wait_for_omcp_socket() {
 wait_for_gateway_health() {
   local attempt verifier_args=()
   if [[ -f "$VERIFIER_PATH" ]]; then
+    [[ -f "$VERIFIER_PATH.sha256" ]] \
+      || { echo "ERROR: stable verifier digest is missing" >&2; return 1; }
+    [[ "$(cat "$VERIFIER_PATH.sha256")" == "$(sha256sum "$VERIFIER_PATH" | awk '{print $1}')" ]] \
+      || { echo "ERROR: stable verifier digest mismatch" >&2; return 1; }
     verifier_args=("$VERIFIER_PATH")
   else
     verifier_args=(-m omcp.http_gateway_verify)
@@ -484,6 +505,10 @@ preflight_activation() {
       || fail "the gateway unit requires the reviewed orchestra-mcp-http/orchestra-mcp identity"
     prepare_mcp_identity
   fi
+
+  [[ "$(sudo stat -c '%u' "$CONFIG_ROOT")" == "$(id -u "$SERVICE_USER")" \
+     && "$(sudo stat -c '%g' "$CONFIG_ROOT")" == "$(id -g "$SERVICE_USER")" ]] \
+    || fail "$CONFIG_ROOT must be owned by $SERVICE_USER"
 
   # Keep an existing credential-isolated broker deployment intact across
   # activate and rollback as well as staging.
@@ -560,6 +585,8 @@ activate_release() {
     sudo systemctl start orchestra-health.timer \
       || fail "activation failed and the prior health timer could not restart"
     if release_has_gateway_unit "$old_root"; then
+      sudo systemctl enable orchestra-mcp-http.service \
+        || fail "activation failed and the prior gateway could not be re-enabled"
       sudo systemctl restart orchestra-mcp-http.service \
         || fail "activation failed and the prior gateway could not restart"
       wait_for_omcp_socket || fail "activation failed and the prior gateway socket is unavailable"

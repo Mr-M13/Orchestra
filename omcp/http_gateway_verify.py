@@ -37,8 +37,7 @@ def _require(condition: bool, message: str) -> None:
 
 def read_token_file(path: Path) -> str:
     values = []
-    for raw in path.read_text().splitlines():
-        line = raw.strip()
+    for line in path.read_text().splitlines():
         if not line or line.startswith("#"):
             continue
         if not line.startswith("ORCHESTRA_MCP_HTTP_TOKEN="):
@@ -79,6 +78,18 @@ def _json_body(response: Response) -> dict:
         raise VerificationError("response is not valid JSON") from None
     _require(isinstance(value, dict), "response is not a JSON object")
     return value
+
+
+def _notification_ack(response: Response) -> None:
+    _require(response.status == 200, "notification was rejected")
+    if not response.body:
+        return
+    try:
+        value = json.loads(response.body)
+    except (ValueError, UnicodeDecodeError):
+        raise VerificationError("notification acknowledgement is not JSON") from None
+    _require(isinstance(value, dict), "notification acknowledgement is not an object")
+    _require("error" not in value, "notification acknowledgement contains an error")
 
 
 def _rpc(response: Response, request_id: int) -> dict:
@@ -144,7 +155,12 @@ def verify(host: str, port: int, token: str, cycles: int = 20) -> dict:
             b'{"jsonrpc":"2.0","method":"notifications/initialized"}',
             session_headers,
         )
-        _require(notification.status == 200, "initialized notification failed")
+        _notification_ack(notification)
+        _require(_request(
+            host, port, "POST", "/mcp",
+            b'{"jsonrpc":"2.0","id":9,"method":"tools/list"}',
+            {**wrong_headers, "Mcp-Session-Id": session},
+        ).status == 401, "valid session bypassed bearer authentication")
 
         tools = _rpc(_request(
             host, port, "POST", "/mcp",

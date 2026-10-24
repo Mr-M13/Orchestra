@@ -694,14 +694,21 @@ ORCHESTRA_DEPLOY_APPROVED=1 ORCHESTRA_CUTOVER_APPROVED=1 \
 ```
 
 Rollback revalidates configuration against that release, atomically selects
-it, reinstalls its unit files, and restarts the coordinator and health timer.
-When the target is a pre-HTTPS release, it stops and removes the gateway unit
-and fails closed if a listener remains on port 8090. When the target includes
-the gateway, successful activation waits for the socket and an authenticated
-backend check; an automatic restoration after failure restarts the prior
-gateway on a best-effort basis and reports the failure. The release being
-replaced becomes `previous`, so the operation is reversible. An activation
-failure also attempts this restoration automatically.
+it, installs the units present in that release, and restarts the coordinator
+and health timer. When the target is a pre-HTTPS release, it stops/removes the
+gateway and fails closed if the service remains enabled/active or a listener
+remains on port 8090. When the target includes the gateway, successful
+activation waits for the socket and an authenticated backend check; an
+automatic restoration after failure re-enables and restarts the prior gateway,
+then verifies its health, and reports a hard failure if that cannot be done.
+The release being replaced becomes `previous`, so the operation is reversible.
+An activation failure also attempts this restoration automatically.
+
+Activation and rollback use the self-contained verifier at
+`/usr/local/lib/orchestra/http_gateway_verify.py`, not a verifier supplied by
+the target release. For multi-step rollback, invoke the reviewed/hardened
+installer from the release you are leaving (or the verified `previous` release)
+rather than an older target's historical installer.
 
 Routing rollback remains a separate, explicitly approved operation:
 

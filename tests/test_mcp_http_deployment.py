@@ -143,9 +143,18 @@ class InstallerSourceTests(unittest.TestCase):
         installer = source[source.index("install_gateway_verifier()"):source.index("stage_configuration()")]
         self.assertIn("$SOURCE_ROOT/omcp/http_gateway_verify.py", installer)
         self.assertIn("$RELEASES_ROOT/$RELEASE_SHA/omcp/http_gateway_verify.py", installer)
+        self.assertIn("sha256sum", installer)
         self.assertIn("install_gateway_verifier", source[source.index("activate_release()"):source.index("main()")])
         verifier = (ROOT / "deploy/pixelbox/verify_mcp_http.sh").read_text()
         self.assertIn("STABLE_VERIFIER", verifier)
+        self.assertIn("stable verifier digest mismatch", verifier)
+
+    def test_failed_restore_re_enables_and_rechecks_prior_gateway(self):
+        source = INSTALL.read_text()
+        failure = source[source.index('echo "Activation failed; restoring'):source.index("main()")]
+        self.assertIn("systemctl enable orchestra-mcp-http.service", failure)
+        self.assertIn("systemctl restart orchestra-mcp-http.service", failure)
+        self.assertIn("wait_for_gateway_health", failure)
 
     def test_portable_staging_rejects_gateway_releases(self):
         source = INSTALL.read_text()
@@ -206,7 +215,6 @@ cat "$calls"
         self.assertIn("orchestra-mcp-http.service", upgrade)
         self.assertIn("rm -f", rollback)
         self.assertIn("orchestra-mcp-http.service", rollback)
-        self.assertIn("orchestra-github-dispatch.service", rollback)
 
     def test_enabled_but_inactive_gateway_is_disabled_and_removed(self):
         result = run_bash(r'''
@@ -268,7 +276,8 @@ set -euo pipefail
 source deploy/pixelbox/install.sh
 release="$(mktemp -d)"
 mkdir -p "$release/deploy/pixelbox/systemd"
-printf '%s\n' '[Service]' 'SocketBindAllow=inet:8090' \
+printf '%s\n' '[Service]' 'User=hamed' 'Group=hamed' \
+  'SocketBindAllow=inet:8090' \
   > "$release/deploy/pixelbox/systemd/orchestra-mcp-http.service"
 gateway_unit_source "$release"
 ''')
@@ -392,7 +401,8 @@ cat "$CONFIG_ROOT/mcp-http.env"
             "ensure_broker_traverse_acl()",
         )]
         self.assertIn('setfacl -m "g:$allowed_group:--x"', helper)
-        self.assertIn('[[ "$other" == "---" ]]', helper)
+        self.assertIn('owner_group="$(_acl_permissions "$config_root" "group::")"', helper)
+        self.assertIn('[[ "$other" == "---" && "$owner_group" == "---" ]]', helper)
         self.assertNotIn("chmod -R", helper)
         self.assertNotIn("chown -R", helper)
         self.assertNotIn("rwx", helper)
