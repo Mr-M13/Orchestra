@@ -7,6 +7,7 @@ import signal
 import socket
 import sys
 import threading
+import grp
 from pathlib import Path
 from typing import Any, Callable
 
@@ -246,7 +247,7 @@ class MCPServer:
         finally:
             self._stop_auxiliary(local_approval, ticker)
 
-    def run_socket(self, socket_path: Path) -> int:
+    def run_socket(self, socket_path: Path, socket_group: str | None = None) -> int:
         """Serve JSON-RPC over an owner-only Unix socket.
 
         The tunnel client owns a small stdio proxy, while this process remains
@@ -259,7 +260,11 @@ class MCPServer:
         socket_path.unlink(missing_ok=True)
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(str(socket_path))
-        os.chmod(socket_path, 0o600)
+        if socket_group:
+            os.chown(socket_path, -1, grp.getgrnam(socket_group).gr_gid)
+            os.chmod(socket_path, 0o660)
+        else:
+            os.chmod(socket_path, 0o600)
         listener.listen(8)
         listener.settimeout(0.5)
         local_approval, ticker = self._start_auxiliary()
@@ -414,6 +419,7 @@ def main(argv: list[str] | None = None) -> int:
         "--socket", type=Path,
         help="serve JSON-RPC on an owner-only Unix socket instead of stdio",
     )
+    parser.add_argument("--socket-group")
     args = parser.parse_args(argv)
     config = Config.load(args.config)
     if os.environ.get("OMCP_TUNNEL_AUTHENTICATED") != "1":
@@ -431,7 +437,7 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGINT, stop)
     try:
         if args.socket is not None:
-            return server.run_socket(args.socket)
+            return server.run_socket(args.socket, args.socket_group)
         return server.run()
     finally:
         controller.close()

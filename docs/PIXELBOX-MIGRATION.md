@@ -386,7 +386,7 @@ tunnel-client init \
   --sample sample_mcp_stdio_local \
   --profile pixelbox \
   --tunnel-id tunnel_REPLACE_WITH_VERIFIED_TUNNEL_ID \
-  --mcp-command "python3 -m omcp.mcp_proxy --socket /home/hamed/orchestra-migration/state/mcp.sock"
+  --mcp-command "python3 -m omcp.mcp_proxy --socket /run/orchestra/omcp.sock"
 unset CONTROL_PLANE_API_KEY
 ```
 

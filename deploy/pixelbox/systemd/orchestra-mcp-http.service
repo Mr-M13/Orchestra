@@ -5,8 +5,9 @@ Requires=orchestra-omcp.service
 [Service]
 User=orchestra-mcp-http
 Group=orchestra-mcp-http
+SupplementaryGroups=orchestra-mcp
 EnvironmentFile=/etc/orchestra/mcp-http.env
-ExecStart=/usr/bin/python3 -m omcp.http_gateway --socket /home/hamed/orchestra-migration/state/mcp.sock --host 127.0.0.1 --port 8090
+ExecStart=/usr/bin/python3 -m omcp.http_gateway --socket /run/orchestra/omcp.sock --host 127.0.0.1 --port 8090
 Restart=on-failure
 RestartSec=2
 NoNewPrivileges=yes
@@ -15,7 +16,7 @@ PrivateDevices=yes
 PrivateNetwork=no
 ProtectSystem=strict
 ProtectHome=yes
-ReadOnlyPaths=/home/hamed/orchestra-migration/state/mcp.sock
+ReadOnlyPaths=/run/orchestra/omcp.sock
 ProtectControlGroups=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
@@ -26,5 +27,7 @@ ProtectProc=invisible
 ProcSubset=pid
 NoNewPrivileges=yes
 RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressDeny=any
+IPAddressAllow=127.0.0.1/32
 [Install]
 WantedBy=multi-user.target
