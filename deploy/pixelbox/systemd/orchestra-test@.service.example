@@ -1,0 +1,66 @@
+# Inactive Phase 1 example. Do not install or enable without a separately
+# approved PixelBox canary. %i must be a full lower-case Git SHA.
+[Unit]
+Description=Orchestra fixed-profile test for release %i
+Documentation=file:/opt/orchestra/current/docs/PIXELBOX-TEST-LAUNCHER.md
+After=local-fs.target
+ConditionPathExists=/opt/orchestra/releases/%i/.orchestra-release-sha
+
+[Service]
+Type=exec
+RemainAfterExit=yes
+User=orchestra-test
+Group=orchestra-test
+SupplementaryGroups=
+UMask=0077
+WorkingDirectory=/opt/orchestra/releases/%i
+ExecStart=/usr/local/libexec/orchestra-test-runner run --job /var/lib/orchestra-test/jobs/%i.json --releases-root /opt/orchestra/releases
+TimeoutStartSec=120
+MemoryMax=1G
+TasksMax=128
+CPUQuota=200%
+KillMode=control-group
+KillSignal=SIGTERM
+SendSIGKILL=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateUsers=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateIPC=yes
+PrivateNetwork=yes
+ProtectSystem=strict
+ProtectHome=tmpfs
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=none
+SocketBindDeny=any
+IPAddressDeny=any
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+ReadOnlyPaths=/opt/orchestra/releases/%i /var/lib/orchestra-test/jobs/%i.json /usr /bin /lib -/lib64 /usr/lib -/usr/lib64 /usr/local/lib/orchestra-test-launcher
+InaccessiblePaths=/etc/orchestra /root /run/docker.sock /var/run/docker.sock /run/tailscale /var/run/tailscale /var/lib/tailscale /var/lib/orchestra-test/receipts
+StandardOutput=journal
+StandardError=journal
+LogRateLimitIntervalSec=1s
+LogRateLimitBurst=8
+LimitFSIZE=32768
+TemporaryFileSystem=/tmp:rw,size=1M,nosuid,nodev,noexec
+Environment=PATH=/usr/bin:/bin
+SetLoginEnvironment=no
+UnsetEnvironment=HOME XDG_CONFIG_HOME XDG_DATA_HOME SSH_AUTH_SOCK SSH_AGENT_PID GIT_ASKPASS GITHUB_TOKEN DEEPSEEK_API_KEY
+
+# Root-only preparation and receipt commands live outside this unit. The direct
+# worker cannot open output or receipt paths; inherited stdout is bounded.

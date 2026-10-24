@@ -4,6 +4,10 @@
 set -euo pipefail
 
 SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+DEPLOY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=config-access.sh
+source "$DEPLOY_ROOT/config-access.sh"
+BROKER_USER="${ORCHESTRA_BROKER_USER:-orchestra-github}"
 INSTALL_ROOT="${ORCHESTRA_INSTALL_ROOT:-/opt/orchestra}"
 CONFIG_ROOT="${ORCHESTRA_CONFIG_ROOT:-/etc/orchestra}"
 STATE_ROOT="${ORCHESTRA_STATE_ROOT:-/home/hamed/orchestra-migration/state}"
@@ -84,9 +88,7 @@ validate_source_commit() {
   for required in \
     omcp/server.py \
     omcp/health.py \
-    .github/workflows/orchestra-worker.yml \
-    deploy/pixelbox/systemd/orchestra-omcp.service \
-    deploy/pixelbox/systemd/orchestra-github-dispatch.service; do
+    deploy/pixelbox/systemd/orchestra-omcp.service; do
     git -C "$SOURCE_ROOT" cat-file -e "$RELEASE_SHA:$required" 2>/dev/null \
       || fail "release commit is missing reviewed file: $required"
   done
@@ -183,9 +185,7 @@ validate_release_tree() {
     .github/workflows/orchestra-worker.yml \
     deploy/pixelbox/install.sh \
     deploy/pixelbox/verify.sh \
-    deploy/pixelbox/systemd/orchestra-omcp.service \
-    deploy/pixelbox/systemd/orchestra-github-dispatch.service \
-    deploy/pixelbox/github-dispatch.example.json; do
+    deploy/pixelbox/systemd/orchestra-omcp.service; do
     sudo test -r "$release_root/$required" \
       || fail "staged release is missing reviewed file: $required"
   done
@@ -241,6 +241,12 @@ stage_configuration() {
   sudo install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" \
     "$(dirname "$STATE_ROOT")/backup"
 
+  # install -d rewrites the ACL mask on an existing CONFIG_ROOT even when its
+  # mode is already 0700.  Re-apply the broker's traverse-only entry after the
+  # directory operations so repeated staging cannot strand the broker.
+  ensure_broker_traverse_acl "$CONFIG_ROOT" \
+    || fail "could not preserve dispatch broker configuration access"
+
   if [[ ! -f "$CONFIG_ROOT/omcp.json" ]]; then
     sudo install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_USER" \
       "$release_root/deploy/pixelbox/omcp.example.json" "$CONFIG_ROOT/omcp.json"
@@ -255,11 +261,6 @@ stage_configuration() {
       STAGED_ONLY=1
     fi
   done
-  if [[ ! -f "$CONFIG_ROOT/github-dispatch/config.json" \
-      || ! -f "$CONFIG_ROOT/github-dispatch/github-actions.token" ]]; then
-    echo "Dedicated GitHub broker identity/configuration is not installed. Follow the reviewed migration runbook after separate approval."
-    STAGED_ONLY=1
-  fi
 }
 
 configuration_is_ready_for_activation() {
@@ -293,7 +294,7 @@ install_units() {
 }
 
 preflight_activation() {
-  local release_root="$RELEASES_ROOT/$RELEASE_SHA" mode coordinator_uid broker_uid
+  local release_root="$RELEASES_ROOT/$RELEASE_SHA" mode broker_uid
   [[ "$(uname -s)" == "Linux" ]] || fail "activation is supported only on Linux"
   [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]] \
     || fail "--apply requires a Linux ARM64 host"
@@ -313,26 +314,29 @@ preflight_activation() {
     mode="$(sudo stat -c '%a' "$CONFIG_ROOT/$file")"
     [[ "$mode" == "600" ]] || fail "$CONFIG_ROOT/$file must have mode 0600"
   done
-  id orchestra-github >/dev/null 2>&1 || fail "dedicated orchestra-github account is missing"
-  getent group orchestra-ipc >/dev/null 2>&1 || fail "orchestra-ipc group is missing"
-  coordinator_uid="$(id -u "$SERVICE_USER")"
-  broker_uid="$(id -u orchestra-github)"
-  [[ "$coordinator_uid" != "$broker_uid" ]] || fail "GitHub broker must use a different UID"
-  for file in github-dispatch/config.json github-dispatch/github-actions.token; do
-    sudo test -f "$CONFIG_ROOT/$file" || fail "broker configuration is missing: $CONFIG_ROOT/$file"
-    [[ "$(sudo stat -c '%a' "$CONFIG_ROOT/$file")" == "600" ]] \
-      || fail "$CONFIG_ROOT/$file must have mode 0600"
-    [[ "$(sudo stat -c '%u' "$CONFIG_ROOT/$file")" == "$broker_uid" ]] \
-      || fail "$CONFIG_ROOT/$file must be owned by orchestra-github"
-  done
-  [[ "$(sudo stat -c '%a' "$CONFIG_ROOT/github-dispatch")" == "700" ]] \
-    || fail "$CONFIG_ROOT/github-dispatch must have mode 0700"
-  [[ "$(sudo stat -c '%u' "$CONFIG_ROOT/github-dispatch")" == "$broker_uid" ]] \
-    || fail "$CONFIG_ROOT/github-dispatch must be owned by orchestra-github"
-  sudo -u orchestra-github PYTHONPATH="$release_root" /usr/bin/python3 -c \
-    'import sys; from pathlib import Path; from omcp.github_dispatch_service import ServiceConfig; ServiceConfig.load(Path(sys.argv[1]))' \
-    "$CONFIG_ROOT/github-dispatch/config.json" \
-    || fail "dispatch broker configuration preflight failed"
+
+  # Keep an existing credential-isolated broker deployment intact across
+  # activate and rollback as well as staging.
+  ensure_broker_traverse_acl "$CONFIG_ROOT" \
+    || fail "could not preserve dispatch broker configuration access"
+  if id "$BROKER_USER" >/dev/null 2>&1 && sudo test -d "$CONFIG_ROOT/github-dispatch"; then
+    broker_uid="$(id -u "$BROKER_USER")"
+    [[ "$(sudo stat -c '%a' "$CONFIG_ROOT/github-dispatch")" == "700" ]] \
+      || fail "$CONFIG_ROOT/github-dispatch must have mode 0700"
+    [[ "$(sudo stat -c '%u' "$CONFIG_ROOT/github-dispatch")" == "$broker_uid" ]] \
+      || fail "$CONFIG_ROOT/github-dispatch must be owned by $BROKER_USER"
+    sudo -u "$BROKER_USER" /usr/bin/test -x "$CONFIG_ROOT" \
+      || fail "$BROKER_USER cannot traverse $CONFIG_ROOT"
+    for file in github-dispatch/config.json github-dispatch/github-actions.token; do
+      sudo test -f "$CONFIG_ROOT/$file" || fail "broker configuration is missing: $CONFIG_ROOT/$file"
+      [[ "$(sudo stat -c '%a' "$CONFIG_ROOT/$file")" == "600" ]] \
+        || fail "$CONFIG_ROOT/$file must have mode 0600"
+      [[ "$(sudo stat -c '%u' "$CONFIG_ROOT/$file")" == "$broker_uid" ]] \
+        || fail "$CONFIG_ROOT/$file must be owned by $BROKER_USER"
+      sudo -u "$BROKER_USER" /usr/bin/test -r "$CONFIG_ROOT/$file" \
+        || fail "$BROKER_USER cannot read $CONFIG_ROOT/$file"
+    done
+  fi
 }
 
 activate_release() {
@@ -348,9 +352,7 @@ activate_release() {
   sudo systemctl daemon-reload
   atomic_symlink "releases/$RELEASE_SHA" "$CURRENT_LINK"
 
-  if sudo systemctl enable --now orchestra-github-dispatch.service \
-      && sudo systemctl is-active --quiet orchestra-github-dispatch.service \
-      && PYTHONPATH="$release_root" /usr/bin/python3 -c \
+  if PYTHONPATH="$release_root" /usr/bin/python3 -c \
         'import sys; from pathlib import Path; from omcp.controller import Config; Config.load(Path(sys.argv[1]))' \
         "$CONFIG_ROOT/omcp.json" \
       && sudo systemctl enable orchestra-omcp.service \
@@ -371,14 +373,13 @@ activate_release() {
     atomic_symlink "releases/$old_sha" "$CURRENT_LINK"
     install_units "$old_root"
     sudo systemctl daemon-reload
-    sudo systemctl restart orchestra-github-dispatch.service || true
     sudo systemctl restart orchestra-omcp.service || true
     sudo systemctl start orchestra-health.timer || true
     fail "activation failed; current was restored to $old_sha"
   fi
   sudo unlink "$CURRENT_LINK" 2>/dev/null || true
-  sudo systemctl stop orchestra-omcp.service orchestra-github-dispatch.service orchestra-health.timer || true
-  sudo systemctl disable orchestra-omcp.service orchestra-github-dispatch.service orchestra-health.timer || true
+  sudo systemctl stop orchestra-omcp.service orchestra-health.timer || true
+  sudo systemctl disable orchestra-omcp.service orchestra-health.timer || true
   fail "first activation failed; no prior managed release was available"
 }
 

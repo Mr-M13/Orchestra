@@ -9,21 +9,25 @@ import sys
 import tempfile
 import threading
 import unittest
+import uuid
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 from urllib.parse import urlparse
 
+from omcp import worker_contract
 from omcp.approval import format_review
 from omcp.controller import (
     AuthorizationError, Config, HostOperation, Principal, RepositoryProfile, StandingAuthorization,
-    TaskController, Worker,
+    TaskController, Worker, systemd_user_worker_command,
 )
 from omcp.docker_gate import gated_command
 from omcp.host_runner import run as run_host_operation
 from omcp.local_control import LocalApprovalServer, approval_request
 from omcp.runner import (
-    OpenCodeDiagnosticCollector, PinnedProviderGateway, opencode_commands,
-    opencode_environment, opencode_policy, run as run_worker, run_opencode_process,
+    OpenCodeDiagnosticCollector, PinnedProviderGateway, WorkerSandboxStartupError,
+    opencode_commands, opencode_environment, opencode_policy,
+    probe_codex_sandbox, run as run_worker, run_opencode_process,
+    worker_log_has_sandbox_startup_failure,
 )
 from omcp.server import MCPServer, TOOLS, main as server_main
 
@@ -45,6 +49,38 @@ def codex_fixture(directory: Path) -> dict[str, str]:
     bin_dir.mkdir(exist_ok=True)
     executable = bin_dir / "codex"
     executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    return {**os.environ, "PATH": str(bin_dir)}
+
+
+def codex_success_side_effect(result_path: Path, text: str = "finished"):
+    """Simulate Codex writing its mandatory final-message file."""
+    def execute(*_args, **_kwargs):
+        Path(result_path).write_text(text)
+        return Mock(returncode=0)
+    return execute
+
+
+def codex_contract_fixture(
+    directory: Path, *, result: str = "worker finished",
+    contract: str | None = '{"status":"success"}',
+) -> dict[str, str]:
+    """Create a fake Codex that writes a result and optional structured files."""
+    bin_dir = directory / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    executable = bin_dir / "codex"
+    lines = [
+        "#!/bin/sh",
+        'while [ "$#" -gt 0 ]; do',
+        '  if [ "$1" = "--output-last-message" ]; then shift; result="$1"; fi',
+        "  shift",
+        "done",
+        f"printf '%s\\n' '{result}' > \"$result\"",
+    ]
+    if contract is not None:
+        lines.append(f"printf '%s\\n' '{contract}' > \"$TMPDIR/orchestra-completion.json\"")
+    lines.append("exit 0")
+    executable.write_text("\n".join(lines) + "\n")
     executable.chmod(0o700)
     return {**os.environ, "PATH": str(bin_dir)}
 
@@ -86,10 +122,13 @@ class ControllerTests(unittest.TestCase):
     def complete(self, task_id, exit_code=0, result="finished"):
         task = self.controller.state["tasks"][task_id]
         Path(task["result_path"]).write_text(result)
-        Path(task["completion_path"]).write_text(json.dumps({
+        record = {
             "exit_code": exit_code, "finished_at": "2026-10-11T00:00:00+00:00",
             "runner_error": None,
-        }))
+        }
+        if task.get("requires_completion_contract"):
+            record["completion_contract"] = "success" if exit_code == 0 else "failure"
+        Path(task["completion_path"]).write_text(json.dumps(record))
 
     def test_submission_is_durable_acknowledged_and_idempotent(self):
         first = self.submit()
@@ -120,7 +159,7 @@ class ControllerTests(unittest.TestCase):
         self.controller.config = replace(
             self.config, local_worker_git_mode="owner_synced", local_worker_source_sha=sha,
         )
-        profile = self.config.profile("default")
+        profile = self.controller.config.profile("default")
         def fake_git(_root, *args, **_kwargs):
             return (1, "") if "show-ref" in args else (0, sha)
         with patch.object(self.controller, "_verify_profile_origin"), \
@@ -138,8 +177,64 @@ class ControllerTests(unittest.TestCase):
                 patch.object(self.controller, "_git", return_value=(0, "b" * 40)):
             with self.assertRaisesRegex(RuntimeError, "differs from pinned"):
                 self.controller._prepare_workspace(
-                    "test-mismatch", "omcp/task-mismatch", self.config.profile("default"), False,
+                    "test-mismatch", "omcp/task-mismatch",
+                    self.controller.config.profile("default"), False,
                 )
+
+    def test_profiles_prepare_unrelated_repositories_independently(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root_a = base / "repo-a"; root_a.mkdir()
+            root_b = base / "repo-b"; root_b.mkdir()
+            profiles = {
+                "a": RepositoryProfile(
+                    "a", "owner/repo-a", root_a, "origin/main",
+                    "owner_synced", "a" * 40,
+                ),
+                "b": RepositoryProfile(
+                    "b", "owner/repo-b", root_b, "origin/main", "fetch", None,
+                ),
+            }
+            self.controller.config = replace(
+                self.config, repository_profiles=profiles, default_profile="a",
+                local_worker_git_mode="owner_synced",
+                local_worker_source_sha="a" * 40,
+            )
+            calls = []
+
+            def fake_git(root, *args, **_kwargs):
+                calls.append((Path(root).name, args))
+                if args[:2] == ("remote", "get-url"):
+                    repo = "repo-a" if Path(root).name == "repo-a" else "repo-b"
+                    return 0, f"https://github.com/owner/{repo}.git"
+                if args[0] == "fetch":
+                    return 0, ""
+                if args[:2] == ("rev-parse", "--verify"):
+                    return 0, "a" * 40
+                if args[0] == "show-ref":
+                    return 1, ""
+                return 0, ""
+
+            with patch.object(self.controller, "_git", side_effect=fake_git):
+                path_a = self.controller._prepare_workspace(
+                    "task-a", "omcp/task-a", self.controller.config.profile("a"), False,
+                )
+                calls_a = list(calls)
+                calls.clear()
+                path_b = self.controller._prepare_workspace(
+                    "task-b", "omcp/task-b", self.controller.config.profile("b"), True,
+                )
+                calls_b = list(calls)
+        self.assertEqual(path_a, self.state / "worktrees" / "a" / "task-a")
+        self.assertEqual(path_b, self.state / "worktrees" / "b" / "task-b")
+        self.assertFalse(any(args[0] == "fetch" for _root, args in calls_a))
+        self.assertTrue(any(args[0] == "fetch" for _root, args in calls_b))
+        self.assertTrue(any(
+            args[:2] == ("rev-parse", "--verify") for _root, args in calls_a
+        ))
+        self.assertFalse(any(
+            args[:2] == ("rev-parse", "--verify") for _root, args in calls_b
+        ))
 
     def test_owner_synced_local_worker_rejects_wrong_origin(self):
         self.controller.config = replace(
@@ -148,8 +243,105 @@ class ControllerTests(unittest.TestCase):
         with patch.object(self.controller, "_git", return_value=(0, "https://github.com/other/repo.git")):
             with self.assertRaisesRegex(RuntimeError, "origin must match"):
                 self.controller._prepare_workspace(
-                    "test-origin", "omcp/task-origin", self.config.profile("default"), False,
+                    "test-origin", "omcp/task-origin",
+                    self.controller.config.profile("default"), False,
                 )
+
+    def test_systemd_user_worker_command_is_hardened(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task_dir = root / "task"
+            workspace = root / "workspace"
+            git_dir = root / "git-worktree"
+            codex_home = root / "codex-home"
+            for path in (task_dir, workspace, git_dir, codex_home):
+                path.mkdir()
+            environment = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": str(root)}
+            with patch("omcp.controller.host_platform", return_value="linux"), \
+                    patch("omcp.controller.shutil.which",
+                          side_effect=lambda name: f"/usr/bin/{name}"), \
+                    patch("omcp.controller.systemd_user_runtime_dir", return_value=root):
+                command, unit, runtime = systemd_user_worker_command(
+                    ["/usr/bin/python3", "-m", "omcp.runner", "--spec", "spec.json"],
+                    task_id="11111111-1111-1111-1111-111111111111",
+                    task_dir=task_dir, workspace=workspace,
+                    git_metadata_paths=(git_dir,), codex_home=codex_home,
+                    source_root=root, max_worker_seconds=90,
+                    environment=environment,
+                )
+        self.assertEqual(command[0], "/usr/bin/systemd-run")
+        self.assertIn("--user", command)
+        self.assertIn("--wait", command)
+        self.assertIn("--collect", command)
+        self.assertIn("--unit=orchestra-worker-11111111-1111-1111-1111-111111111111", command)
+        properties = {value.removeprefix("--property=") for value in command
+                      if value.startswith("--property=")}
+        self.assertIn("ProtectSystem=strict", properties)
+        self.assertIn("ProtectHome=read-only", properties)
+        self.assertIn("PrivateTmp=yes", properties)
+        self.assertIn("NoNewPrivileges=yes", properties)
+        self.assertIn("RestrictSUIDSGID=no", properties)
+        self.assertIn("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK", properties)
+        self.assertIn(f"ReadWritePaths={task_dir}", properties)
+        self.assertIn(f"ReadWritePaths={workspace}", properties)
+        self.assertIn(f"ReadWritePaths={git_dir}", properties)
+        self.assertIn(f"ReadWritePaths={codex_home}", properties)
+        self.assertEqual(unit, "orchestra-worker-11111111-1111-1111-1111-111111111111")
+        self.assertEqual(runtime, root)
+        self.assertEqual(environment["XDG_RUNTIME_DIR"], str(root))
+        self.assertIn("--", command)
+        self.assertEqual(command[command.index("--") + 1:], [
+            "/usr/bin/python3", "-m", "omcp.runner", "--spec", "spec.json",
+        ])
+
+    def test_systemd_user_worker_command_rejects_non_linux_hosts(self):
+        with patch("omcp.controller.host_platform", return_value="darwin"):
+            with self.assertRaisesRegex(RuntimeError, "only on Linux"):
+                systemd_user_worker_command(
+                    ["/usr/bin/python3", "-m", "omcp.runner"],
+                    task_id="11111111-1111-1111-1111-111111111111",
+                    task_dir=Path("/tmp/task"), workspace=Path("/tmp/workspace"),
+                    git_metadata_paths=(), codex_home=None, source_root=Path("/tmp"),
+                    max_worker_seconds=90, environment={},
+                )
+
+    def test_systemd_user_launcher_is_used_for_local_codex_worker(self):
+        self.controller.config = replace(
+            self.config, local_worker_launcher="systemd-user",
+        )
+        unit = "orchestra-worker-11111111-1111-1111-1111-111111111111"
+        launch = Mock(return_value=(
+            ["/usr/bin/systemd-run", "--user", "--unit=" + unit], unit, self.root,
+        ))
+        with patch("omcp.controller.systemd_user_worker_command", launch):
+            submitted = self.submit("systemd-launch")
+        self.assertEqual(submitted["status"], "running")
+        self.assertEqual(submitted["worker_unit"], unit)
+        self.assertEqual(self.popen.call_args.args[0][0], "/usr/bin/systemd-run")
+        launch.assert_called_once()
+
+    def test_cancelling_transient_worker_stops_its_unit(self):
+        self.controller.config = replace(
+            self.config, local_worker_launcher="systemd-user",
+        )
+        unit = "orchestra-worker-11111111-1111-1111-1111-111111111111"
+        launch = Mock(return_value=(
+            ["/usr/bin/systemd-run", "--user", "--unit=" + unit], unit, self.root,
+        ))
+        with patch("omcp.controller.systemd_user_worker_command", launch):
+            submitted = self.submit("systemd-cancel")
+        task = self.controller.state["tasks"][submitted["task_id"]]
+        task["runner_pid"] = 999999
+        with patch("omcp.controller.shutil.which", return_value="/usr/bin/systemctl"), \
+                patch.object(Path, "is_socket", return_value=True), \
+                patch("omcp.controller.subprocess.run") as stop:
+            self.controller.cancel_task(submitted["task_id"], "test cancellation")
+        stop.assert_any_call(
+            ["/usr/bin/systemctl", "--user", "stop", unit],
+            env=ANY, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=False, timeout=10,
+        )
 
     def test_opencode_failure_exposes_only_allowlisted_diagnostic_fields(self):
         self.controller.close()
@@ -303,6 +495,11 @@ class ControllerTests(unittest.TestCase):
         })
         self.assertEqual(self.controller.list_approvals()["approvals"], [])
         self.popen.assert_called_once()
+        self.assertTrue((self.root / "src").is_dir())
+        self.assertTrue((self.root / "tests").is_dir())
+        prompt = (self.state / "tasks" / submitted["task_id"] / "prompt.txt").read_text()
+        self.assertIn("ORCHESTRA STRUCTURED COMPLETION CONTRACT", prompt)
+        self.assertNotIn("orchestra-security-probe", prompt)
         audit = (self.state / "audit.jsonl").read_text()
         self.assertIn('"authorization_mode":"standing"', audit)
         self.assertNotIn("Change local code and run tests", audit)
@@ -363,6 +560,24 @@ class ControllerTests(unittest.TestCase):
             id_factory=lambda: "11111111-1111-1111-1111-111111111111")
         task = self.controller.submit_task("direct-approval", "Review", "Do not edit", "deepseek")
         self.assertEqual(task["status"], "approval_required")
+        self.assertEqual(task["approval"]["status"], "pending")
+        self.assertEqual(self.popen.call_count, 0)
+
+    def test_omitted_consequence_class_requires_explicit_approval(self):
+        self.controller.close()
+        self.controller = TaskController(
+            Config(
+                "owner/repo", self.root, self.state, "origin/main",
+                {"ina": Worker("ina", ("codex",))},
+                Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+                task_approval_mode="disabled",
+            ),
+            popen=self.popen, workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: "11111111-1111-1111-1111-111111111111",
+        )
+        task = self.controller.submit_task("unclassified-default", "Review", "Do not edit", "ina")
+        self.assertEqual(task["consequence_class"], "unclassified")
+        self.assertEqual(task["status"], "approval_required")
         self.assertEqual(self.popen.call_count, 0)
 
     def test_protected_and_unclassified_work_still_requires_explicit_approval(self):
@@ -400,7 +615,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(len(self.controller.list_approvals()["approvals"]), 4)
         self.popen.assert_not_called()
 
-    def test_disabled_approval_policy_runs_protected_and_unclassified_without_request(self):
+    def test_disabled_approval_policy_keeps_protected_and_unclassified_work_pending(self):
         self.controller.close()
         ids = iter([
             "11111111-1111-1111-1111-111111111111",
@@ -421,26 +636,53 @@ class ControllerTests(unittest.TestCase):
             "automatic-security", "Security work", "Perform bounded security work", "ina",
             True, "default", "security_change",
         )
-        self.assertEqual(first["status"], "running")
-        self.assertEqual(first["authorization"], {
-            "mode": "automatic", "policy": "task_approvals_disabled",
-        })
-        self.assertEqual(first["approval"]["status"], "not_required")
-        self.assertEqual(self.controller.list_approvals()["approvals"], [])
+        self.assertEqual(first["status"], "approval_required")
+        self.assertEqual(first["authorization"], {"mode": "explicit"})
+        self.assertEqual(first["approval"]["status"], "pending")
+        self.assertEqual(self.controller.list_approvals()["approvals"][0]["task_id"], first["task_id"])
 
-        self.complete(first["task_id"])
         second = self.controller.submit_task(
             "automatic-unclassified", "Unclassified work", "Perform bounded work", "ina",
             False, "default", "unclassified",
         )
-        self.assertEqual(second["status"], "running")
-        self.assertEqual(self.popen.call_count, 2)
+        self.assertEqual(second["status"], "approval_required")
+        self.assertEqual(self.popen.call_count, 0)
         audit = (self.state / "audit.jsonl").read_text()
-        self.assertIn('"authorization_mode":"automatic"', audit)
+        self.assertIn('"authorization_mode":"explicit"', audit)
+
+    def test_disabled_approval_policy_runs_routine_coding_without_manual_approval(self):
+        self.controller.close()
+        self.controller = TaskController(
+            Config(
+                "owner/repo", self.root, self.state, "origin/main",
+                {"ina": Worker("ina", ("codex",))},
+                Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+                task_approval_mode="disabled",
+            ),
+            popen=self.popen, workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: "11111111-1111-1111-1111-111111111111",
+        )
+        submitted = self.controller.submit_task(
+            "routine-coding", "Adjust CSS", "Update the stylesheet and tests", "ina",
+            True, "default", "routine_development",
+        )
+        self.assertEqual(submitted["status"], "running")
+        self.assertEqual(submitted["authorization"]["mode"], "automatic")
+        self.assertEqual(submitted["approval"]["status"], "not_required")
+        self.assertEqual(self.controller.list_approvals()["approvals"], [])
+        self.popen.assert_called_once()
+        self.complete(submitted["task_id"], result="routine task completed")
+        self.controller.reconcile()
+        self.assertEqual(self.controller.task_status(submitted["task_id"])["status"], "succeeded")
+        self.assertEqual(
+            self.controller.task_result(submitted["task_id"])["result"],
+            "routine task completed",
+        )
 
     def test_disabled_approval_policy_releases_existing_pending_request(self):
         submitted = self.controller.submit_task(
             "pending-before-policy-change", "Queued work", "Perform bounded work", "ina",
+            True, None, "routine_development",
         )
         self.assertEqual(submitted["status"], "approval_required")
         self.controller.close()
@@ -517,6 +759,140 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(result["result"], "verified result")
         self.assertFalse(result["truncated"])
         self.assertTrue(self.controller.worker_availability()["workers"][0]["available"])
+
+    def test_codex_spec_enables_the_sandbox_startup_probe(self):
+        submitted = self.submit("probe-spec")
+        spec_path = self.state / "tasks" / submitted["task_id"] / "runner.json"
+        spec = json.loads(spec_path.read_text())
+        self.assertIs(spec["sandbox_startup_probe"], True)
+
+    def test_exit_zero_without_required_result_is_reconciled_as_failed(self):
+        submitted = self.submit("missing-result")
+        task = self.controller.state["tasks"][submitted["task_id"]]
+        Path(task["completion_path"]).write_text(json.dumps({
+            "exit_code": 0, "finished_at": "2026-10-11T00:00:00+00:00",
+            "runner_error": None,
+        }))
+        self.controller.reconcile()
+        reconciled = self.controller.state["tasks"][submitted["task_id"]]
+        self.assertEqual(reconciled["status"], "failed")
+        self.assertEqual(reconciled["exit_code"], 125)
+        self.assertEqual(reconciled["failure"], {"type": "MissingWorkerResult"})
+
+    def test_exit_zero_without_completion_contract_is_failed(self):
+        submitted = self.submit("missing-contract")
+        task = self.controller.state["tasks"][submitted["task_id"]]
+        Path(task["result_path"]).write_text("required operation was denied\n")
+        Path(task["completion_path"]).write_text(json.dumps({
+            "exit_code": 0, "finished_at": "2026-10-11T00:00:00+00:00",
+            "runner_error": None,
+        }))
+        self.controller.reconcile()
+        reconciled = self.controller.state["tasks"][submitted["task_id"]]
+        self.assertEqual(reconciled["status"], "failed")
+        self.assertEqual(reconciled["failure"], {"type": "TaskContractFailed"})
+
+    def _standing_completion(self, request_id: str):
+        submitted = self.submit(request_id)
+        task = self.controller.state["tasks"][submitted["task_id"]]
+        task["requires_security_assertions"] = True
+        (self.root / ".orchestra-tmp").mkdir(exist_ok=True)
+        Path(task["result_path"]).write_text("worker diagnostic\n")
+        Path(task["completion_path"]).write_text(json.dumps({
+            "exit_code": 0, "finished_at": "2026-10-11T00:00:00+00:00",
+            "runner_error": None, "completion_contract": "success",
+        }))
+        return submitted, task
+
+    @staticmethod
+    def _trusted_checks():
+        return {
+            name: {
+                "name": name, "attempted": True, "allowed": False,
+                "error_type": "PermissionError", "command": "probe " + name,
+            }
+            for name in worker_contract.REQUIRED_SECURITY_CHECKS
+        }
+
+    def test_worker_cannot_forge_trusted_security_evidence(self):
+        actions = ("replace-probe", "delete-probe", "fabricate-report", "edit-report", "skip-probe")
+        for action in actions:
+            with self.subTest(action=action):
+                self.controller.close()
+                self.controller = TaskController(
+                    self.config, popen=self.popen,
+                    workspace_preparer=lambda *_: self.root,
+                    id_factory=lambda: str(uuid.uuid4()),
+                )
+                contract_dir = self.root / ".orchestra-tmp"
+                if contract_dir.exists():
+                    for child in contract_dir.iterdir():
+                        if child.is_file():
+                            child.unlink()
+                submitted, task = self._standing_completion("adversarial-" + action)
+                probe = self.root / ".orchestra-tmp/orchestra-security-probe.py"
+                report = self.root / ".orchestra-tmp/orchestra-security-probe.json"
+                if action == "replace-probe":
+                    probe.write_text("fake probe\n")
+                elif action == "delete-probe":
+                    probe.unlink(missing_ok=True)
+                elif action == "fabricate-report":
+                    report.write_text(json.dumps({"schema_version": 1, "checks": []}))
+                elif action == "edit-report":
+                    report.write_text(json.dumps({"schema_version": 1, "checks": []}))
+                    report.write_text(json.dumps({"schema_version": 1, "checks": []}) + " ")
+                with patch(
+                    "omcp.controller.trusted_probe.run_trusted_security_probe",
+                    side_effect=RuntimeError("trusted probe failed"),
+                ) as verify:
+                    self.controller.reconcile()
+                verify.assert_called_once()
+                reconciled = self.controller.state["tasks"][submitted["task_id"]]
+                self.assertEqual(reconciled["status"], "failed")
+                self.assertEqual(reconciled["failure"], {"type": "SecurityAssertionFailed"})
+                self.assertEqual(reconciled["security_assertions"], "failed")
+
+    def test_trusted_security_evidence_success_marks_task_succeeded(self):
+        submitted, task = self._standing_completion("trusted-success")
+        with patch(
+            "omcp.controller.trusted_probe.run_trusted_security_probe",
+            return_value=self._trusted_checks(),
+        ) as verify:
+            self.controller.reconcile()
+        verify.assert_called_once()
+        reconciled = self.controller.state["tasks"][submitted["task_id"]]
+        self.assertEqual(reconciled["status"], "succeeded")
+        self.assertEqual(reconciled["security_assertions"], "passed")
+        self.assertEqual(
+            {item["name"] for item in reconciled["security_checks"]},
+            set(worker_contract.REQUIRED_SECURITY_CHECKS),
+        )
+
+    def test_unexpectedly_allowed_trusted_assertion_fails_task(self):
+        submitted, task = self._standing_completion("trusted-allowed")
+        with patch(
+            "omcp.controller.trusted_probe.run_trusted_security_probe",
+            side_effect=ValueError("security probe allowed read_orchestra_config"),
+        ):
+            self.controller.reconcile()
+        reconciled = self.controller.state["tasks"][submitted["task_id"]]
+        self.assertEqual(reconciled["status"], "failed")
+        self.assertEqual(reconciled["failure"], {"type": "SecurityAssertionFailed"})
+
+    def test_sandbox_startup_failure_is_visible_in_task_diagnostics(self):
+        submitted = self.submit("sandbox-failure")
+        task = self.controller.state["tasks"][submitted["task_id"]]
+        Path(task["result_path"]).write_text("Worker sandbox failed to start.\n")
+        Path(task["completion_path"]).write_text(json.dumps({
+            "exit_code": 125, "finished_at": "2026-10-11T00:00:00+00:00",
+            "runner_error": "SandboxStartupError",
+        }))
+        self.controller.reconcile()
+        reconciled = self.controller.state["tasks"][submitted["task_id"]]
+        self.assertEqual(reconciled["status"], "failed")
+        self.assertEqual(reconciled["failure"], {"type": "SandboxStartupError"})
+        result = self.controller.task_result(submitted["task_id"])
+        self.assertEqual(result["result"], "Worker sandbox failed to start.\n")
 
     def test_cancelled_reaped_runner_without_completion_is_terminal(self):
         submitted = self.submit()
@@ -653,6 +1029,19 @@ class ControllerTests(unittest.TestCase):
         submitted = self.submit()
         self.complete(submitted["task_id"], result="x" * 2000)
         result = self.controller.task_result(submitted["task_id"])
+        self.assertTrue(result["truncated"])
+        self.assertEqual(len(result["result"]), 1024)
+
+    def test_result_reader_does_not_read_past_bound_sentinel(self):
+        self.controller.config = Config(
+            self.config.repository, self.config.project_root, self.config.state_dir,
+            self.config.base_ref, self.config.workers, self.config.principal,
+            max_result_bytes=1024,
+        )
+        submitted = self.submit()
+        self.complete(submitted["task_id"], result="x" * 4096)
+        with patch("pathlib.Path.read_bytes", side_effect=AssertionError("unbounded read")):
+            result = self.controller.task_result(submitted["task_id"])
         self.assertTrue(result["truncated"])
         self.assertEqual(len(result["result"]), 1024)
 
@@ -809,7 +1198,7 @@ class ControllerTests(unittest.TestCase):
         submitted = [
             self.controller.submit_task(
                 f"parallel-{number}", "Parallel", "Run independently",
-                f"worker-{number}", True, f"repo-{number}", "unclassified",
+                f"worker-{number}", True, f"repo-{number}", "routine_development",
             )
             for number in range(1, 4)
         ]
@@ -850,10 +1239,10 @@ class ControllerTests(unittest.TestCase):
             id_factory=lambda: next(ids),
         )
         first = self.controller.submit_task(
-            "writer-one", "Write one", "Edit files", "one", True, "one", "unclassified",
+            "writer-one", "Write one", "Edit files", "one", True, "one", "routine_development",
         )
         second = self.controller.submit_task(
-            "writer-two", "Write two", "Edit files", "two", True, "two", "unclassified",
+            "writer-two", "Write two", "Edit files", "two", True, "two", "routine_development",
         )
 
         self.assertEqual(first["status"], "running")
@@ -885,13 +1274,13 @@ class ControllerTests(unittest.TestCase):
             id_factory=lambda: next(ids),
         )
         first = self.controller.submit_task(
-            "hot-1", "Hot one", "Edit", "hot-1", True, "hot", "unclassified",
+            "hot-1", "Hot one", "Edit", "hot-1", True, "hot", "routine_development",
         )
         hot_waiting = self.controller.submit_task(
-            "hot-2", "Hot two", "Edit", "hot-2", True, "hot", "unclassified",
+            "hot-2", "Hot two", "Edit", "hot-2", True, "hot", "routine_development",
         )
         other_waiting = self.controller.submit_task(
-            "other", "Other", "Edit", "other", True, "other", "unclassified",
+            "other", "Other", "Edit", "other", True, "other", "routine_development",
         )
         self.complete(first["task_id"])
         self.controller.tick()
@@ -956,6 +1345,163 @@ class ControllerTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_profiles_define_independent_git_preparation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "project"
+            a_root = base / "repo-a"
+            b_root = base / "repo-b"
+            for path in (root, a_root, b_root):
+                path.mkdir()
+            codex = base / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            config_path = base / "omcp.json"
+            config_path.write_text(json.dumps({
+                "repository": "owner/orchestra",
+                "project_root": str(root),
+                "state_dir": str(base / "state"),
+                "workers": {"ina": {"command": ["codex"]}},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+                "local_worker_git_mode": "owner_synced",
+                "local_worker_source_sha": "c" * 40,
+                "repository_profiles": {
+                    "orchestra": {
+                        "repository": "owner/orchestra",
+                        "project_root": str(a_root),
+                        "base_ref": "origin/main",
+                        "local_worker_git_mode": "owner_synced",
+                        "local_worker_source_sha": "a" * 40,
+                    },
+                    "delnavazan": {
+                        "repository": "owner/delnavazan",
+                        "project_root": str(b_root),
+                        "base_ref": "origin/main",
+                        "local_worker_git_mode": "fetch",
+                        "local_worker_source_sha": None,
+                    },
+                },
+                "default_profile": "orchestra",
+            }))
+            os.chmod(config_path, 0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                config = Config.load(config_path)
+        orchestra = config.profile("orchestra")
+        delnavazan = config.profile("delnavazan")
+        self.assertEqual(orchestra.local_worker_git_mode, "owner_synced")
+        self.assertEqual(orchestra.local_worker_source_sha, "a" * 40)
+        self.assertEqual(delnavazan.local_worker_git_mode, "fetch")
+        self.assertIsNone(delnavazan.local_worker_source_sha)
+        self.assertEqual(config.local_worker_git_mode, "owner_synced")
+        self.assertEqual(config.local_worker_source_sha, "c" * 40)
+
+    def test_legacy_profile_inherits_global_git_preparation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "project"
+            root.mkdir()
+            codex = base / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            config_path = base / "omcp.json"
+            config_path.write_text(json.dumps({
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(base / "state"),
+                "workers": {"ina": {"command": ["codex"]}},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+                "local_worker_git_mode": "owner_synced",
+                "local_worker_source_sha": "d" * 40,
+            }))
+            os.chmod(config_path, 0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                config = Config.load(config_path)
+        profile = config.profile(None)
+        self.assertEqual(profile.local_worker_git_mode, "owner_synced")
+        self.assertEqual(profile.local_worker_source_sha, "d" * 40)
+
+    def test_profile_owner_synced_requires_a_pin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "project"
+            repo = base / "repo"
+            root.mkdir(); repo.mkdir()
+            codex = base / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            config_path = base / "omcp.json"
+            config_path.write_text(json.dumps({
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(base / "state"),
+                "workers": {"ina": {"command": ["codex"]}},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+                "repository_profiles": {
+                    "repo": {
+                        "repository": "owner/repo", "project_root": str(repo),
+                        "base_ref": "origin/main", "local_worker_git_mode": "owner_synced",
+                    },
+                },
+                "default_profile": "repo",
+            }))
+            os.chmod(config_path, 0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                with self.assertRaisesRegex(ValueError, "owner_synced requires"):
+                    Config.load(config_path)
+
+    def test_deepseek_worker_cannot_receive_standing_authorization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "project"
+            root.mkdir()
+            credential = base / "deepseek.key"
+            credential.write_text("not-printed")
+            credential.chmod(0o600)
+            config_path = base / "omcp.json"
+            config_path.write_text(json.dumps({
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(base / "state"),
+                "workers": {"deepseek": {
+                    "adapter": "deepseek", "provider": "deepseek",
+                    "model": "deepseek/deepseek-chat",
+                    "credential_file": str(credential),
+                }},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+                "standing_authorizations": [{
+                    "id": "deepseek-routine",
+                    "consequence_class": "routine_development",
+                    "repository_profiles": ["default"],
+                    "workers": ["deepseek"],
+                    "writable_paths": ["platform"],
+                }],
+            }))
+            os.chmod(config_path, 0o600)
+            with self.assertRaisesRegex(ValueError, "only name Codex workers"):
+                Config.load(config_path)
+
+    def test_standing_authorization_rejects_unsafe_writable_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "project"
+            root.mkdir()
+            codex = base / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            config_path = base / "omcp.json"
+            config_path.write_text(json.dumps({
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(base / "state"),
+                "workers": {"ina": {"command": ["codex"]}},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+                "standing_authorizations": [{
+                    "id": "routine", "consequence_class": "routine_development",
+                    "repository_profiles": ["default"], "workers": ["ina"],
+                    "writable_paths": ["../outside"],
+                }],
+            }))
+            os.chmod(config_path, 0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                with self.assertRaisesRegex(ValueError, "safe relative paths"):
+                    Config.load(config_path)
+
     def test_config_loads_independent_allowlisted_opencode_and_deepseek_workers(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "project"
@@ -1090,6 +1636,30 @@ class ConfigTests(unittest.TestCase):
                 raw["task_approval_mode"] = "sometimes"
                 config_path.write_text(json.dumps(raw))
                 with self.assertRaisesRegex(ValueError, "must be required or disabled"):
+                    Config.load(config_path)
+
+    def test_config_loads_and_validates_local_worker_launcher(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            codex = Path(directory) / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            config_path = Path(directory) / "omcp.json"
+            raw = {
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(Path(directory) / "state"),
+                "workers": {"ina": {"command": [str(codex)]}},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+                "local_worker_launcher": "systemd-user",
+            }
+            config_path.write_text(json.dumps(raw))
+            os.chmod(config_path, 0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                self.assertEqual(Config.load(config_path).local_worker_launcher, "systemd-user")
+                raw["local_worker_launcher"] = "sometimes"
+                config_path.write_text(json.dumps(raw))
+                with self.assertRaisesRegex(ValueError, "direct or systemd-user"):
                     Config.load(config_path)
 
     def test_config_supports_future_parallel_capacity_without_hardcoded_two(self):
@@ -1697,6 +2267,200 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual((root / "result").read_text(),
                              "DeepSeek request failed; no provider response was retained.\n")
             self.assertNotIn("secret diagnostic", (root / "completion").read_text())
+    def test_sandbox_probe_fails_closed_on_nonzero_bubblewrap(self):
+        with patch("omcp.runner.host_platform", return_value="linux"), \
+                patch("omcp.runner.shutil.which",
+                      side_effect=lambda name: {"bwrap": "/usr/bin/bwrap",
+                                                "true": "/bin/true"}[name]), \
+                patch("omcp.runner.subprocess.run", return_value=Mock(returncode=1)):
+            with self.assertRaises(WorkerSandboxStartupError):
+                probe_codex_sandbox()
+        with patch("omcp.runner.host_platform", return_value="linux"), \
+                patch("omcp.runner.shutil.which",
+                      side_effect=lambda name: {"bwrap": "/usr/bin/bwrap",
+                                                "true": "/bin/true"}[name]), \
+                patch("omcp.runner.subprocess.run", return_value=Mock(returncode=0)):
+            probe_codex_sandbox()
+
+    def test_sandbox_log_detection_requires_a_bwrap_error_line(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "worker.log"
+            log.write_text("agent quoted: bwrap: Can't open source /: Function not implemented\n")
+            self.assertFalse(worker_log_has_sandbox_startup_failure(log))
+            log.write_text("  bwrap: Can't open source /: Function not implemented\n")
+            self.assertTrue(worker_log_has_sandbox_startup_failure(log))
+
+    def test_probe_failure_is_failed_and_skips_codex_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            marker = root / "codex-ran"
+            codex = bin_dir / "codex"
+            codex.write_text(f"#!/bin/sh\n: > {marker}\nexit 0\n")
+            codex.chmod(0o700)
+            prompt = root / "prompt"
+            prompt.write_text("task")
+            spec = root / "spec.json"
+            completion = root / "completion.json"
+            spec.write_text(json.dumps({
+                "command": ["codex"], "workspace": str(root),
+                "prompt_path": str(prompt), "log_path": str(root / "log"),
+                "result_path": str(root / "result"),
+                "completion_path": str(completion), "codex_home": None,
+                "sandbox_startup_probe": True,
+            }))
+            with patch.dict(os.environ, {"PATH": str(bin_dir)}, clear=True), \
+                    patch("omcp.runner.probe_codex_sandbox",
+                          side_effect=WorkerSandboxStartupError("failed")):
+                self.assertEqual(run_worker(spec), 125)
+            self.assertFalse(marker.exists())
+            record = json.loads(completion.read_text())
+            self.assertEqual(record["exit_code"], 125)
+            self.assertEqual(record["runner_error"], "SandboxStartupError")
+            self.assertIn("sandbox failed to start", (root / "result").read_text().lower())
+
+    def test_logged_bubblewrap_failure_overrides_a_zero_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            codex = bin_dir / "codex"
+            codex.write_text(
+                "#!/bin/sh\n"
+                "while [ \"$#\" -gt 0 ]; do\n"
+                "  if [ \"$1\" = \"--output-last-message\" ]; then shift; result=\"$1\"; fi\n"
+                "  shift\n"
+                "done\n"
+                "echo \"bwrap: Can't open source /: Function not implemented\" >&2\n"
+                "echo 'Both checks failed because the sandbox did not start.' > \"$result\"\n"
+                "exit 0\n"
+            )
+            codex.chmod(0o700)
+            prompt = root / "prompt"
+            prompt.write_text("task")
+            spec = root / "spec.json"
+            completion = root / "completion.json"
+            spec.write_text(json.dumps({
+                "command": ["codex"], "workspace": str(root),
+                "prompt_path": str(prompt), "log_path": str(root / "log"),
+                "result_path": str(root / "result"),
+                "completion_path": str(completion), "codex_home": None,
+            }))
+            with patch.dict(os.environ, {"PATH": str(bin_dir)}, clear=True):
+                self.assertEqual(run_worker(spec), 125)
+            record = json.loads(completion.read_text())
+            self.assertEqual(record["exit_code"], 125)
+            self.assertEqual(record["runner_error"], "SandboxStartupError")
+            self.assertIn("Both checks failed", (root / "result").read_text())
+            self.assertIn("bwrap: Can't open source", (root / "log").read_text())
+
+    def test_zero_exit_without_required_result_is_failed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            codex = bin_dir / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            prompt = root / "prompt"
+            prompt.write_text("task")
+            spec = root / "spec.json"
+            completion = root / "completion.json"
+            spec.write_text(json.dumps({
+                "command": ["codex"], "workspace": str(root),
+                "prompt_path": str(prompt), "log_path": str(root / "log"),
+                "result_path": str(root / "result"),
+                "completion_path": str(completion), "codex_home": None,
+            }))
+            with patch.dict(os.environ, {"PATH": str(bin_dir)}, clear=True):
+                self.assertEqual(run_worker(spec), 125)
+            record = json.loads(completion.read_text())
+            self.assertEqual(record["runner_error"], "MissingWorkerResult")
+            self.assertIn("required result", (root / "result").read_text())
+
+    def test_zero_exit_with_required_result_and_no_optional_artifact_succeeds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            codex = bin_dir / "codex"
+            codex.write_text(
+                "#!/bin/sh\n"
+                "while [ \"$#\" -gt 0 ]; do\n"
+                "  if [ \"$1\" = \"--output-last-message\" ]; then shift; result=\"$1\"; fi\n"
+                "  shift\n"
+                "done\n"
+                "echo 'read-only canary completed' > \"$result\"\n"
+                "exit 0\n"
+            )
+            codex.chmod(0o700)
+            prompt = root / "prompt"
+            prompt.write_text("task")
+            spec = root / "spec.json"
+            completion = root / "completion.json"
+            spec.write_text(json.dumps({
+                "command": ["codex"], "workspace": str(root),
+                "prompt_path": str(prompt), "log_path": str(root / "log"),
+                "result_path": str(root / "result"),
+                "completion_path": str(completion), "codex_home": None,
+            }))
+            with patch.dict(os.environ, {"PATH": str(bin_dir)}, clear=True):
+                self.assertEqual(run_worker(spec), 0)
+            record = json.loads(completion.read_text())
+            self.assertEqual(record["exit_code"], 0)
+            self.assertEqual((root / "result").read_text(), "read-only canary completed\n")
+
+    def _contract_spec(self, root: Path) -> Path:
+        prompt = root / "prompt"
+        prompt.write_text("task")
+        spec = root / "spec.json"
+        spec.write_text(json.dumps({
+            "command": ["codex"], "workspace": str(root),
+            "prompt_path": str(prompt), "log_path": str(root / "log"),
+            "result_path": str(root / "result"),
+            "completion_path": str(root / "completion"),
+            "codex_home": None,
+            "require_completion_contract": True,
+        }))
+        return spec
+
+    def test_runner_accepts_a_structured_success_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = self._contract_spec(root)
+            with patch.dict(os.environ, codex_contract_fixture(root), clear=True):
+                self.assertEqual(run_worker(spec), 0)
+            record = json.loads((root / "completion").read_text())
+            self.assertEqual(record["completion_contract"], "success")
+            self.assertNotIn("completion_contract_error", record)
+
+    def test_runner_contract_failure_overrides_a_zero_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = self._contract_spec(root)
+            fixture = codex_contract_fixture(
+                root, result="required filesystem operation was denied",
+                contract='{"status":"failure","reason":"required write denied"}',
+            )
+            with patch.dict(os.environ, fixture, clear=True):
+                self.assertEqual(run_worker(spec), 125)
+            record = json.loads((root / "completion").read_text())
+            self.assertEqual(record["runner_error"], "TaskContractFailed")
+            self.assertEqual(record["completion_contract"], "failure")
+            self.assertIn("required filesystem operation", (root / "result").read_text())
+
+    def test_runner_missing_contract_fails_even_when_result_exists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = self._contract_spec(root)
+            fixture = codex_contract_fixture(root, contract=None)
+            with patch.dict(os.environ, fixture, clear=True):
+                self.assertEqual(run_worker(spec), 125)
+            record = json.loads((root / "completion").read_text())
+            self.assertEqual(record["runner_error"], "TaskContractInvalid")
+            self.assertEqual(record["completion_contract"], "invalid")
+
     def test_runner_passes_only_explicitly_permitted_environment(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1717,7 +2481,7 @@ class RunnerTests(unittest.TestCase):
             }))
             parent_environment = {
                 "PATH": str(bin_dir), "HOME": "/Users/test",
-                "TMPDIR": "/tmp/test", "LANG": "en_AU.UTF-8",
+                "TMPDIR": str(root / ".orchestra-tmp"), "LANG": "en_AU.UTF-8",
                 "LC_ALL": "en_AU.UTF-8", "CODEX_HOME": "/parent/codex-home",
                 "CONTROL_PLANE_API_KEY": "tunnel-secret",
                 "OMCP_AUTHENTICATED_CALLER": "chatgpt:principal",
@@ -1725,13 +2489,14 @@ class RunnerTests(unittest.TestCase):
                 "HTTPS_PROXY": "https://proxy.example", "GIT_TERMINAL_PROMPT": "1",
             }
             with patch.dict(os.environ, parent_environment, clear=True):
-                with patch("omcp.runner.subprocess.run", return_value=Mock(returncode=0)) as execute:
+                with patch("omcp.runner.subprocess.run",
+                           side_effect=codex_success_side_effect(root / "result")) as execute:
                     self.assertEqual(run_worker(spec), 0)
 
             environment = execute.call_args.kwargs["env"]
             self.assertEqual(environment, {
                 "PATH": str(bin_dir), "HOME": "/Users/test",
-                "TMPDIR": "/tmp/test", "LANG": "en_AU.UTF-8",
+                "TMPDIR": str(root / ".orchestra-tmp"), "LANG": "en_AU.UTF-8",
                 "LC_ALL": "en_AU.UTF-8", "CODEX_HOME": "/private/codex-home",
                 "GIT_TERMINAL_PROMPT": "0",
             })
@@ -1759,7 +2524,8 @@ class RunnerTests(unittest.TestCase):
                 "codex_home": None,
             }))
             with patch.dict(os.environ, codex_fixture(root), clear=True), \
-                    patch("omcp.runner.subprocess.run", return_value=Mock(returncode=0)) as execute:
+                    patch("omcp.runner.subprocess.run",
+                          side_effect=codex_success_side_effect(root / "result")) as execute:
                 self.assertEqual(run_worker(spec), 0)
             self.assertEqual(json.loads(completion.read_text())["exit_code"], 0)
             command = execute.call_args.args[0]
@@ -1786,7 +2552,8 @@ class RunnerTests(unittest.TestCase):
                 "task_id": task_id, "lease_id": lease_id, "lease_path": str(lease),
             }))
             with patch("omcp.runner.canonical_codex_executable", return_value="/codex"), \
-                    patch("omcp.runner.subprocess.run", return_value=Mock(returncode=0)):
+                    patch("omcp.runner.subprocess.run",
+                          side_effect=codex_success_side_effect(root / "result")):
                 self.assertEqual(run_worker(spec), 0)
             record = json.loads(lease.read_text())
             self.assertEqual(record["task_id"], task_id)
@@ -1847,6 +2614,7 @@ class RunnerTests(unittest.TestCase):
                 "prompt_path": str(prompt), "log_path": str(root / "log"),
                 "result_path": str(root / "result"),
                 "completion_path": str(root / "completion"), "codex_home": None,
+                "git_read_paths": [str(root / "git-meta")],
                 "execution_capabilities": {
                     "profile": "routine_development_v1", "writable_paths": ["src"],
                     "network": False, "external_credentials": False,
@@ -1854,7 +2622,8 @@ class RunnerTests(unittest.TestCase):
                 },
             }))
             with patch.dict(os.environ, codex_fixture(root), clear=True), \
-                    patch("omcp.runner.subprocess.run", return_value=Mock(returncode=0)) as execute:
+                    patch("omcp.runner.subprocess.run",
+                          side_effect=codex_success_side_effect(root / "result")) as execute:
                 self.assertEqual(run_worker(spec), 0)
             command = execute.call_args.args[0]
             self.assertNotIn("--sandbox", command)
@@ -1862,6 +2631,14 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("--ignore-rules", command)
             self.assertIn("--ephemeral", command)
             self.assertIn("permissions.orchestra-routine.network.enabled=false", command)
+            self.assertIn(
+                'permissions.orchestra-routine.filesystem./etc/orchestra="deny"',
+                command,
+            )
+            self.assertIn(
+                f'permissions.orchestra-routine.filesystem.{root / "git-meta"}="read"',
+                command,
+            )
             self.assertIn(
                 'permissions.orchestra-routine.filesystem.:workspace_roots={"."="read",".orchestra-tmp"="write","src"="write"}',
                 command,
@@ -2042,14 +2819,19 @@ class ServerTests(unittest.TestCase):
         self.server = MCPServer(self.controller)
 
     def test_initialize_and_tool_discovery(self):
-        initialized = self.server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        session = self.server.new_session()
+        initialized = session.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
         self.assertEqual(initialized["result"]["serverInfo"]["name"], "orchestra-omcp")
-        listed = self.server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        session.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        listed = session.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
         self.assertEqual({tool["name"] for tool in TOOLS},
                          {tool["name"] for tool in listed["result"]["tools"]})
 
     def test_tool_call_returns_structured_content(self):
-        response = self.server.handle({
+        session = self.server.new_session()
+        session.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+        session.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        response = session.handle({
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
             "params": {"name": "bridge_status", "arguments": {}},
         })
@@ -2076,8 +2858,120 @@ class ServerTests(unittest.TestCase):
                 server_main(["--config", "/unused/config.json"])
 
     def test_unknown_method_uses_json_rpc_error(self):
-        response = self.server.handle({"jsonrpc": "2.0", "id": 4, "method": "unknown"})
+        session = self.server.new_session()
+        session.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+        session.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        response = session.handle({"jsonrpc": "2.0", "id": 4, "method": "unknown"})
         self.assertEqual(response["error"]["code"], -32601)
+
+    def test_handshake_rejects_unsupported_version_and_pre_ready_requests(self):
+        session = self.server.new_session()
+        early = session.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+        self.assertEqual(early["error"]["code"], -32002)
+        unsupported = session.handle({"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {"protocolVersion": "2027-01-01"}})
+        self.assertEqual(unsupported["error"]["code"], -32602)
+
+    def test_current_tunnel_initialize_uses_the_normal_mcp_handshake(self):
+        session = self.server.new_session()
+        initialized = session.handle({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2026-07-28",
+                "capabilities": {},
+                "clientInfo": {"name": "secure-mcp-tunnel", "version": "test"},
+            },
+        })
+        self.assertEqual(initialized["result"]["protocolVersion"], "2026-07-28")
+        self.assertEqual(session.state, session.NEGOTIATED)
+        session.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        listed = session.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        self.assertEqual({tool["name"] for tool in TOOLS},
+                         {tool["name"] for tool in listed["result"]["tools"]})
+
+    def test_current_tunnel_initialize_with_stateless_metadata_is_not_dispatched_as_a_tool(self):
+        session = self.server.new_session()
+        initialized = session.handle({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": self.stateless_params(
+                protocolVersion="2026-07-28", capabilities={},
+                clientInfo={"name": "secure-mcp-tunnel", "version": "test"},
+            ),
+        })
+        self.assertEqual(initialized["result"]["protocolVersion"], "2026-07-28")
+        self.assertEqual(session.state, session.NEGOTIATED)
+
+    def test_legacy_reconnect_requires_new_handshake(self):
+        first = self.server.new_session()
+        first.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+        first.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self.assertIn("result", first.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}))
+        second = self.server.new_session()
+        self.assertEqual(second.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}})["error"]["code"], -32002)
+
+    @staticmethod
+    def stateless_params(**params):
+        return {
+            **params,
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        }
+
+    def test_stateless_discovery_and_tool_call_need_no_handshake(self):
+        session = self.server.new_session()
+        discovered = session.handle({
+            "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+            "params": self.stateless_params(),
+        })
+        self.assertIn("2026-07-28", discovered["result"]["supportedVersions"])
+        listed = session.handle({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list",
+            "params": self.stateless_params(),
+        })
+        self.assertEqual({tool["name"] for tool in TOOLS},
+                         {tool["name"] for tool in listed["result"]["tools"]})
+        response = session.handle({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": self.stateless_params(name="bridge_status", arguments={}),
+        })
+        self.assertEqual(response["result"]["structuredContent"], {"status": "ok"})
+        self.assertEqual(session.state, session.CONNECTED)
+
+    def test_stateless_reconnect_needs_no_shared_session(self):
+        for request_id in (1, 2):
+            session = self.server.new_session()
+            response = session.handle({
+                "jsonrpc": "2.0", "id": request_id, "method": "tools/list",
+                "params": self.stateless_params(),
+            })
+            self.assertIn("result", response)
+            self.assertEqual(session.state, session.CONNECTED)
+
+    def test_stateless_path_rejects_incomplete_or_wrong_metadata(self):
+        cases = (
+            {},
+            {"_meta": {}},
+            {"_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            }},
+            {"_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": [],
+            }},
+            {"_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2027-01-01",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            }},
+        )
+        for request_id, params in enumerate(cases, start=1):
+            with self.subTest(params=params):
+                session = self.server.new_session()
+                response = session.handle({
+                    "jsonrpc": "2.0", "id": request_id, "method": "tools/list",
+                    "params": params,
+                })
+                self.assertEqual(response["error"]["code"], -32002)
 
 
 class LocalApprovalChannelTests(unittest.TestCase):
@@ -2165,6 +3059,8 @@ class ServerLifecycleTests(unittest.TestCase):
             workspace_preparer=lambda *_: self.root, id_factory=lambda: next(ids),
         )
         self.server = MCPServer(self.controller)
+        self.server.handle({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+        self.server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
         self.call_id = 0
 
     def tearDown(self):
@@ -2186,6 +3082,10 @@ class ServerLifecycleTests(unittest.TestCase):
         self.assertIn("repository_profile", schema["required"])
         self.assertEqual(schema["properties"]["repository_profile"]["type"], "string")
         self.assertEqual(schema["properties"]["consequence_class"]["default"], "unclassified")
+        description = schema["properties"]["consequence_class"]["description"]
+        self.assertIn("eligible routine_development only", description)
+        self.assertIn("unclassified work still require explicit approval", description)
+        self.assertNotIn("automatically authorizes all valid classes", description)
         self.assertEqual(set(schema["properties"]["consequence_class"]["enum"]), {
             "routine_development", "production_deployment", "destructive_operation",
             "security_change", "unclassified",
@@ -2197,7 +3097,7 @@ class ServerLifecycleTests(unittest.TestCase):
         )
         self.assertNotIn("command", host_schema["properties"])
         self.assertNotIn("arguments", host_schema["properties"])
-        self.assertNotIn("const", schema["properties"]["requires_approval"])
+        self.assertNotIn("requires_approval", schema["properties"])
 
     def test_multi_repository_health_and_submission_scope_through_mcp(self):
         archive = Path(self.temp.name) / "archive"
@@ -2217,6 +3117,8 @@ class ServerLifecycleTests(unittest.TestCase):
             id_factory=lambda: "11111111-1111-1111-1111-111111111111",
         )
         self.server = MCPServer(self.controller)
+        self.server.handle({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+        self.server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
         status = self.call("bridge_status")
         self.assertEqual(status["default_profile"], "orchestra")
@@ -2254,11 +3156,20 @@ class ServerLifecycleTests(unittest.TestCase):
         task_id = submitted["task_id"]
         self.assertEqual(self.call("task_status", {"task_id": task_id})["status"], "approval_required")
         self.assertEqual(len(self.call("list_tasks")["tasks"]), 1)
+        queued = self.call("task_snapshot", {"recent_limit": 20})
+        self.assertEqual(queued["counts"]["queued"], 1)
+        self.assertEqual(queued["counts"]["approval_pending"], 1)
+        self.assertEqual(queued["queued"][0]["queue_state"], "approval_pending")
+        self.assertEqual(queued["recent"], [])
         self.assertEqual(len(self.call("list_approvals")["approvals"]), 1)
         self.assertTrue(self.call("worker_availability")["workers"][0]["available"])
         self.assertEqual(self.call("cancel_task", {
             "task_id": task_id, "reason": "Requester withdrew it",
         })["status"], "cancelled")
+        terminal = self.call("task_snapshot", {"recent_limit": 20})
+        self.assertEqual(terminal["counts"]["queued"], 0)
+        self.assertEqual(terminal["counts"]["recent"], 1)
+        self.assertEqual(terminal["recent"][0]["task_id"], task_id)
         self.assertEqual(self.call("task_result", {"task_id": task_id})["result"], "")
 
         self.assertNotIn("resolve_approval", {tool.get("name") for tool in TOOLS})
@@ -2287,7 +3198,7 @@ class StdioIntegrationTests(unittest.TestCase):
             }))
             os.chmod(config_path, 0o600)
             requests = "\n".join(json.dumps(item) for item in [
-                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
                 {"jsonrpc": "2.0", "method": "notifications/initialized"},
                 {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
                 {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
@@ -2306,7 +3217,7 @@ class StdioIntegrationTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             responses = [json.loads(line) for line in completed.stdout.splitlines()]
             self.assertEqual([response["id"] for response in responses], [1, 2, 3])
-            self.assertEqual(len(responses[1]["result"]["tools"]), 9)
+            self.assertEqual(len(responses[1]["result"]["tools"]), len(TOOLS))
             self.assertEqual(responses[2]["result"]["structuredContent"]["status"], "ok")
 
 

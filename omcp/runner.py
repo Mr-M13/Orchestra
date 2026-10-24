@@ -24,7 +24,9 @@ from omcp.controller import (
     OPENCODE_PROVIDER_ENDPOINTS,
     canonical_codex_executable, canonical_opencode_executable,
 )
-from omcp.platform import SandboxPolicy, sandbox_command
+from omcp import worker_contract
+from omcp.routine_policy import RoutineConfinementPolicy
+from omcp.platform import SandboxPolicy, host_platform, sandbox_command
 
 
 class RunnerTerminated(BaseException):
@@ -35,6 +37,10 @@ class RunnerTerminated(BaseException):
 
 class ProviderRequestError(Exception):
     """Detail-free provider failure: no remote response is retained."""
+
+
+class WorkerSandboxStartupError(RuntimeError):
+    """The worker's external sandbox could not start; no task ran."""
 
 
 class OpenCodeDiagnosticCollector:
@@ -224,6 +230,79 @@ def write_private_text(path: Path, text: str) -> None:
     os.chmod(path, 0o600)
 
 
+SANDBOX_STARTUP_PREFIXES = (
+    b"bwrap: Can't open source ",
+    b"bwrap: Can't mkdir parents ",
+    b"bwrap: No permissions to create new namespace",
+    b"bwrap: Creating new namespace failed",
+    b"bwrap: Failed to unshare",
+)
+MAX_WORKER_LOG_SCAN_BYTES = 4 * 1024 * 1024
+
+
+def probe_codex_sandbox() -> None:
+    """Fail closed unless Bubblewrap can start in the worker environment.
+
+    Codex reports a failed tool execution to the model and can still exit zero
+    after producing a final message.  A startup probe on the same host, service
+    and seccomp context makes that failure a runner failure instead of a
+    misleading successful task.
+    """
+    if host_platform() != "linux":
+        return
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        # Codex may use a different sandbox implementation when bwrap is absent.
+        return
+    true = shutil.which("true")
+    if not true:
+        raise WorkerSandboxStartupError("sandbox probe helper is unavailable")
+    command = [
+        bwrap, "--unshare-all", "--die-with-parent",
+        "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+        "--", true,
+    ]
+    try:
+        completed = subprocess.run(
+            command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, check=False, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise WorkerSandboxStartupError("sandbox startup probe failed") from None
+    if completed.returncode != 0:
+        raise WorkerSandboxStartupError("sandbox startup probe failed")
+
+
+def worker_log_has_sandbox_startup_failure(path: Path) -> bool:
+    """Detect a Bubblewrap startup failure in the bounded worker log head."""
+    try:
+        with path.open("rb") as log:
+            data = log.read(MAX_WORKER_LOG_SCAN_BYTES)
+    except OSError:
+        return False
+    for line in data.splitlines():
+        line = line.lstrip()
+        if any(line.startswith(prefix) for prefix in SANDBOX_STARTUP_PREFIXES):
+            return True
+    return False
+
+
+def required_result_present(path: Path) -> bool:
+    """True only for the non-empty result file every local worker must emit."""
+    try:
+        return path.is_file() and not path.is_symlink() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def write_failure_result(path: Path, message: str) -> None:
+    """Best-effort safe result text when the worker produced no output."""
+    try:
+        write_private_text(path, message)
+    except OSError:
+        pass
+
+
 def worker_environment(codex_home: str | None) -> dict[str, str]:
     permitted = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "CODEX_HOME")
     environment = {key: os.environ[key] for key in permitted if key in os.environ}
@@ -248,24 +327,14 @@ def opencode_environment(runtime_dir: Path) -> dict[str, str]:
 
 
 def routine_command(executable: str, workspace: Path, result_path: Path,
-                    writable_paths: list[str]) -> list[str]:
-    if not all(isinstance(value, str) and value and all(
-            part and part.replace("_", "").replace("-", "").isalnum() for part in Path(value).parts)
-            for value in writable_paths):
-        raise ValueError("invalid routine writable paths")
-    rules = ','.join(['"."="read"', '".orchestra-tmp"="write"',
-                      *(f'"{value}"="write"' for value in writable_paths)])
-    return [
-        executable, "--ask-for-approval", "never", "exec", "--ignore-user-config",
-        "--ignore-rules", "--ephemeral", "--config", 'default_permissions="orchestra-routine"',
-        "--config", 'permissions.orchestra-routine.filesystem.:root="deny"',
-        "--config", 'permissions.orchestra-routine.filesystem.:minimal="read"',
-        "--config", 'permissions.orchestra-routine.filesystem.:tmpdir="deny"',
-        "--config", 'permissions.orchestra-routine.filesystem.:slash_tmp="deny"',
-        "--config", "permissions.orchestra-routine.filesystem.:workspace_roots={" + rules + "}",
-        "--config", "permissions.orchestra-routine.network.enabled=false", "--cd", str(workspace),
-        "--output-last-message", str(result_path), "-",
-    ]
+                    writable_paths: list[str], git_read_paths: list[str] | None = None,
+                    read_only_paths: list[str] | None = None) -> list[str]:
+    """Build the Codex worker command from the shared routine policy."""
+    policy = RoutineConfinementPolicy(
+        tuple(writable_paths),
+        tuple(read_only_paths if read_only_paths is not None else (git_read_paths or ())),
+    )
+    return policy.worker_command(executable, workspace, result_path)
 
 
 def owner_only_credential(path: Path) -> None:
@@ -758,9 +827,12 @@ def run(spec_path: Path) -> int:
     if (not isinstance(seconds, int) or isinstance(seconds, bool) or not 60 <= seconds <= 7200
             or not isinstance(maximum, int) or isinstance(maximum, bool) or not 1024 <= maximum <= 1048576):
         raise ValueError("invalid worker bounds")
-    runtime_dir = routine_tmp = None
+    runtime_dir = routine_tmp = contract_tmp = None
     gateway: PinnedProviderGateway | None = None
     worker_diagnostic: dict[str, Any] | None = None
+    completion_contract: str | None = None
+    completion_contract_error: str | None = None
+    require_contract = adapter == "codex" and spec.get("require_completion_contract") is True
     exit_code, error_type = 125, None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     def terminate(signum: int, _frame: Any) -> None: raise RunnerTerminated(signum)
@@ -797,13 +869,27 @@ def run(spec_path: Path) -> int:
                 command = [executable, "--ask-for-approval", "never", "exec", "--sandbox", "workspace-write",
                            "--cd", str(workspace), "--output-last-message", str(result), "-"]
                 environment = worker_environment(spec.get("codex_home"))
+                contract_tmp = workspace / worker_contract.CONTRACT_DIR
+                contract_tmp.mkdir(mode=0o700, exist_ok=True)
+                routine_tmp = contract_tmp
+                environment["TMPDIR"] = str(contract_tmp)
             else:
                 if (not isinstance(capabilities, dict) or capabilities.get("profile") != "routine_development_v1"
                         or capabilities.get("network") is not False or capabilities.get("external_credentials") is not False
                         or capabilities.get("git_metadata") != "read_only" or not isinstance(capabilities.get("writable_paths"), list)):
                     raise ValueError("invalid routine execution capabilities")
-                routine_tmp = workspace / ".orchestra-tmp"; routine_tmp.mkdir(mode=0o700)
-                command = routine_command(executable, workspace, result, capabilities["writable_paths"])
+                contract_tmp = workspace / worker_contract.CONTRACT_DIR
+                contract_tmp.mkdir(mode=0o700, exist_ok=True)
+                routine_tmp = contract_tmp
+                read_only_paths = spec.get(
+                    "read_only_paths", spec.get("git_read_paths", []),
+                )
+                if not isinstance(read_only_paths, list):
+                    raise ValueError("invalid routine read paths")
+                command = routine_command(
+                    executable, workspace, result, capabilities["writable_paths"],
+                    read_only_paths=read_only_paths,
+                )
                 environment = worker_environment(spec.get("codex_home")); environment["TMPDIR"] = str(routine_tmp)
             if adapter == "opencode":
                 exit_code, worker_diagnostic = run_opencode_with_server(
@@ -813,6 +899,20 @@ def run(spec_path: Path) -> int:
                 error_type = "WorkerTimeout" if exit_code == 124 else (
                     "OpenCodeExecutionFailed" if exit_code else None
                 )
+            elif adapter == "codex" and spec.get("sandbox_startup_probe") is True:
+                try:
+                    probe_codex_sandbox()
+                except WorkerSandboxStartupError:
+                    exit_code, error_type = 125, "SandboxStartupError"
+                    if not required_result_present(result):
+                        write_failure_result(
+                            result,
+                            "Worker sandbox failed to start; the task did not run.\n",
+                        )
+                else:
+                    with prompt.open("rb") as input_file, log.open("ab") as output:
+                        exit_code = subprocess.run(command, cwd=workspace, env=environment, stdin=input_file,
+                            stdout=output, stderr=subprocess.STDOUT, check=False, timeout=seconds).returncode
             else:
                 with prompt.open("rb") as input_file, log.open("ab") as output:
                     exit_code = subprocess.run(command, cwd=workspace, env=environment, stdin=input_file,
@@ -827,6 +927,19 @@ def run(spec_path: Path) -> int:
         signal.signal(signal.SIGTERM, previous_sigterm)
         if gateway is not None:
             gateway.close()
+        # Read the structured contract and security report while the private
+        # contract directory still exists.  These files are never interpreted
+        # as natural-language assertions.
+        if adapter == "codex" and contract_tmp is not None and require_contract:
+            try:
+                contract = worker_contract.read_completion_contract(
+                    worker_contract.contract_path(workspace),
+                )
+            except (worker_contract.CompletionContractError, OSError, ValueError) as exc:
+                completion_contract = "invalid"
+                completion_contract_error = type(exc).__name__
+            else:
+                completion_contract = contract["status"]
         if routine_tmp is not None:
             shutil.rmtree(routine_tmp, ignore_errors=True)
             if routine_tmp.exists():
@@ -838,9 +951,43 @@ def run(spec_path: Path) -> int:
             elif not result.exists():
                 write_private_text(result, "OpenCode execution completed; provider output is intentionally not retained.\n"
                     if exit_code == 0 else f"OpenCode execution failed (exit {exit_code}); provider output is intentionally not retained.\n")
+        sandbox_failure = (
+            adapter == "codex" and worker_log_has_sandbox_startup_failure(log)
+        )
+        if sandbox_failure:
+            error_type = "SandboxStartupError"
+            if exit_code == 0:
+                exit_code = 125
+            if not required_result_present(result):
+                write_failure_result(
+                    result, "Worker sandbox failed to start; the task did not run.\n",
+                )
+        if (not sandbox_failure and exit_code == 0 and require_contract
+                and completion_contract != "success"):
+            exit_code = 125
+            error_type = (
+                "TaskContractFailed" if completion_contract == "failure"
+                else "TaskContractInvalid"
+            )
+        # result.txt is mandatory for every local worker.  A process can exit
+        # zero after its tool sandbox failed, or without emitting the requested
+        # final message; neither is a successful task.
+        if exit_code == 0 and not required_result_present(result):
+            exit_code, error_type = 125, "MissingWorkerResult"
+            write_failure_result(
+                result, "Worker exited without the required result output.\n",
+            )
+        elif exit_code != 0 and not required_result_present(result) and not sandbox_failure:
+            write_failure_result(
+                result, "Worker failed before producing a result; see task diagnostics.\n",
+            )
         record: dict[str, Any] = {
             "exit_code": exit_code, "finished_at": utc_now(), "runner_error": error_type,
         }
+        if require_contract:
+            record["completion_contract"] = completion_contract or "missing"
+            if completion_contract_error is not None:
+                record["completion_contract_error"] = completion_contract_error
         if worker_diagnostic is not None:
             record["worker_diagnostic"] = worker_diagnostic
         atomic_json(completion, record)
