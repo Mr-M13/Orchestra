@@ -78,7 +78,11 @@ class FakeBackend:
                         method = request.get("method")
                         if method == "notifications/initialized":
                             continue
-                        result = {"tools": []} if method == "tools/list" else {"ok": True}
+                        result = {"ok": True}
+                        if method == "tools/list":
+                            result = {"tools": [{"name": "bridge_status"}]}
+                        elif method == "tools/call":
+                            result = {"structuredContent": {"service": "omcp"}}
                         if method == "initialize":
                             result = {"protocolVersion": "2025-06-18"}
                         response = {
@@ -186,6 +190,11 @@ class GatewayLifecycleTests(GatewayTestBase):
                 session,
                 b'{"jsonrpc":"2.0","id":3,"method":"notifications/initialized"}',
             )
+        with self.assertRaises(GatewayError):
+            self.gateway.rpc(
+                session,
+                b'{"jsonrpc":"2.0","id":null,"method":"notifications/initialized"}',
+            )
         self.gateway.rpc(
             session,
             b'{"jsonrpc":"2.0","method":"notifications/initialized"}',
@@ -200,6 +209,18 @@ class GatewayLifecycleTests(GatewayTestBase):
                 session,
                 b'{"jsonrpc":"2.0","method":"notifications/cancelled"}',
             )
+
+    def test_canonicalization_cannot_expand_past_backend_line_limit(self):
+        payload = json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/list",
+            "params": {"x": "😀" * 8},
+        }).encode()
+        self.assertLessEqual(len(payload), 200)
+        with patch("omcp.http_gateway.MAX_BODY_BYTES", 200), \
+             patch("omcp.http_gateway.MAX_MCP_LINE_BYTES", 100):
+            with self.assertRaises(GatewayError) as raised:
+                self.gateway.rpc(None, payload)
+        self.assertEqual(raised.exception.status, 413)
 
     def test_trailing_newline_does_not_desynchronise_backend_framing(self):
         session = self.ready_session()
@@ -269,6 +290,20 @@ class GatewayLifecycleTests(GatewayTestBase):
             )
         self.assertEqual(raised.exception.status, 502)
         self.assertEqual(self.gateway.session_count, 0)
+
+    def test_repeated_close_releases_the_session_slot_once(self):
+        gateway = Gateway(self.path, TOKEN, max_sessions=1)
+        try:
+            session = self.ready_session(gateway)
+            with gateway._lock:
+                state = gateway.sessions.pop(session)
+            for _ in range(50):
+                gateway._close_state(state)
+            self.ready_session(gateway)
+            with self.assertRaises(SessionLimitError):
+                self.initialize(gateway)
+        finally:
+            gateway.shutdown()
 
     def test_shutdown_closes_all_backend_sockets(self):
         self.ready_session()
@@ -668,9 +703,12 @@ class GatewayTokenTests(unittest.TestCase):
     def test_weak_tokens_are_rejected_without_logging_values(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "omcp.sock"
-            for token in ("", "short", "x" * 63 + " "):
+            for token in ("", "short", "x" * 63 + " ", "x" * 39 + "\x01",
+                          "x" * 63 + "\n"):
                 with self.assertRaises(ValueError):
                     Gateway(path, token)
+            Gateway(path, "x" * 40)
+            Gateway(path, "x" * 40 + "._~+/=-")
 
 
 if __name__ == "__main__":

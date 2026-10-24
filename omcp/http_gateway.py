@@ -33,6 +33,7 @@ MAX_HTTP_CONCURRENCY = 64
 PROTOCOL_VERSION = "2025-06-18"
 SESSION_ID_RE = re.compile(r"[0-9a-f]{32}")
 MIN_TOKEN_LENGTH = 32
+TOKEN_RE = re.compile(r"[A-Za-z0-9._~+/=-]{32,}")
 
 LOGGER = logging.getLogger("orchestra.mcp.http")
 LOGGER.addHandler(logging.NullHandler())
@@ -56,6 +57,11 @@ class SessionLimitError(GatewayError):
     code = "session_limit"
 
 
+class RequestTooLarge(GatewayError):
+    status = 413
+    code = "request_too_large"
+
+
 class BackendUnavailable(GatewayError):
     status = 502
     code = "backend_unavailable"
@@ -67,6 +73,7 @@ class Session:
     last: float
     ready: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
+    close_lock: threading.Lock = field(default_factory=threading.Lock)
     closed: bool = False
 
 
@@ -84,9 +91,9 @@ class Gateway:
         socket_timeout: float = SOCKET_TIMEOUT_SECONDS,
     ) -> None:
         if (not isinstance(token, str) or len(token) < MIN_TOKEN_LENGTH
-                or any(character.isspace() for character in token)):
+                or TOKEN_RE.fullmatch(token) is None):
             raise ValueError(
-                "ORCHESTRA_MCP_HTTP_TOKEN must be at least 32 non-whitespace characters"
+                "ORCHESTRA_MCP_HTTP_TOKEN must be at least 32 safe header characters"
             )
         if bool(socket_owner) != bool(socket_group):
             raise ValueError("gateway socket owner and group must be configured together")
@@ -132,7 +139,8 @@ class Gateway:
             sessions = list(self.sessions.values())
             self.sessions.clear()
         for state in sessions:
-            self._close_state(state)
+            with state.lock:
+                self._close_state(state)
         audit("gateway_shutdown", closed=len(sessions))
 
     @property
@@ -168,6 +176,8 @@ class Gateway:
         canonical = json.dumps(
             request, separators=(",", ":"), ensure_ascii=True,
         ).encode("utf-8")
+        if len(canonical) + 1 > MAX_MCP_LINE_BYTES:
+            raise RequestTooLarge()
         if method == "initialize":
             if session:
                 raise GatewayError("MCP session already exists")
@@ -185,7 +195,7 @@ class Gateway:
                 self._drop(session, state, "expired")
                 raise GatewayError("MCP session expired")
             if method == "notifications/initialized":
-                if request.get("id") is not None:
+                if "id" in request:
                     raise GatewayError("initialized notification must not have an id")
                 if state.ready:
                     raise GatewayError("MCP session is already initialized")
@@ -202,7 +212,7 @@ class Gateway:
             if not state.ready:
                 raise GatewayError("MCP session is not initialized")
             try:
-                response = self._relay(state, canonical)
+                response = self._relay(state, canonical, request.get("id"))
             except OSError as exc:
                 self._drop(session, state, "backend_failure")
                 raise BackendUnavailable() from exc
@@ -216,7 +226,8 @@ class Gateway:
             state = self.sessions.pop(session, None)
             active = len(self.sessions)
         if state is not None:
-            self._close_state(state)
+            with state.lock:
+                self._close_state(state)
             audit("session_closed", reason="client", active=active)
 
     def _parse(self, payload: bytes) -> tuple[dict[str, Any], str]:
@@ -263,7 +274,7 @@ class Gateway:
             connection = None
             audit("session_created", active=active)
             return session, response.rstrip()
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError, json.JSONDecodeError, GatewayError) as exc:
             if connection is not None:
                 connection.close()
             self._slots.release()
@@ -296,9 +307,16 @@ class Gateway:
             raise
         return connection
 
-    def _relay(self, state: Session, payload: bytes) -> bytes:
+    def _relay(self, state: Session, payload: bytes, request_id: Any) -> bytes:
         self._send(state, payload)
-        return self._read_line(state.socket)
+        response = self._read_line(state.socket)
+        try:
+            parsed = json.loads(response)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise OSError("backend returned invalid JSON") from exc
+        if not isinstance(parsed, dict) or parsed.get("id") != request_id:
+            raise OSError("backend response id mismatch")
+        return response
 
     @staticmethod
     def _send(state: Session, payload: bytes) -> None:
@@ -312,7 +330,7 @@ class Gateway:
             if not block:
                 raise OSError("backend closed the connection")
             response.extend(block)
-            if len(response) > MAX_BODY_BYTES:
+            if len(response) > MAX_MCP_LINE_BYTES:
                 raise OSError("backend response exceeds the size limit")
         return bytes(response).split(b"\n", 1)[0].rstrip()
 
@@ -322,14 +340,16 @@ class Gateway:
             if removed:
                 del self.sessions[session]
             active = len(self.sessions)
+        if not removed:
+            return
         self._close_state(state)
-        if removed:
-            audit("session_closed", reason=reason, active=active)
+        audit("session_closed", reason=reason, active=active)
 
     def _close_state(self, state: Session) -> None:
-        if state.closed:
-            return
-        state.closed = True
+        with state.close_lock:
+            if state.closed:
+                return
+            state.closed = True
         try:
             state.socket.shutdown(socket.SHUT_RDWR)
         except OSError:
@@ -357,10 +377,9 @@ class Gateway:
                             and threshold - state.last >= self.session_ttl):
                         del self.sessions[session]
                         expired.append(state)
+                        self._close_state(state)
                 finally:
                     state.lock.release()
-        for state in expired:
-            self._close_state(state)
         if expired:
             with self._lock:
                 active = len(self.sessions)
@@ -488,18 +507,28 @@ def make_handler(gateway: Gateway,
                 return self.send(400, b'{"error":"invalid request size"}')
             lengths = self.headers.get_all("Content-Length") or []
             if len(lengths) != 1:
+                audit("request_rejected", logging.WARNING,
+                      status=400, code="duplicate_content_length")
                 return self.send(400, b'{"error":"invalid request size"}')
             try:
                 size = int(lengths[0])
             except ValueError:
+                audit("request_rejected", logging.WARNING,
+                      status=400, code="invalid_content_length")
                 return self.send(400, b'{"error":"invalid request size"}')
             if size < 1 or size > MAX_BODY_BYTES:
+                audit("request_rejected", logging.WARNING,
+                      status=413, code="invalid_request_size")
                 return self.send(413, b'{"error":"invalid request size"}')
             session = self.headers.get("Mcp-Session-Id")
             if session is not None and not SESSION_ID_RE.fullmatch(session):
+                audit("request_rejected", logging.WARNING,
+                      status=400, code="invalid_session_id")
                 return self.send(400, b'{"error":"invalid MCP session"}')
             body = self.rfile.read(size)
             if len(body) != size:
+                audit("request_rejected", logging.WARNING,
+                      status=400, code="incomplete_body")
                 return self.send(400, b'{"error":"incomplete request body"}')
             try:
                 session, result = gateway.rpc(session, body)
@@ -521,6 +550,7 @@ def make_handler(gateway: Gateway,
             if self.path != "/mcp":
                 return self.send(404, b"{}")
             if not gateway.allowed(self.headers.get("Authorization")):
+                audit("auth_failure", logging.WARNING, status=401, method="DELETE")
                 return self.send(401, b'{"error":"unauthorized"}')
             session = self.headers.get("Mcp-Session-Id")
             if not isinstance(session, str) or not SESSION_ID_RE.fullmatch(session):

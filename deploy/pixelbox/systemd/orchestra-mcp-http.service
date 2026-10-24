@@ -21,6 +21,8 @@ Restart=on-failure
 RestartSec=2
 TimeoutStopSec=10
 KillMode=control-group
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=200
 UMask=0077
 
 NoNewPrivileges=yes
@@ -47,7 +49,7 @@ IPAddressDeny=any
 IPAddressAllow=127.0.0.1/32
 # systemd >= 249: the gateway may bind only its reviewed loopback listener.
 SocketBindDeny=any
-SocketBindAllow=inet:8090
+SocketBindAllow=ipv4:tcp:8090
 
 [Install]
 WantedBy=multi-user.target

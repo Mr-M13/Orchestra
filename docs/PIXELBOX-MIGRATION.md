@@ -688,9 +688,11 @@ ORCHESTRA_DEPLOY_APPROVED=1 ORCHESTRA_CUTOVER_APPROVED=1 \
 
 Rollback revalidates configuration against that release, atomically selects
 it, reinstalls its unit files, and restarts the coordinator and health timer.
-When the target is a pre-HTTPS release, it disables and removes the gateway
-unit; when the target includes the gateway, it restarts the gateway after the
-coordinator socket is readable by the gateway identity. The release being
+When the target is a pre-HTTPS release, it stops and removes the gateway unit
+and fails closed if a listener remains on port 8090. When the target includes
+the gateway, successful activation waits for the socket and an authenticated
+backend check; an automatic restoration after failure restarts the prior
+gateway on a best-effort basis and reports the failure. The release being
 replaced becomes `previous`, so the operation is reversible. An activation
 failure also attempts this restoration automatically.
 

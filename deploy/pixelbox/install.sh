@@ -73,7 +73,6 @@ validate_source_commit() {
   for required in \
     omcp/server.py \
     omcp/health.py \
-    deploy/pixelbox/config-access.sh \
     deploy/pixelbox/systemd/orchestra-omcp.service; do
     git -C "$SOURCE_ROOT" cat-file -e "$RELEASE_SHA:$required" 2>/dev/null \
       || fail "release commit is missing reviewed file: $required"
@@ -82,6 +81,7 @@ validate_source_commit() {
       "$RELEASE_SHA:deploy/pixelbox/systemd/orchestra-mcp-http.service" 2>/dev/null; then
     for required in \
       omcp/http_gateway.py \
+      omcp/http_gateway_verify.py \
       deploy/pixelbox/mcp-http.env.example \
       deploy/pixelbox/verify_mcp_http.sh; do
       git -C "$SOURCE_ROOT" cat-file -e "$RELEASE_SHA:$required" 2>/dev/null \
@@ -152,7 +152,6 @@ validate_release_tree() {
     omcp/health.py \
     .github/workflows/orchestra-worker.yml \
     deploy/pixelbox/install.sh \
-    deploy/pixelbox/config-access.sh \
     deploy/pixelbox/verify.sh \
     deploy/pixelbox/systemd/orchestra-omcp.service; do
     sudo test -r "$release_root/$required" \
@@ -161,6 +160,7 @@ validate_release_tree() {
   if release_has_gateway_unit "$release_root"; then
     for required in \
       omcp/http_gateway.py \
+      omcp/http_gateway_verify.py \
       deploy/pixelbox/mcp-http.env.example \
       deploy/pixelbox/verify_mcp_http.sh; do
       sudo test -r "$release_root/$required" \
@@ -291,6 +291,25 @@ release_sha_from_link() {
   printf '%s\n' "${BASH_REMATCH[1]}"
 }
 
+gateway_listener_present() {
+  command -v ss >/dev/null 2>&1 || return 1
+  ss -ltnH | awk '$4 ~ /:8090$/ { found=1 } END { exit !found }'
+}
+
+stop_gateway_or_fail() {
+  if sudo systemctl is-active --quiet orchestra-mcp-http.service 2>/dev/null; then
+    sudo systemctl disable --now orchestra-mcp-http.service \
+      || fail "could not stop the HTTP gateway during rollback"
+  fi
+  sudo rm -f "$UNIT_ROOT/orchestra-mcp-http.service"
+  if sudo systemctl is-active --quiet orchestra-mcp-http.service 2>/dev/null; then
+    fail "the HTTP gateway is still active after rollback"
+  fi
+  if gateway_listener_present; then
+    fail "a listener remains on port 8090 after gateway rollback"
+  fi
+}
+
 install_units() {
   local release_root="$1" unit
   for unit in orchestra-omcp.service orchestra-github-dispatch.service orchestra-tunnel.service \
@@ -303,10 +322,9 @@ install_units() {
       "$release_root/deploy/pixelbox/systemd/orchestra-mcp-http.service" \
       "$UNIT_ROOT/orchestra-mcp-http.service"
   else
-    # A pre-HTTPS release must not leave the gateway service enabled or its
-    # unit file behind. Rollback therefore removes the newer capability.
-    sudo systemctl disable --now orchestra-mcp-http.service 2>/dev/null || true
-    sudo rm -f "$UNIT_ROOT/orchestra-mcp-http.service"
+    # A pre-HTTPS release must not leave the gateway service enabled, its unit
+    # file behind, or an unmanaged listener on the reviewed port.
+    stop_gateway_or_fail
   fi
 }
 
@@ -348,19 +366,17 @@ gateway_environment_is_ready() {
     || fail "$MCP_HTTP_USER cannot read $env_file"
   sudo -u "$MCP_HTTP_USER" /usr/bin/python3 - "$env_file" <<'PY' \
     || fail "$env_file does not contain a valid ORCHESTRA_MCP_HTTP_TOKEN"
+import re
 import sys
 from pathlib import Path
 
-value = None
+values = []
 for raw in Path(sys.argv[1]).read_text().splitlines():
     line = raw.strip()
-    if not line or line.startswith("#"):
-        continue
     if line.startswith("ORCHESTRA_MCP_HTTP_TOKEN="):
-        value = line.split("=", 1)[1]
-        break
-if (value is None or len(value) < 32 or value == "REPLACE_WITH_RANDOM_TOKEN"
-        or any(character.isspace() for character in value)):
+        values.append(line.split("=", 1)[1])
+if (len(values) != 1
+        or re.fullmatch(r"[A-Za-z0-9._~+/=-]{32,}", values[0]) is None):
     raise SystemExit(1)
 PY
 }
@@ -382,14 +398,15 @@ wait_for_omcp_socket() {
 wait_for_gateway_health() {
   local attempt
   for attempt in {1..50}; do
-    if sudo -u "$MCP_HTTP_USER" /usr/bin/python3 -c \
-        'import http.client; c=http.client.HTTPConnection("127.0.0.1",8090,timeout=2); c.request("GET","/healthz"); r=c.getresponse(); r.read(); c.close(); raise SystemExit(0 if r.status == 200 else 1)' \
-        >/dev/null 2>&1; then
+    if (cd /opt/orchestra/current && \
+        sudo -u "$MCP_HTTP_USER" /usr/bin/python3 -E -m omcp.http_gateway_verify \
+          --host 127.0.0.1 --port 8090 --cycles 1 \
+          --env-file "$CONFIG_ROOT/mcp-http.env" >/dev/null 2>&1); then
       return 0
     fi
     sleep 0.2
   done
-  echo "ERROR: the HTTP gateway did not become healthy on loopback" >&2
+  echo "ERROR: the HTTP gateway did not pass an authenticated backend check" >&2
   return 1
 }
 
@@ -409,6 +426,7 @@ preflight_activation() {
   [[ "$UNIT_ROOT" == "/etc/systemd/system" ]] \
     || fail "activation requires ORCHESTRA_SYSTEMD_UNIT_ROOT=/etc/systemd/system"
   command -v systemctl >/dev/null || fail "systemctl is required"
+  command -v ss >/dev/null || fail "ss is required to verify gateway listener cleanup"
   [[ -x /usr/bin/python3 ]] || fail "/usr/bin/python3 is required by the systemd units"
   validate_release_tree "$release_root"
   for file in omcp.json omcp.env tunnel.env; do
@@ -473,7 +491,7 @@ activate_release() {
       && sudo systemctl restart orchestra-omcp.service \
       && { ! release_has_gateway_unit "$release_root" || wait_for_omcp_socket; } \
       && { ! release_has_gateway_unit "$release_root" || { sudo systemctl enable orchestra-mcp-http.service && sudo systemctl restart orchestra-mcp-http.service && sudo systemctl is-active --quiet orchestra-mcp-http.service; }; } \
-      && { ! release_has_gateway_unit "$release_root" || wait_for_gateway_health; } \
+      && { ! release_has_gateway_unit "$release_root" || { wait_for_gateway_health && sudo systemctl is-active --quiet orchestra-mcp-http.service; }; } \
       && sudo systemctl is-active --quiet orchestra-omcp.service \
       && sudo systemctl is-active --quiet orchestra-health.timer; then
     if [[ -n "$old_sha" && "$old_sha" != "$RELEASE_SHA" ]]; then
@@ -497,9 +515,10 @@ activate_release() {
     fail "activation failed; current was restored to $old_sha"
   fi
   sudo unlink "$CURRENT_LINK" 2>/dev/null || true
-  sudo systemctl stop orchestra-mcp-http.service orchestra-omcp.service orchestra-health.timer || true
-  sudo systemctl disable orchestra-mcp-http.service orchestra-omcp.service orchestra-health.timer || true
-  sudo rm -f "$UNIT_ROOT/orchestra-mcp-http.service"
+  sudo systemctl stop orchestra-mcp-http.service 2>/dev/null || true
+  stop_gateway_or_fail
+  sudo systemctl stop orchestra-omcp.service orchestra-health.timer || true
+  sudo systemctl disable orchestra-omcp.service orchestra-health.timer || true
   sudo systemctl daemon-reload || true
   fail "first activation failed; no prior managed release was available"
 }

@@ -23,7 +23,7 @@ No router forwarding, public PixelBox bind, DNS migration, or new domain is requ
    `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'`.
 5. The service unit binds only `127.0.0.1:8090`, denies all network addresses
    except IPv4 loopback, restricts socket families to `AF_UNIX AF_INET`,
-   restricts `bind()` to port 8090 on systemd >= 249, and drops all
+   restricts `bind()` to IPv4 TCP port 8090 on systemd >= 249, and drops all
    capabilities. It reaches the local OMCP socket
    `/run/orchestra/omcp.sock` through the `orchestra-mcp` group only. Do not
    change the listener to `0.0.0.0`, `::`, or a LAN address, and do not expose
