@@ -17,7 +17,7 @@ from omcp.local_control import LocalApprovalServer
 
 PROTOCOL_VERSION = "2025-06-18"
 STATELESS_PROTOCOL_VERSION = "2026-07-28"
-SUPPORTED_PROTOCOL_VERSIONS = frozenset({PROTOCOL_VERSION})
+SUPPORTED_PROTOCOL_VERSIONS = frozenset({PROTOCOL_VERSION, STATELESS_PROTOCOL_VERSION})
 MAX_MCP_LINE_BYTES = 4 * 1024 * 1024
 
 
@@ -379,10 +379,6 @@ class MCPSession:
         if not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or not isinstance(request.get("method"), str):
             return self.server._error(request.get("id") if isinstance(request, dict) else None, -32600, "Invalid Request")
         request_id, method = request.get("id"), request["method"]
-        if self._is_self_contained(request):
-            # Stateless requests must never satisfy, reset, or inherit a
-            # connection's legacy initialize/initialized lifecycle.
-            return self.server._handle_ready(request)
         if method == "initialize":
             if self.state != self.CONNECTED:
                 return self.server._error(request_id, -32002, "MCP session is already initialized")
@@ -397,6 +393,12 @@ class MCPSession:
                 "serverInfo": {"name": "orchestra-omcp", "version": __version__},
                 "instructions": "Submit bounded implementation tasks; Orchestra schedules within owner-configured parallel capacity and repository conflict rules.",
             })
+        if self._is_self_contained(request):
+            # Stateless tool requests must never satisfy, reset, or inherit a
+            # connection's initialize/initialized lifecycle.  Handle
+            # initialize first: a tunnel may use the ordinary MCP handshake
+            # with the current protocol version before retaining this pipe.
+            return self.server._handle_ready(request)
         if method == "notifications/initialized" and "id" not in request:
             if self.state == self.NEGOTIATED:
                 self.state = self.READY
