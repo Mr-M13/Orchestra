@@ -16,6 +16,8 @@ from omcp.local_control import LocalApprovalServer
 
 
 PROTOCOL_VERSION = "2025-06-18"
+STATELESS_PROTOCOL_VERSION = "2026-07-28"
+SUPPORTED_PROTOCOL_VERSIONS = frozenset({PROTOCOL_VERSION})
 MAX_MCP_LINE_BYTES = 4 * 1024 * 1024
 
 
@@ -144,6 +146,7 @@ class MCPServer:
             "cancel_task": lambda value: controller.cancel_task(value.get("task_id"), value.get("reason")),
             "list_approvals": lambda _: controller.list_approvals(),
         }
+        self._direct_session = MCPSession(self)
 
     @staticmethod
     def _result(request_id: Any, result: Any) -> dict[str, Any]:
@@ -154,18 +157,23 @@ class MCPServer:
         return {"jsonrpc": "2.0", "id": request_id,
                 "error": {"code": code, "message": message}}
 
-    def handle(self, request: Any) -> dict[str, Any] | None:
+    def new_session(self) -> "MCPSession":
+        return MCPSession(self)
+
+    def handle(self, request: Any, session: "MCPSession | None" = None) -> dict[str, Any] | None:
+        """Compatibility entry point; transports must retain one session per peer."""
+        return (session or self._direct_session).handle(request)
+
+    def _handle_ready(self, request: dict[str, Any]) -> dict[str, Any] | None:
         if not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or not isinstance(request.get("method"), str):
             return self._error(request.get("id") if isinstance(request, dict) else None, -32600, "Invalid Request")
         request_id = request.get("id")
         method = request["method"]
         if "id" not in request:
-            if method == "notifications/initialized":
-                return None
             return None
-        if method == "initialize":
+        if method == "server/discover":
             return self._result(request_id, {
-                "protocolVersion": PROTOCOL_VERSION,
+                "supportedVersions": [PROTOCOL_VERSION, STATELESS_PROTOCOL_VERSION],
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": "orchestra-omcp", "version": __version__},
                 "instructions": "Submit bounded implementation tasks; Orchestra schedules within owner-configured parallel capacity and repository conflict rules.",
@@ -217,19 +225,20 @@ class MCPServer:
         ticker.join(timeout=2)
         local_approval.stop()
 
-    def _stdio_response(self, line: str) -> dict[str, Any] | None:
+    def _stdio_response(self, line: str, session: "MCPSession") -> dict[str, Any] | None:
         try:
-            return self.handle(json.loads(line))
+            return session.handle(json.loads(line))
         except json.JSONDecodeError:
             return self._error(None, -32700, "Parse error")
 
     def run(self) -> int:
         local_approval, ticker = self._start_auxiliary()
+        session = self.new_session()
         try:
             for line in sys.stdin:
                 if self.stopping:
                     break
-                response = self._stdio_response(line)
+                response = self._stdio_response(line, session)
                 if response is not None:
                     sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
                     sys.stdout.flush()
@@ -283,6 +292,7 @@ class MCPServer:
     def _serve_connection(self, connection: socket.socket) -> None:
         connection.settimeout(1.0)
         buffer = b""
+        session = self.new_session()
         with connection:
             while not self.stop_event.is_set():
                 try:
@@ -308,7 +318,7 @@ class MCPServer:
                             None, -32700, "Parse error",
                         ))
                         continue
-                    response = self._stdio_response(line)
+                    response = self._stdio_response(line, session)
                     if response is not None:
                         self._send_connection(connection, response)
 
@@ -332,6 +342,68 @@ class MCPServer:
                 except Exception:
                     pass
 
+
+class MCPSession:
+    """One legacy MCP handshake; discarded with its stdio/Unix-socket peer."""
+    CONNECTED = "connected"
+    NEGOTIATED = "negotiated"
+    READY = "ready"
+
+    def __init__(self, server: MCPServer):
+        self.server = server
+        self.state = self.CONNECTED
+
+    @staticmethod
+    def _is_self_contained(request: dict[str, Any]) -> bool:
+        """Recognize only the current tunnel's complete stateless request form.
+
+        The tunnel uses this metadata to bypass its own legacy stdio readiness
+        guard.  Requiring both fields here prevents an arbitrary ``_meta``
+        payload from weakening Orchestra's legacy session enforcement.
+        """
+        params = request.get("params")
+        if not isinstance(params, dict):
+            return False
+        meta = params.get("_meta")
+        if not isinstance(meta, dict):
+            return False
+        return (
+            meta.get("io.modelcontextprotocol/protocolVersion")
+            == STATELESS_PROTOCOL_VERSION
+            and isinstance(
+                meta.get("io.modelcontextprotocol/clientCapabilities"), dict,
+            )
+        )
+
+    def handle(self, request: Any) -> dict[str, Any] | None:
+        if not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or not isinstance(request.get("method"), str):
+            return self.server._error(request.get("id") if isinstance(request, dict) else None, -32600, "Invalid Request")
+        request_id, method = request.get("id"), request["method"]
+        if self._is_self_contained(request):
+            # Stateless requests must never satisfy, reset, or inherit a
+            # connection's legacy initialize/initialized lifecycle.
+            return self.server._handle_ready(request)
+        if method == "initialize":
+            if self.state != self.CONNECTED:
+                return self.server._error(request_id, -32002, "MCP session is already initialized")
+            params = request.get("params")
+            version = params.get("protocolVersion") if isinstance(params, dict) else None
+            if version not in SUPPORTED_PROTOCOL_VERSIONS:
+                return self.server._error(request_id, -32602, "Unsupported MCP protocol version")
+            self.state = self.NEGOTIATED
+            return self.server._result(request_id, {
+                "protocolVersion": version,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "orchestra-omcp", "version": __version__},
+                "instructions": "Submit bounded implementation tasks; Orchestra schedules within owner-configured parallel capacity and repository conflict rules.",
+            })
+        if method == "notifications/initialized" and "id" not in request:
+            if self.state == self.NEGOTIATED:
+                self.state = self.READY
+            return None
+        if self.state != self.READY:
+            return self.server._error(request_id, -32002, "MCP server is not initialized") if "id" in request else None
+        return self.server._handle_ready(request)
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Orchestra MCP task-control server")
