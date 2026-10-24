@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 import socket
+import time
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,10 @@ class OMCPClient:
 
     _PROTOCOL_VERSION = "2025-06-18"
     _CLIENT_INFO = {"name": "orchestra-dashboard", "version": "0.2.0"}
+    # This is the maximum number of UTF-8 JSON bytes, excluding the newline
+    # framing delimiter.  A peer cannot use a final oversized recv() chunk to
+    # evade this bound.
+    _MAX_RESPONSE_BYTES = 1_048_576
 
     _TOOLS = {
         "bridge_status", "worker_availability", "list_tasks", "task_snapshot",
@@ -72,9 +77,10 @@ class OMCPClient:
                 response = self._receive_line(connection)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             raise OMCPError("Orchestra is unavailable") from exc
-        if (not isinstance(response, dict) or response.get("jsonrpc") != "2.0"
-                or response.get("id") != request_id):
+        if not self._is_response_for(response, request_id):
             raise OMCPError("invalid response from Orchestra")
+        if "error" in response:
+            raise OMCPError("Orchestra rejected the request")
         result = response.get("result")
         if not isinstance(result, dict) or result.get("isError"):
             raise OMCPError("Orchestra rejected the request")
@@ -104,9 +110,10 @@ class OMCPClient:
             },
         })
         response = self._receive_line(connection)
-        if (not isinstance(response, dict) or response.get("jsonrpc") != "2.0"
-                or response.get("id") != request_id):
+        if not self._is_response_for(response, request_id):
             raise OMCPError("invalid response from Orchestra")
+        if "error" in response:
+            raise OMCPError("Orchestra initialization failed")
         result = response.get("result")
         if (not isinstance(result, dict)
                 or result.get("protocolVersion") != self._PROTOCOL_VERSION):
@@ -116,14 +123,32 @@ class OMCPClient:
         })
 
     @staticmethod
-    def _receive_line(connection: socket.socket) -> dict[str, Any]:
+    def _is_response_for(response: Any, request_id: int) -> bool:
+        return (
+            isinstance(response, dict)
+            and response.get("jsonrpc") == "2.0"
+            and type(response.get("id")) is int
+            and response["id"] == request_id
+        )
+
+    def _receive_line(self, connection: socket.socket) -> dict[str, Any]:
         data = bytearray()
-        while len(data) <= 1_048_576:
+        deadline = time.monotonic() + self.timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("OMCP response deadline expired")
+            connection.settimeout(remaining)
             part = connection.recv(65536)
             if not part:
                 break
             data.extend(part)
-            if b"\n" in part:
-                line = bytes(data).split(b"\n", 1)[0]
+            newline = data.find(b"\n")
+            if newline >= 0:
+                if newline > self._MAX_RESPONSE_BYTES:
+                    raise OMCPError("invalid response from Orchestra")
+                line = bytes(data[:newline])
                 return json.loads(line.decode("utf-8"))
+            if len(data) > self._MAX_RESPONSE_BYTES:
+                raise OMCPError("invalid response from Orchestra")
         raise OMCPError("invalid response from Orchestra")
