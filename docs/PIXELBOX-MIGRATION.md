@@ -606,7 +606,31 @@ A restore is a new deployment action: restore into an empty state directory,
 validate permissions, start the coordinator, and verify health before
 submitting work.
 
-## 12. Cutover gate
+## 12. Optional HTTPS MCP gateway
+
+The HTTPS MCP gateway is an optional second ingress for clients that cannot use
+the Secure MCP Tunnel. It is not required for the tunnel path and must not be
+exposed directly.
+
+- Staging an HTTPS-capable release creates the `orchestra-mcp` group and
+  `orchestra-mcp-http` service identity before installing gateway configuration.
+- `/etc/orchestra/mcp-http.env` is owned by `orchestra-mcp-http`, group
+  `orchestra-mcp`, mode `0600`; the installer preserves existing contents and
+  never prints or replaces the token. Activation rejects a placeholder or a
+  token shorter than 32 non-whitespace characters.
+- The service binds only `127.0.0.1:8090`, allows only IPv4 loopback network
+  traffic, accepts only `AF_UNIX` and `AF_INET`, and reaches the coordinator
+  socket through the `orchestra-mcp` group. Cloudflare ingress is the only
+  intended external path.
+- Idle MCP sessions expire after 15 minutes, a background sweeper removes stale
+  sessions, concurrent sessions are capped, and shutdown/`DELETE` closes backend
+  sockets.
+- Rollback to a pre-HTTPS release disables and removes the gateway unit. Roll
+  forward again only after another explicit cutover approval.
+- Verify with `deploy/pixelbox/verify_mcp_http.sh` and the Cloudflare ingress
+  checks in [CLOUDFLARE-MCP.md](CLOUDFLARE-MCP.md).
+
+## 13. Cutover gate
 
 Do not cut over on unit tests alone. The owner must explicitly approve after all
 of the following evidence is recorded:
@@ -616,7 +640,7 @@ of the following evidence is recorded:
 3. `Config.load` validates the reviewed owner-only configuration.
 4. `omcp.health` reports `ok` (or a documented, accepted degraded reason).
 5. The dedicated tunnel profile passes `tunnel-client doctor` and `/readyz`.
-6. ChatGPT discovers all nine OMCP tools and `bridge_status` reports
+6. ChatGPT discovers the configured OMCP tools and `bridge_status` reports
    `platform=linux`, `sandbox.backend=bubblewrap`, and the expected workers.
 7. A harmless `routine_development` local Codex task starts without approval
    and returns a terminal result. An unclassified harmless task remains
@@ -658,9 +682,12 @@ ORCHESTRA_DEPLOY_APPROVED=1 ORCHESTRA_CUTOVER_APPROVED=1 \
 ```
 
 Rollback revalidates configuration against that release, atomically selects
-it, reinstalls its unit files, and restarts only the coordinator and health
-timer. The release being replaced becomes `previous`, so the operation is
-reversible. An activation failure also attempts this restoration automatically.
+it, reinstalls its unit files, and restarts the coordinator and health timer.
+When the target is a pre-HTTPS release, it disables and removes the gateway
+unit; when the target includes the gateway, it restarts the gateway after the
+coordinator socket is readable by the gateway identity. The release being
+replaced becomes `previous`, so the operation is reversible. An activation
+failure also attempts this restoration automatically.
 
 Routing rollback remains a separate, explicitly approved operation:
 
@@ -670,7 +697,7 @@ Routing rollback remains a separate, explicitly approved operation:
 4. Re-run the Mac health and harmless-task checks.
 5. Do not delete PixelBox state until the owner authorises retention cleanup.
 
-## 13. Security notes and limitations
+## 14. Security notes and limitations
 
 - Never commit credentials. Never print a token, API key or capability value in
   a command, log, issue or task.

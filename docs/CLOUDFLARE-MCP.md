@@ -12,10 +12,30 @@ No router forwarding, public PixelBox bind, DNS migration, or new domain is requ
    `hostname: mcp.<domain>` and `service: http://127.0.0.1:8090`; include a
    final 404 ingress rule. Install Cloudflare's generated systemd service so it
    reconnects on boot.
-4. Keep `orchestra-mcp-http.service` loopback-only. Put a generated bearer
-   token in `/etc/orchestra/mcp-http.env` mode 0600, owned by `hamed`; never in
-   this repository. Run `verify_mcp_http.sh` locally, then verify
-   `https://mcp.<domain>/healthz` and authenticated `/mcp`.
+4. Keep `orchestra-mcp-http.service` loopback-only. The installer creates the
+   `orchestra-mcp` group and `orchestra-mcp-http` service identity before
+   staging gateway configuration. The gateway token file
+   `/etc/orchestra/mcp-http.env` is owned by `orchestra-mcp-http`, group
+   `orchestra-mcp`, mode `0600`. The installer preserves existing token
+   contents, grants only group traverse access on `/etc/orchestra`, and never
+   prints the token. Generate a token of at least 32 non-whitespace characters,
+   for example:
+   `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'`.
+5. The service unit binds only `127.0.0.1:8090`, denies all network addresses
+   except IPv4 loopback, restricts socket families to `AF_UNIX AF_INET`, and
+   drops all capabilities. It reaches the local OMCP socket
+   `/run/orchestra/omcp.sock` through the `orchestra-mcp` group only. Do not
+   change the listener to `0.0.0.0`, `::`, or a LAN address, and do not expose
+   the port through any other proxy.
+6. Run `verify_mcp_http.sh` locally, then verify
+   `https://mcp.<domain>/healthz` and authenticated `/mcp`. The verifier checks
+   the exact loopback listener, the gateway identity's read access to the
+   coordinator socket, and 20 authenticated initialize/tools/delete cycles.
+
+The gateway expires idle MCP sessions after 15 minutes, sweeps them in the
+background, caps concurrent sessions, and closes every backend socket on
+shutdown or `DELETE`. Cloudflare ingress is not a substitute for gateway
+authentication.
 
 ChatGPT remote MCP authentication must be confirmed in the owner’s current
 OpenAI connector UI/documentation before use. If that UI cannot attach a static

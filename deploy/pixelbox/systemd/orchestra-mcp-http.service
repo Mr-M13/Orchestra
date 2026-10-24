@@ -2,21 +2,30 @@
 Description=Orchestra loopback HTTP MCP gateway
 After=orchestra-omcp.service
 Requires=orchestra-omcp.service
+Conflicts=shutdown.target
+
 [Service]
+Type=simple
 User=orchestra-mcp-http
-Group=orchestra-mcp-http
-SupplementaryGroups=orchestra-mcp
+Group=orchestra-mcp
 EnvironmentFile=/etc/orchestra/mcp-http.env
-ExecStart=/usr/bin/python3 -m omcp.http_gateway --socket /run/orchestra/omcp.sock --host 127.0.0.1 --port 8090
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Exercise the same identity that reads the token and connects to the socket.
+ExecStartPre=/usr/bin/test -r /etc/orchestra/mcp-http.env
+ExecStartPre=/usr/bin/test -S /run/orchestra/omcp.sock
+ExecStart=/usr/bin/python3 -m omcp.http_gateway --socket /run/orchestra/omcp.sock --socket-owner hamed --socket-group orchestra-mcp --host 127.0.0.1 --port 8090
 Restart=on-failure
 RestartSec=2
+TimeoutStopSec=10
+KillMode=control-group
+UMask=0077
+
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
 PrivateNetwork=no
 ProtectSystem=strict
 ProtectHome=yes
-ReadOnlyPaths=/run/orchestra/omcp.sock
 ProtectControlGroups=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
@@ -25,9 +34,14 @@ ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
 ProcSubset=pid
-NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_UNIX AF_INET
 IPAddressDeny=any
 IPAddressAllow=127.0.0.1/32
+
 [Install]
 WantedBy=multi-user.target

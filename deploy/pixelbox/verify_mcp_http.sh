@@ -1,13 +1,49 @@
 #!/usr/bin/env bash
 # Read-only live verifier. It never prints ORCHESTRA_MCP_HTTP_TOKEN.
 set -euo pipefail
+
 ENV_FILE="${ORCHESTRA_MCP_HTTP_ENV:-/etc/orchestra/mcp-http.env}"
-[[ -r "$ENV_FILE" ]] || { echo "missing gateway environment" >&2; exit 1; }
-set -a; source "$ENV_FILE"; set +a
-[[ -n "${ORCHESTRA_MCP_HTTP_TOKEN:-}" ]] || { echo "missing gateway token" >&2; exit 1; }
+MCP_HTTP_USER="${ORCHESTRA_MCP_HTTP_USER:-orchestra-mcp-http}"
+[[ -f "$ENV_FILE" && ! -L "$ENV_FILE" ]] \
+  || { echo "missing or unsafe gateway environment" >&2; exit 1; }
+[[ "$(stat -c '%a' "$ENV_FILE" 2>/dev/null || stat -f '%Lp' "$ENV_FILE")" == "600" ]] \
+  || { echo "gateway environment must have mode 0600" >&2; exit 1; }
+
+read_token() {
+  if [[ "$(id -un)" == "$MCP_HTTP_USER" ]]; then
+    /usr/bin/python3 - "$ENV_FILE"
+  else
+    sudo -u "$MCP_HTTP_USER" /usr/bin/python3 - "$ENV_FILE"
+  fi <<'PY'
+import sys
+from pathlib import Path
+
+value = None
+for raw in Path(sys.argv[1]).read_text().splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    if line.startswith("ORCHESTRA_MCP_HTTP_TOKEN="):
+        value = line.split("=", 1)[1]
+        break
+if (value is None or len(value) < 32 or value == "REPLACE_WITH_RANDOM_TOKEN"
+        or any(character.isspace() for character in value)):
+    raise SystemExit(1)
+print(value)
+PY
+}
+
+ORCHESTRA_MCP_HTTP_TOKEN="$(read_token)" \
+  || { echo "gateway environment does not contain a valid token" >&2; exit 1; }
+export ORCHESTRA_MCP_HTTP_TOKEN
+
+command -v systemctl >/dev/null || { echo "systemctl is required" >&2; exit 1; }
+command -v ss >/dev/null || { echo "ss is required" >&2; exit 1; }
 systemctl is-active --quiet orchestra-mcp-http.service
 ss -ltnH | awk '$4 == "127.0.0.1:8090" { found=1 } END { exit !found }'
-! ss -ltnH | awk '$4 ~ /(^|:)8090$/ && $4 !~ /^127\.0\.0\.1:8090$/ { exit 1 }'
+! ss -ltnH | awk '$4 ~ /(^|:)8090$/ && $4 !~ /^127\.0\.0\.1:8090$/ { found=1 } END { exit !found }'
+sudo -u "$MCP_HTTP_USER" /usr/bin/test -r /run/orchestra/omcp.sock
+sudo -u "$MCP_HTTP_USER" /usr/bin/test -w /run/orchestra/omcp.sock
 python3 - <<'PY'
 import http.client, json, os
 token=os.environ['ORCHESTRA_MCP_HTTP_TOKEN']; headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'}

@@ -8,10 +8,13 @@ DEPLOY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=config-access.sh
 source "$DEPLOY_ROOT/config-access.sh"
 BROKER_USER="${ORCHESTRA_BROKER_USER:-orchestra-github}"
+MCP_HTTP_USER="${ORCHESTRA_MCP_HTTP_USER:-orchestra-mcp-http}"
+MCP_HTTP_GROUP="${ORCHESTRA_MCP_HTTP_GROUP:-orchestra-mcp}"
 INSTALL_ROOT="${ORCHESTRA_INSTALL_ROOT:-/opt/orchestra}"
 CONFIG_ROOT="${ORCHESTRA_CONFIG_ROOT:-/etc/orchestra}"
 STATE_ROOT="${ORCHESTRA_STATE_ROOT:-/home/hamed/orchestra-migration/state}"
 SERVICE_USER="${ORCHESTRA_SERVICE_USER:-hamed}"
+UNIT_ROOT="${ORCHESTRA_SYSTEMD_UNIT_ROOT:-/etc/systemd/system}"
 RELEASES_ROOT="$INSTALL_ROOT/releases"
 CURRENT_LINK="$INSTALL_ROOT/current"
 PREVIOUS_LINK="$INSTALL_ROOT/previous"
@@ -62,24 +65,6 @@ while (($#)); do
   shift
 done
 
-SOURCE_HEAD="unavailable"
-case "$MODE" in
-  plan|stage|apply)
-    command -v git >/dev/null || fail "git is required"
-    SOURCE_HEAD="$(git -C "$SOURCE_ROOT" rev-parse --verify HEAD^{commit} 2>/dev/null)" \
-      || fail "source is not a Git checkout"
-    if [[ -z "$RELEASE_SHA" ]]; then
-      [[ "$MODE" == "plan" ]] || fail "--sha must name the reviewed 40-character commit"
-      RELEASE_SHA="$SOURCE_HEAD"
-    fi
-    ;;
-  activate|rollback)
-    [[ -n "$RELEASE_SHA" ]] || fail "--sha must name the staged 40-character commit"
-    ;;
-esac
-[[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] \
-  || fail "release SHA must be exactly 40 lowercase hexadecimal characters"
-
 validate_source_commit() {
   local resolved required
   resolved="$(git -C "$SOURCE_ROOT" rev-parse --verify "$RELEASE_SHA^{commit}" 2>/dev/null)" \
@@ -88,42 +73,26 @@ validate_source_commit() {
   for required in \
     omcp/server.py \
     omcp/health.py \
+    deploy/pixelbox/config-access.sh \
     deploy/pixelbox/systemd/orchestra-omcp.service; do
     git -C "$SOURCE_ROOT" cat-file -e "$RELEASE_SHA:$required" 2>/dev/null \
       || fail "release commit is missing reviewed file: $required"
   done
+  if git -C "$SOURCE_ROOT" cat-file -e \
+      "$RELEASE_SHA:deploy/pixelbox/systemd/orchestra-mcp-http.service" 2>/dev/null; then
+    for required in \
+      omcp/http_gateway.py \
+      deploy/pixelbox/mcp-http.env.example \
+      deploy/pixelbox/verify_mcp_http.sh; do
+      git -C "$SOURCE_ROOT" cat-file -e "$RELEASE_SHA:$required" 2>/dev/null \
+        || fail "release commit is missing reviewed HTTPS MCP file: $required"
+    done
+  fi
 }
 
-if [[ "$MODE" == "plan" || "$MODE" == "stage" || "$MODE" == "apply" ]]; then
-  validate_source_commit
-fi
-
-echo "Orchestra PixelBox release plan"
-note "source repository: $SOURCE_ROOT"
-note "source HEAD:       $SOURCE_HEAD"
-note "exact release:     $RELEASE_SHA"
-note "release directory: $RELEASES_ROOT/$RELEASE_SHA"
-note "active symlink:    $CURRENT_LINK"
-note "config root:       $CONFIG_ROOT"
-note "state root:        $STATE_ROOT"
-note "service user:      $SERVICE_USER"
-note "mode:              $MODE"
-note "untouched:         tunnel, Nextcloud, Docker, Tailscale, Mac coordinator"
-echo
-
-if [[ "$MODE" == "plan" ]]; then
-  echo "Dry run complete. No files or services were changed; no symlinks were changed."
-  echo "Stage this exact commit with:"
-  echo "  ORCHESTRA_DEPLOY_APPROVED=1 $0 --stage --sha $RELEASE_SHA"
-  exit 0
-fi
-
-[[ "${ORCHESTRA_DEPLOY_APPROVED:-0}" == "1" ]] \
-  || fail "deployment staging is not approved; set ORCHESTRA_DEPLOY_APPROVED=1 only after approval"
-[[ "$(id -un)" == "$SERVICE_USER" ]] || fail "run as $SERVICE_USER"
-command -v sudo >/dev/null || fail "sudo is required"
-command -v tar >/dev/null || fail "tar is required"
-command -v python3 >/dev/null || fail "python3 is required"
+release_has_gateway_unit() {
+  [[ -f "$1/deploy/pixelbox/systemd/orchestra-mcp-http.service" ]]
+}
 
 cleanup() {
   if [[ -n "$ARCHIVE_FILE" && -f "$ARCHIVE_FILE" ]]; then
@@ -138,7 +107,6 @@ cleanup() {
     esac
   fi
 }
-trap cleanup EXIT
 
 calculate_release_digest() {
   python3 - "$1" <<'PY'
@@ -184,11 +152,21 @@ validate_release_tree() {
     omcp/health.py \
     .github/workflows/orchestra-worker.yml \
     deploy/pixelbox/install.sh \
+    deploy/pixelbox/config-access.sh \
     deploy/pixelbox/verify.sh \
     deploy/pixelbox/systemd/orchestra-omcp.service; do
     sudo test -r "$release_root/$required" \
       || fail "staged release is missing reviewed file: $required"
   done
+  if release_has_gateway_unit "$release_root"; then
+    for required in \
+      omcp/http_gateway.py \
+      deploy/pixelbox/mcp-http.env.example \
+      deploy/pixelbox/verify_mcp_http.sh; do
+      sudo test -r "$release_root/$required" \
+        || fail "staged release is missing reviewed HTTPS MCP file: $required"
+    done
+  fi
   recorded_digest="$(sudo cat "$release_root/.orchestra-release-digest" 2>/dev/null)" \
     || fail "release digest is missing: $release_root"
   [[ "$recorded_digest" =~ ^[0-9a-f]{64}$ ]] || fail "release digest is invalid"
@@ -198,6 +176,9 @@ validate_release_tree() {
     || fail "staged release content differs from its validated digest"
   bash -n "$release_root/deploy/pixelbox/install.sh"
   bash -n "$release_root/deploy/pixelbox/verify.sh"
+  if release_has_gateway_unit "$release_root"; then
+    bash -n "$release_root/deploy/pixelbox/verify_mcp_http.sh"
+  fi
   cache_root="$(mktemp -d "${TMPDIR:-/tmp}/orchestra-pycache.XXXXXX")"
   if ! (cd "$release_root" && PYTHONPYCACHEPREFIX="$cache_root" \
       python3 -m compileall -q omcp scripts tests); then
@@ -233,6 +214,24 @@ stage_release() {
   echo "Staged and validated exact release: $release_root"
 }
 
+install_environment_file() {
+  local release_root="$1" env_file="$2" owner="$3" group="$4"
+  local destination="$CONFIG_ROOT/$env_file"
+  if [[ -e "$destination" || -L "$destination" ]]; then
+    [[ -f "$destination" && ! -L "$destination" ]] \
+      || fail "$destination must be a regular owner-managed file, not a symlink"
+    # Preserve the existing value. Only repair access for the configured
+    # service identity; never print or replace credential contents.
+    sudo chown "$owner:$group" "$destination"
+    sudo chmod 0600 "$destination"
+    return
+  fi
+  sudo install -m 0600 -o "$owner" -g "$group" \
+    "$release_root/deploy/pixelbox/$env_file.example" "$destination"
+  echo "Installed $destination; fill it locally and do not commit secrets."
+  STAGED_ONLY=1
+}
+
 stage_configuration() {
   local release_root="$RELEASES_ROOT/$RELEASE_SHA" env_file
   sudo install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$CONFIG_ROOT"
@@ -242,10 +241,17 @@ stage_configuration() {
     "$(dirname "$STATE_ROOT")/backup"
 
   # install -d rewrites the ACL mask on an existing CONFIG_ROOT even when its
-  # mode is already 0700.  Re-apply the broker's traverse-only entry after the
-  # directory operations so repeated staging cannot strand the broker.
+  # mode is already 0700.  Re-apply traverse-only entries after the directory
+  # operations so repeated staging cannot strand the broker or the HTTP gateway.
   ensure_broker_traverse_acl "$CONFIG_ROOT" \
     || fail "could not preserve dispatch broker configuration access"
+  if release_has_gateway_unit "$release_root"; then
+    [[ "$MCP_HTTP_USER" == "orchestra-mcp-http" && "$MCP_HTTP_GROUP" == "orchestra-mcp" ]] \
+      || fail "the gateway unit requires the reviewed orchestra-mcp-http/orchestra-mcp identity"
+    prepare_mcp_identity
+    ensure_group_traverse_acl "$CONFIG_ROOT" "$MCP_HTTP_GROUP" \
+      || fail "could not grant the HTTP gateway traverse access to $CONFIG_ROOT"
+  fi
 
   if [[ ! -f "$CONFIG_ROOT/omcp.json" ]]; then
     sudo install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_USER" \
@@ -253,14 +259,14 @@ stage_configuration() {
     echo "Installed example omcp.json; owner review is required before activation."
     STAGED_ONLY=1
   fi
-  for env_file in omcp.env tunnel.env mcp-http.env; do
-    if [[ ! -f "$CONFIG_ROOT/$env_file" ]]; then
-      sudo install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_USER" \
-        "$release_root/deploy/pixelbox/$env_file.example" "$CONFIG_ROOT/$env_file"
-      echo "Installed $CONFIG_ROOT/$env_file; fill it locally and do not commit secrets."
-      STAGED_ONLY=1
-    fi
+  for env_file in omcp.env tunnel.env; do
+    install_environment_file "$release_root" "$env_file" \
+      "$SERVICE_USER" "$SERVICE_USER"
   done
+  if release_has_gateway_unit "$release_root"; then
+    install_environment_file "$release_root" mcp-http.env \
+      "$MCP_HTTP_USER" "$MCP_HTTP_GROUP"
+  fi
 }
 
 configuration_is_ready_for_activation() {
@@ -289,19 +295,87 @@ install_units() {
   for unit in orchestra-omcp.service orchestra-github-dispatch.service orchestra-tunnel.service \
               orchestra-health.service orchestra-health.timer; do
     sudo install -m 0644 "$release_root/deploy/pixelbox/systemd/$unit" \
-      "/etc/systemd/system/$unit"
+      "$UNIT_ROOT/$unit"
   done
-  if [[ -f "$release_root/deploy/pixelbox/systemd/orchestra-mcp-http.service" ]]; then
-    sudo install -m 0644 "$release_root/deploy/pixelbox/systemd/orchestra-mcp-http.service" /etc/systemd/system/orchestra-mcp-http.service
+  if release_has_gateway_unit "$release_root"; then
+    sudo install -m 0644 \
+      "$release_root/deploy/pixelbox/systemd/orchestra-mcp-http.service" \
+      "$UNIT_ROOT/orchestra-mcp-http.service"
   else
+    # A pre-HTTPS release must not leave the gateway service enabled or its
+    # unit file behind. Rollback therefore removes the newer capability.
     sudo systemctl disable --now orchestra-mcp-http.service 2>/dev/null || true
-    sudo rm -f /etc/systemd/system/orchestra-mcp-http.service
+    sudo rm -f "$UNIT_ROOT/orchestra-mcp-http.service"
   fi
 }
 
 prepare_mcp_identity() {
-  getent group orchestra-mcp >/dev/null || sudo groupadd --system orchestra-mcp
-  id orchestra-mcp-http >/dev/null 2>&1 || sudo useradd --system --no-create-home --shell /usr/sbin/nologin --gid orchestra-mcp orchestra-mcp-http
+  local desired_gid primary_gid
+  command -v getent >/dev/null 2>&1 || fail "getent is required to manage the HTTPS MCP identity"
+  command -v groupadd >/dev/null 2>&1 || fail "groupadd is required to create $MCP_HTTP_GROUP"
+  command -v useradd >/dev/null 2>&1 || fail "useradd is required to create $MCP_HTTP_USER"
+  if ! getent group "$MCP_HTTP_GROUP" >/dev/null 2>&1; then
+    sudo groupadd --system "$MCP_HTTP_GROUP"
+  fi
+  desired_gid="$(getent group "$MCP_HTTP_GROUP" | awk -F: 'NR == 1 {print $3}')"
+  [[ "$desired_gid" =~ ^[0-9]+$ ]] \
+    || fail "could not resolve the $MCP_HTTP_GROUP group ID"
+  if ! id "$MCP_HTTP_USER" >/dev/null 2>&1; then
+    sudo useradd --system --no-create-home --home-dir /nonexistent \
+      --shell /usr/sbin/nologin --gid "$MCP_HTTP_GROUP" "$MCP_HTTP_USER"
+  fi
+  primary_gid="$(id -g "$MCP_HTTP_USER")"
+  [[ "$primary_gid" == "$desired_gid" ]] \
+    || fail "$MCP_HTTP_USER must use $MCP_HTTP_GROUP as its primary group"
+}
+
+gateway_environment_is_ready() {
+  local env_file="$CONFIG_ROOT/mcp-http.env" user_uid group_gid
+  [[ -f "$env_file" && ! -L "$env_file" ]] \
+    || fail "required gateway configuration is missing or unsafe: $env_file"
+  user_uid="$(id -u "$MCP_HTTP_USER")"
+  group_gid="$(getent group "$MCP_HTTP_GROUP" | awk -F: 'NR == 1 {print $3}')"
+  [[ "$(sudo stat -c '%a' "$env_file")" == "600" ]] \
+    || fail "$env_file must have mode 0600"
+  [[ "$(sudo stat -c '%u' "$env_file")" == "$user_uid" ]] \
+    || fail "$env_file must be owned by $MCP_HTTP_USER"
+  [[ "$(sudo stat -c '%g' "$env_file")" == "$group_gid" ]] \
+    || fail "$env_file must have group $MCP_HTTP_GROUP"
+  sudo -u "$MCP_HTTP_USER" /usr/bin/test -x "$CONFIG_ROOT" \
+    || fail "$MCP_HTTP_USER cannot traverse $CONFIG_ROOT"
+  sudo -u "$MCP_HTTP_USER" /usr/bin/test -r "$env_file" \
+    || fail "$MCP_HTTP_USER cannot read $env_file"
+  sudo -u "$MCP_HTTP_USER" /usr/bin/python3 - "$env_file" <<'PY' \
+    || fail "$env_file does not contain a valid ORCHESTRA_MCP_HTTP_TOKEN"
+import sys
+from pathlib import Path
+
+value = None
+for raw in Path(sys.argv[1]).read_text().splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    if line.startswith("ORCHESTRA_MCP_HTTP_TOKEN="):
+        value = line.split("=", 1)[1]
+        break
+if (value is None or len(value) < 32 or value == "REPLACE_WITH_RANDOM_TOKEN"
+        or any(character.isspace() for character in value)):
+    raise SystemExit(1)
+PY
+}
+
+wait_for_omcp_socket() {
+  local attempt
+  for attempt in {1..50}; do
+    if sudo test -S /run/orchestra/omcp.sock 2>/dev/null \
+        && sudo -u "$MCP_HTTP_USER" /usr/bin/test -r /run/orchestra/omcp.sock 2>/dev/null \
+        && sudo -u "$MCP_HTTP_USER" /usr/bin/test -w /run/orchestra/omcp.sock 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "ERROR: the HTTP gateway identity cannot read/write the coordinator socket" >&2
+  return 1
 }
 
 preflight_activation() {
@@ -317,6 +391,8 @@ preflight_activation() {
     || fail "activation requires the reviewed PixelBox state path"
   [[ "$SERVICE_USER" == "hamed" ]] \
     || fail "activation requires the reviewed PixelBox service user hamed"
+  [[ "$UNIT_ROOT" == "/etc/systemd/system" ]] \
+    || fail "activation requires ORCHESTRA_SYSTEMD_UNIT_ROOT=/etc/systemd/system"
   command -v systemctl >/dev/null || fail "systemctl is required"
   [[ -x /usr/bin/python3 ]] || fail "/usr/bin/python3 is required by the systemd units"
   validate_release_tree "$release_root"
@@ -325,9 +401,10 @@ preflight_activation() {
     mode="$(sudo stat -c '%a' "$CONFIG_ROOT/$file")"
     [[ "$mode" == "600" ]] || fail "$CONFIG_ROOT/$file must have mode 0600"
   done
-  if [[ -f "$release_root/deploy/pixelbox/systemd/orchestra-mcp-http.service" ]]; then
-    [[ -f "$CONFIG_ROOT/mcp-http.env" ]] || fail "required gateway configuration is missing: $CONFIG_ROOT/mcp-http.env"
-    [[ "$(sudo stat -c '%a' "$CONFIG_ROOT/mcp-http.env")" == "600" ]] || fail "$CONFIG_ROOT/mcp-http.env must have mode 0600"
+  if release_has_gateway_unit "$release_root"; then
+    [[ "$MCP_HTTP_USER" == "orchestra-mcp-http" && "$MCP_HTTP_GROUP" == "orchestra-mcp" ]] \
+      || fail "the gateway unit requires the reviewed orchestra-mcp-http/orchestra-mcp identity"
+    prepare_mcp_identity
   fi
 
   # Keep an existing credential-isolated broker deployment intact across
@@ -352,6 +429,11 @@ preflight_activation() {
         || fail "$BROKER_USER cannot read $CONFIG_ROOT/$file"
     done
   fi
+  if release_has_gateway_unit "$release_root"; then
+    ensure_group_traverse_acl "$CONFIG_ROOT" "$MCP_HTTP_GROUP" \
+      || fail "could not grant the HTTP gateway traverse access to $CONFIG_ROOT"
+    gateway_environment_is_ready
+  fi
 }
 
 activate_release() {
@@ -364,7 +446,7 @@ activate_release() {
   fi
 
   install_units "$release_root"
-  if [[ -f "$release_root/deploy/pixelbox/systemd/orchestra-mcp-http.service" ]]; then prepare_mcp_identity; fi
+  if release_has_gateway_unit "$release_root"; then prepare_mcp_identity; fi
   sudo systemctl daemon-reload
   atomic_symlink "releases/$RELEASE_SHA" "$CURRENT_LINK"
 
@@ -374,7 +456,8 @@ activate_release() {
       && sudo systemctl enable orchestra-omcp.service \
       && sudo systemctl enable --now orchestra-health.timer \
       && sudo systemctl restart orchestra-omcp.service \
-      && { [[ ! -f "$release_root/deploy/pixelbox/systemd/orchestra-mcp-http.service" ]] || { sudo systemctl enable orchestra-mcp-http.service && sudo systemctl restart orchestra-mcp-http.service && sudo systemctl is-active --quiet orchestra-mcp-http.service; }; } \
+      && { ! release_has_gateway_unit "$release_root" || wait_for_omcp_socket; } \
+      && { ! release_has_gateway_unit "$release_root" || { sudo systemctl enable orchestra-mcp-http.service && sudo systemctl restart orchestra-mcp-http.service && sudo systemctl is-active --quiet orchestra-mcp-http.service; }; } \
       && sudo systemctl is-active --quiet orchestra-omcp.service \
       && sudo systemctl is-active --quiet orchestra-health.timer; then
     if [[ -n "$old_sha" && "$old_sha" != "$RELEASE_SHA" ]]; then
@@ -392,35 +475,93 @@ activate_release() {
     sudo systemctl daemon-reload
     sudo systemctl restart orchestra-omcp.service || true
     sudo systemctl start orchestra-health.timer || true
+    if release_has_gateway_unit "$old_root"; then
+      sudo systemctl restart orchestra-mcp-http.service || true
+    fi
     fail "activation failed; current was restored to $old_sha"
   fi
   sudo unlink "$CURRENT_LINK" 2>/dev/null || true
-  sudo systemctl stop orchestra-omcp.service orchestra-health.timer || true
-  sudo systemctl disable orchestra-omcp.service orchestra-health.timer || true
+  sudo systemctl stop orchestra-mcp-http.service orchestra-omcp.service orchestra-health.timer || true
+  sudo systemctl disable orchestra-mcp-http.service orchestra-omcp.service orchestra-health.timer || true
   fail "first activation failed; no prior managed release was available"
 }
 
-case "$MODE" in
-  stage)
-    stage_release
-    stage_configuration
-    if [[ "$STAGED_ONLY" == "1" ]]; then
-      echo "Release staging is complete; owner-only configuration is not yet activation-ready."
-    fi
-    ;;
-  activate|rollback)
-    [[ "${ORCHESTRA_CUTOVER_APPROVED:-0}" == "1" ]] \
-      || fail "$MODE is not approved; set ORCHESTRA_CUTOVER_APPROVED=1 only after approval"
-    preflight_activation
-    activate_release
-    ;;
-  apply)
-    [[ "${ORCHESTRA_CUTOVER_APPROVED:-0}" == "1" ]] \
-      || fail "cutover is not approved; set ORCHESTRA_CUTOVER_APPROVED=1 only after approval"
-    stage_release
-    stage_configuration
-    configuration_is_ready_for_activation || exit $?
-    preflight_activation
-    activate_release
-    ;;
-esac
+main() {
+  SOURCE_HEAD="unavailable"
+  case "$MODE" in
+    plan|stage|apply)
+      command -v git >/dev/null || fail "git is required"
+      SOURCE_HEAD="$(git -C "$SOURCE_ROOT" rev-parse --verify HEAD^{commit} 2>/dev/null)" \
+        || fail "source is not a Git checkout"
+      if [[ -z "$RELEASE_SHA" ]]; then
+        [[ "$MODE" == "plan" ]] || fail "--sha must name the reviewed 40-character commit"
+        RELEASE_SHA="$SOURCE_HEAD"
+      fi
+      ;;
+    activate|rollback)
+      [[ -n "$RELEASE_SHA" ]] || fail "--sha must name the staged 40-character commit"
+      ;;
+  esac
+  [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] \
+    || fail "release SHA must be exactly 40 lowercase hexadecimal characters"
+  if [[ "$MODE" == "plan" || "$MODE" == "stage" || "$MODE" == "apply" ]]; then
+    validate_source_commit
+  fi
+
+  echo "Orchestra PixelBox release plan"
+  note "source repository: $SOURCE_ROOT"
+  note "source HEAD:       $SOURCE_HEAD"
+  note "exact release:     $RELEASE_SHA"
+  note "release directory: $RELEASES_ROOT/$RELEASE_SHA"
+  note "active symlink:    $CURRENT_LINK"
+  note "config root:       $CONFIG_ROOT"
+  note "state root:        $STATE_ROOT"
+  note "service user:      $SERVICE_USER"
+  note "mode:              $MODE"
+  note "untouched:         tunnel, Nextcloud, Docker, Tailscale, Mac coordinator"
+  echo
+
+  if [[ "$MODE" == "plan" ]]; then
+    echo "Dry run complete. No files or services were changed; no symlinks were changed."
+    echo "Stage this exact commit with:"
+    echo "  ORCHESTRA_DEPLOY_APPROVED=1 $0 --stage --sha $RELEASE_SHA"
+    return 0
+  fi
+
+  [[ "${ORCHESTRA_DEPLOY_APPROVED:-0}" == "1" ]] \
+    || fail "deployment staging is not approved; set ORCHESTRA_DEPLOY_APPROVED=1 only after approval"
+  [[ "$(id -un)" == "$SERVICE_USER" ]] || fail "run as $SERVICE_USER"
+  command -v sudo >/dev/null || fail "sudo is required"
+  command -v tar >/dev/null || fail "tar is required"
+  command -v python3 >/dev/null || fail "python3 is required"
+  trap cleanup EXIT
+
+  case "$MODE" in
+    stage)
+      stage_release
+      stage_configuration
+      if [[ "$STAGED_ONLY" == "1" ]]; then
+        echo "Release staging is complete; owner-only configuration is not yet activation-ready."
+      fi
+      ;;
+    activate|rollback)
+      [[ "${ORCHESTRA_CUTOVER_APPROVED:-0}" == "1" ]] \
+        || fail "$MODE is not approved; set ORCHESTRA_CUTOVER_APPROVED=1 only after approval"
+      preflight_activation
+      activate_release
+      ;;
+    apply)
+      [[ "${ORCHESTRA_CUTOVER_APPROVED:-0}" == "1" ]] \
+        || fail "cutover is not approved; set ORCHESTRA_CUTOVER_APPROVED=1 only after approval"
+      stage_release
+      stage_configuration
+      configuration_is_ready_for_activation || exit $?
+      preflight_activation
+      activate_release
+      ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

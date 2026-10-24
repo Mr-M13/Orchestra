@@ -228,11 +228,11 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
     def test_proxy_rejects_socket_metadata_that_is_not_owner_only(self):
         endpoint = Path("/does/not/matter")
         fake = type("Metadata", (), {
-            "st_mode": stat.S_IFSOCK | 0o660,
+            "st_mode": stat.S_IFSOCK | 0o666,
             "st_uid": os.getuid(),
         })()
         with patch.object(Path, "lstat", return_value=fake):
-            with self.assertRaisesRegex(PermissionError, "owner-only"):
+            with self.assertRaisesRegex(PermissionError, "owner/group-only"):
                 _validate_socket_path(endpoint)
 
     def test_runbook_preserves_staging_evidence_without_claiming_live_cutover(self):

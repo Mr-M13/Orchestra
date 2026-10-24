@@ -32,6 +32,48 @@ _acl_add_execute() {
   esac
 }
 
+ensure_group_traverse_acl() {
+  local config_root="$1"
+  local allowed_group="$2"
+  local sudo_spec="${ORCHESTRA_ACL_SUDO-sudo}"
+  local -a privilege=()
+  local entry mask current_mask new_mask other
+
+  [[ -d "$config_root" && ! -L "$config_root" ]] || return 0
+  [[ -n "$allowed_group" ]] || return 1
+  getent group "$allowed_group" >/dev/null 2>&1 \
+    || { echo "ERROR: group does not exist: $allowed_group" >&2; return 1; }
+  command -v setfacl >/dev/null 2>&1 \
+    || { echo "ERROR: setfacl is required to grant group traverse access" >&2; return 1; }
+  command -v getfacl >/dev/null 2>&1 \
+    || { echo "ERROR: getfacl is required to verify group traverse access" >&2; return 1; }
+
+  other="$(_acl_permissions "$config_root" "other:")"
+  [[ "$other" == "---" ]] \
+    || { echo "ERROR: $config_root is not other-private" >&2; return 1; }
+
+  if [[ -n "$sudo_spec" ]]; then
+    read -r -a privilege <<< "$sudo_spec"
+  fi
+
+  "${privilege[@]}" setfacl -m "g:$allowed_group:--x" "$config_root" || return 1
+  entry="$(_acl_permissions "$config_root" "group:$allowed_group")"
+  mask="$(_acl_permissions "$config_root" "mask:")"
+  if [[ "$entry" != "--x" || "$mask" != *x* ]]; then
+    current_mask="$mask"
+    [[ -n "$current_mask" ]] || current_mask="---"
+    new_mask="$(_acl_add_execute "$current_mask")"
+    "${privilege[@]}" setfacl -m "m::$new_mask" "$config_root" || return 1
+  fi
+
+  entry="$(_acl_permissions "$config_root" "group:$allowed_group")"
+  mask="$(_acl_permissions "$config_root" "mask:")"
+  other="$(_acl_permissions "$config_root" "other:")"
+  [[ "$entry" == "--x" && "$mask" == *x* && "$other" == "---" ]] \
+    || { echo "ERROR: group traverse ACL is not effective on $config_root" >&2; return 1; }
+  return 0
+}
+
 ensure_broker_traverse_acl() {
   local config_root="$1"
   local broker_user="${ORCHESTRA_BROKER_USER:-orchestra-github}"

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import grp
 import json
 import os
 import signal
 import socket
 import sys
 import threading
-import grp
 from pathlib import Path
 from typing import Any, Callable
 
@@ -248,24 +248,31 @@ class MCPServer:
             self._stop_auxiliary(local_approval, ticker)
 
     def run_socket(self, socket_path: Path, socket_group: str | None = None) -> int:
-        """Serve JSON-RPC over an owner-only Unix socket.
+        """Serve JSON-RPC over an owner/group-only Unix socket.
 
         The tunnel client owns a small stdio proxy, while this process remains
         the persistent coordinator.  This keeps the scheduler, approval socket
-        and task state alive across individual tunnel connections.
+        and task state alive across individual tunnel connections.  When a
+        socket group is configured, the runtime directory and socket grant only
+        that group access so the loopback HTTP gateway can connect.
         """
         socket_path = socket_path.expanduser().resolve()
         socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(socket_path.parent, 0o700)
+        if socket_group:
+            group_id = grp.getgrnam(socket_group).gr_gid
+            os.chown(socket_path.parent, -1, group_id)
+            os.chmod(socket_path.parent, 0o710)
+        else:
+            os.chmod(socket_path.parent, 0o700)
         socket_path.unlink(missing_ok=True)
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(str(socket_path))
+        listener.listen(8)
         if socket_group:
-            os.chown(socket_path, -1, grp.getgrnam(socket_group).gr_gid)
+            os.chown(socket_path, -1, group_id)
             os.chmod(socket_path, 0o660)
         else:
             os.chmod(socket_path, 0o600)
-        listener.listen(8)
         listener.settimeout(0.5)
         local_approval, ticker = self._start_auxiliary()
         connections: list[threading.Thread] = []
