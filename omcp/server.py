@@ -16,6 +16,7 @@ from omcp.local_control import LocalApprovalServer
 
 
 PROTOCOL_VERSION = "2025-06-18"
+STATELESS_PROTOCOL_VERSION = "2026-07-28"
 SUPPORTED_PROTOCOL_VERSIONS = frozenset({PROTOCOL_VERSION})
 MAX_MCP_LINE_BYTES = 4 * 1024 * 1024
 
@@ -157,6 +158,13 @@ class MCPServer:
         method = request["method"]
         if "id" not in request:
             return None
+        if method == "server/discover":
+            return self._result(request_id, {
+                "supportedVersions": [PROTOCOL_VERSION, STATELESS_PROTOCOL_VERSION],
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "orchestra-omcp", "version": __version__},
+                "instructions": "Submit bounded implementation tasks; Orchestra schedules within owner-configured parallel capacity and repository conflict rules.",
+            })
         if method == "ping":
             return self._result(request_id, {})
         if method == "tools/list":
@@ -323,7 +331,7 @@ class MCPServer:
 
 
 class MCPSession:
-    """One MCP handshake; discarded with its stdio/Unix-socket peer."""
+    """One legacy MCP handshake; discarded with its stdio/Unix-socket peer."""
     CONNECTED = "connected"
     NEGOTIATED = "negotiated"
     READY = "ready"
@@ -332,10 +340,36 @@ class MCPSession:
         self.server = server
         self.state = self.CONNECTED
 
+    @staticmethod
+    def _is_self_contained(request: dict[str, Any]) -> bool:
+        """Recognize only the current tunnel's complete stateless request form.
+
+        The tunnel uses this metadata to bypass its own legacy stdio readiness
+        guard.  Requiring both fields here prevents an arbitrary ``_meta``
+        payload from weakening Orchestra's legacy session enforcement.
+        """
+        params = request.get("params")
+        if not isinstance(params, dict):
+            return False
+        meta = params.get("_meta")
+        if not isinstance(meta, dict):
+            return False
+        return (
+            meta.get("io.modelcontextprotocol/protocolVersion")
+            == STATELESS_PROTOCOL_VERSION
+            and isinstance(
+                meta.get("io.modelcontextprotocol/clientCapabilities"), dict,
+            )
+        )
+
     def handle(self, request: Any) -> dict[str, Any] | None:
         if not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or not isinstance(request.get("method"), str):
             return self.server._error(request.get("id") if isinstance(request, dict) else None, -32600, "Invalid Request")
         request_id, method = request.get("id"), request["method"]
+        if self._is_self_contained(request):
+            # Stateless requests must never satisfy, reset, or inherit a
+            # connection's legacy initialize/initialized lifecycle.
+            return self.server._handle_ready(request)
         if method == "initialize":
             if self.state != self.CONNECTED:
                 return self.server._error(request_id, -32002, "MCP session is already initialized")

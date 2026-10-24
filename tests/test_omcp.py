@@ -2871,13 +2871,78 @@ class ServerTests(unittest.TestCase):
         unsupported = session.handle({"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {"protocolVersion": "2026-07-28"}})
         self.assertEqual(unsupported["error"]["code"], -32602)
 
-    def test_reconnect_requires_new_handshake(self):
+    def test_legacy_reconnect_requires_new_handshake(self):
         first = self.server.new_session()
         first.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
         first.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
         self.assertIn("result", first.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}))
         second = self.server.new_session()
         self.assertEqual(second.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}})["error"]["code"], -32002)
+
+    @staticmethod
+    def stateless_params(**params):
+        return {
+            **params,
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        }
+
+    def test_stateless_discovery_and_tool_call_need_no_handshake(self):
+        session = self.server.new_session()
+        discovered = session.handle({
+            "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+            "params": self.stateless_params(),
+        })
+        self.assertIn("2026-07-28", discovered["result"]["supportedVersions"])
+        listed = session.handle({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list",
+            "params": self.stateless_params(),
+        })
+        self.assertEqual({tool["name"] for tool in TOOLS},
+                         {tool["name"] for tool in listed["result"]["tools"]})
+        response = session.handle({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": self.stateless_params(name="bridge_status", arguments={}),
+        })
+        self.assertEqual(response["result"]["structuredContent"], {"status": "ok"})
+        self.assertEqual(session.state, session.CONNECTED)
+
+    def test_stateless_reconnect_needs_no_shared_session(self):
+        for request_id in (1, 2):
+            session = self.server.new_session()
+            response = session.handle({
+                "jsonrpc": "2.0", "id": request_id, "method": "tools/list",
+                "params": self.stateless_params(),
+            })
+            self.assertIn("result", response)
+            self.assertEqual(session.state, session.CONNECTED)
+
+    def test_stateless_path_rejects_incomplete_or_wrong_metadata(self):
+        cases = (
+            {},
+            {"_meta": {}},
+            {"_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            }},
+            {"_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": [],
+            }},
+            {"_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2027-01-01",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            }},
+        )
+        for request_id, params in enumerate(cases, start=1):
+            with self.subTest(params=params):
+                session = self.server.new_session()
+                response = session.handle({
+                    "jsonrpc": "2.0", "id": request_id, "method": "tools/list",
+                    "params": params,
+                })
+                self.assertEqual(response["error"]["code"], -32002)
 
 
 class LocalApprovalChannelTests(unittest.TestCase):
