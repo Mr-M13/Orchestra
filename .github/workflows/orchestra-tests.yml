@@ -40,10 +40,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends acl
 
       - name: Compile
-        run: python3 -m compileall -q omcp mac_bridge tests scripts
+        run: python3 -m compileall -q omcp mac_bridge dashboard tests scripts
 
       - name: Run test suite
         run: python3 -m unittest discover -s tests -v
+
+      - name: Run dashboard polling tests
+        run: node --test tests/test_dashboard_polling.js
 
       - name: Validate deployment shell scripts
         run: |

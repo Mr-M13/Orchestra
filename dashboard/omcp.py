@@ -41,8 +41,8 @@ class OMCPClient:
     """Call only the dashboard's fixed, audited OMCP tool allowlist."""
 
     _TOOLS = {
-        "bridge_status", "worker_availability", "list_tasks", "task_status",
-        "task_result", "list_approvals", "submit_task", "cancel_task",
+        "bridge_status", "worker_availability", "list_tasks", "task_snapshot",
+        "task_status", "task_result", "list_approvals", "submit_task", "cancel_task",
     }
 
     def __init__(self, socket_path: str, timeout: float = 3.0) -> None:
