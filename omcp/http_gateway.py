@@ -1,22 +1,29 @@
 """Loopback-only authenticated HTTP façade for the private OMCP socket."""
 from __future__ import annotations
-import argparse, hmac, json, os, socket, threading, uuid
+import argparse, hmac, json, os, socket, threading, uuid, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from omcp.mcp_proxy import _validate_socket_path
 
 MAX = 4 * 1024 * 1024
+SESSION_TTL_SECONDS = 900
 
 class Gateway:
     def __init__(self, path: Path, token: str):
         if not token: raise ValueError("ORCHESTRA_MCP_HTTP_TOKEN is required")
         self.path, self.token, self.sessions, self.lock = path, token, {}, threading.Lock()
+    def _expire(self):
+        now=time.monotonic()
+        for key,state in list(self.sessions.items()):
+            if now-state['last'] >= SESSION_TTL_SECONDS:
+                state['socket'].close(); del self.sessions[key]
     def allowed(self, header: str | None) -> bool:
         return bool(header and header.startswith("Bearer ") and hmac.compare_digest(header[7:], self.token))
     def rpc(self, session: str | None, payload: bytes) -> tuple[str, bytes]:
         request = json.loads(payload); method = request.get("method")
         if not isinstance(method, str): raise ValueError("invalid MCP method")
         with self.lock:
+            self._expire()
             if method == "initialize":
                 if session: raise PermissionError("MCP session already exists")
                 version = request.get("params", {}).get("protocolVersion") if isinstance(request.get("params"), dict) else None
@@ -25,11 +32,13 @@ class Gateway:
                 _validate_socket_path(self.path)
                 session = uuid.uuid4().hex
                 conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); conn.settimeout(10); conn.connect(str(self.path))
-                self.sessions[session] = {"socket": conn, "ready": False}
+                self.sessions[session] = {"socket": conn, "ready": False, "last": time.monotonic()}
             if not session or session not in self.sessions: raise PermissionError("MCP session is not initialized")
             state = self.sessions[session]
             if method == "notifications/initialized":
-                state["socket"].sendall(payload + b"\n"); state["ready"] = True; return session, b"{}"
+                try: state["socket"].sendall(payload + b"\n")
+                except OSError: state["socket"].close(); del self.sessions[session]; raise
+                state["ready"] = True; state['last']=time.monotonic(); return session, b"{}"
             if not state["ready"] and method != "initialize": raise PermissionError("MCP session is not initialized")
             try:
                 conn = state["socket"]; conn.sendall(payload + b"\n")
@@ -38,12 +47,13 @@ class Gateway:
                     block = conn.recv(65536)
                     if not block: raise OSError("backend closed")
                     response += block
+                    if len(response) > MAX: raise OSError("backend response too large")
                 if method == "initialize":
                     negotiated = json.loads(response).get("result", {}).get("protocolVersion")
                     if negotiated != version:
                         conn.close(); del self.sessions[session]
                         raise ValueError("backend negotiated unsupported MCP protocol")
-                return session, response.rstrip()
+                state['last']=time.monotonic(); return session, response.rstrip()
             except OSError:
                 state["socket"].close(); del self.sessions[session]; raise
     def close(self, session: str | None) -> None:
@@ -62,7 +72,7 @@ def make_handler(gateway: Gateway):
             if self.path == "/healthz": return self.send(200, b'{"status":"ok"}')
             if self.path == "/readyz":
                 try:
-                    s=socket.socket(socket.AF_UNIX); s.settimeout(1); s.connect(str(gateway.path)); s.close(); return self.send(200,b'{"ready":true}')
+                    _validate_socket_path(gateway.path); s=socket.socket(socket.AF_UNIX); s.settimeout(1); s.connect(str(gateway.path)); s.close(); return self.send(200,b'{"ready":true}')
                 except OSError: return self.send(503,b'{"ready":false}')
             self.send(404,b'{}')
         def do_POST(self):
