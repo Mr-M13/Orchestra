@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "adapters": [
+    {
+      "adapter_id": "disposable-coding-worker",
+      "agent_id": "disposable-coding-agent",
+      "model_provider": "fake-provider",
+      "model_id": "fake-model",
+      "coding_harness": "disposable-harness",
+      "runtime": "local_process",
+      "operational": true,
+      "scope": "tests_only"
+    },
+    {
+      "adapter_id": "coding-worker",
+      "agent_id": "codex-coding-agent",
+      "model_provider": "openai",
+      "model_id": "example-unimplemented",
+      "coding_harness": "codex-cli",
+      "runtime": "local_process",
+      "operational": false
+    },
+    {
+      "adapter_id": "coding-worker",
+      "agent_id": "deepseek-coding-agent",
+      "model_provider": "deepseek",
+      "model_id": "example-unimplemented",
+      "coding_harness": "opencode",
+      "runtime": "local_process",
+      "operational": false
+    },
+    {
+      "adapter_id": "coding-worker",
+      "agent_id": "claude-coding-agent",
+      "model_provider": "anthropic",
+      "model_id": "example-unimplemented",
+      "coding_harness": "claude-code",
+      "runtime": "local_process",
+      "operational": false
+    },
+    {
+      "adapter_id": "coding-worker",
+      "agent_id": "gemini-coding-agent",
+      "model_provider": "google",
+      "model_id": "example-unimplemented",
+      "coding_harness": "gemini-cli",
+      "runtime": "local_process",
+      "operational": false
+    }
+  ]
+}

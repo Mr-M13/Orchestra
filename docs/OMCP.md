@@ -46,7 +46,7 @@ The remote MCP surface cannot decide explicit approvals. A local operator must r
 - use a fresh `omcp/task-<id>` Git branch and worktree from the configured base ref;
 - retain prompts, logs, results and worktrees in the private state directory for inspection.
 
-DeepSeek is a direct, response-only HTTPS adapter, not an OpenCode alias. It has no configured executable and never launches a model-directed subprocess or shell. Each task still gets the normal fresh worktree, but the adapter cannot edit it. A macOS Seatbelt profile constrains the runner to its private task files, the worktree, the owner-only credential file, and TCP to `api.deepseek.com:443`; its process environment excludes tunnel and provider variables. The adapter sends only to the fixed `/v1/chat/completions` endpoint, has the configured 60–7200 second deadline and result-byte cap, bounds the HTTP body before parsing, retains only sanitized assistant text, and emits a neutral failure result without provider diagnostics. DeepSeek always requires a fresh local approval, even if the general `task_approval_mode` is disabled.
+DeepSeek is a direct, response-only HTTPS adapter, not an OpenCode alias. It has no configured executable and never launches a model-directed subprocess or shell. Each task still gets the normal fresh worktree, but the adapter cannot edit it. A macOS Seatbelt profile constrains the runner to its private task files, the worktree, the owner-only credential file, and TCP to `api.deepseek.com:443`; its process environment excludes tunnel and provider variables. The adapter sends only to the fixed `/v1/chat/completions` endpoint, has the configured 60–7200 second deadline and result-byte cap, bounds the HTTP body before parsing, retains only sanitized assistant text, and emits a neutral failure result without provider diagnostics. DeepSeek always requires a fresh local approval, even if the general `task_approval_mode` is disabled. The current adapter is not eligible for standing authorisation. Any isolated coding adapter is separate future work described in [DeepSeek isolated coding adapter](DEEPSEEK-ISOLATED-CODING-ADAPTER.md).
 
 OpenCode is independent. Its only accepted executable is the reviewed absolute OpenCode Desktop CLI, `/Users/hamed/Library/Application Support/ai.opencode.desktop/cli/2.0.32-arm64/opencode-cli`; wrappers, aliases, and configured flags are rejected. The owner selects a provider/model pair from the owner-only `opencode_model_allowlist`; the runner accepts only the supported `openai` or `deepseek` provider endpoints. It starts a password-protected private V2 server with `opencode-cli serve --hostname 127.0.0.1 --port <runner-selected-port>`, then invokes exactly `opencode-cli run --server http://127.0.0.1:<same-port> --format json --model <selected-model> --file <private-prompt> ...`, never `--auto`. Both processes use a private home/config and a generated V2 deny-by-default policy. Shell, external-directory, web, skills and subagents are denied.
 
@@ -60,6 +60,8 @@ The state directory and its files are owner-only. State updates are atomic. `aud
 
 V1 configuration remains valid and describes one implicit `default` profile. A multi-repository deployment adds `repository_profiles` and `default_profile`. Every profile binds a stable ID to one GitHub repository, one existing local checkout, and one `origin/<branch>` base ref. OMCP validates the selected ID before persisting a task, records the resolved profile, repository, and ref in task status and local approval review, checks the checkout's HTTPS GitHub origin at worktree creation, and creates the worktree under a profile-specific private state path.
 
+Each profile may independently set `local_worker_git_mode` (`fetch` or `owner_synced`) and, for `owner_synced`, `local_worker_source_sha`. The top-level values remain backward-compatible defaults for profiles that omit these fields. A fetch profile updates its own configured `origin/<branch>`; an owner-synced profile verifies its own pinned SHA without fetching. Preparing one profile never changes another profile's source strategy or refs.
+
 ### Parallel scheduler and reservations
 
 `max_parallel_tasks` is an owner-only operating limit from 1 through 64. Omitting it preserves the previous single-task behavior. The initial voluntary operating policy is `2`; that value is configuration, not a code ceiling, so a reviewed installation can later select 4, 8 or more lanes without changing the scheduler. Each configured worker still runs at most one task at a time.
@@ -72,9 +74,35 @@ Queue order is FIFO within each repository and round-robin across repositories u
 
 Standing authorization is an owner-configured execution grant, not a caller-supplied approval. A grant has a stable ID and is bound to the fixed principal process, one consequence class, named repository profiles, and named workers. The initial policy permits grants only for `routine_development`. Configuration loading rejects attempts to grant standing authority for production deployment, destructive operations, security changes, or unclassified work.
 
-The caller's consequence label is not the security boundary. A matching grant selects a server-owned `routine_development_v1` capability profile. That profile denies reads outside the worktree except for Codex's minimal runtime paths, denies command network access, keeps Git metadata read-only, ignores user configuration and repository rules, and permits writes only below the grant's explicit `writable_paths`. Arbitrary instructions therefore cannot acquire deployment, push, merge, credential, security-configuration, or machine-wide destructive capabilities merely by claiming to be routine. OMCP does not use keyword classification as an authority check.
+The caller's consequence label is not the security boundary. A matching grant selects a server-owned `routine_development_v1` capability profile. That profile denies reads outside the worktree except for Codex's minimal runtime paths and the read-only owner checkout needed to resolve linked-worktree Git metadata, explicitly denies `/etc/orchestra`, denies command network access, keeps Git metadata read-only, ignores user configuration and repository rules, and permits writes only below the grant's explicit `writable_paths`. Arbitrary instructions therefore cannot acquire deployment, push, merge, credential, security-configuration, or machine-wide destructive capabilities merely by claiming to be routine. OMCP does not use keyword classification as an authority check.
+
+On PixelBox, local Codex workers must use the `systemd-user` launcher. It runs each worker in a transient user service that drops only `RestrictSUIDSGID` (whose seccomp filter blocks `openat2` and therefore Bubblewrap) while retaining the coordinator's other confinement and limiting writable paths to the task, worktree, exact Git metadata and Codex home. The coordinator keeps `RestrictSUIDSGID=yes`.
 
 `writable_paths` are owner-reviewed relative directory roots, not task-supplied paths. Absolute paths, parent traversal, `.git`, `.codex`, duplicate paths, and punctuation that could change the permission-profile structure are rejected at configuration load. A read-only routine grant uses an empty list. Keep security policy, deployment, infrastructure, credential, release, and production configuration outside every standing grant. If a repository cannot be divided into non-sensitive write roots, do not configure a standing grant for edits; use explicit approval instead. Git metadata remains read-only in routine mode, so the worker produces commit-ready changes but cannot create, merge, update, or push refs. Integration remains an independently reviewed action.
+
+Before a routine worker starts, the coordinator materialises each configured writable path inside the isolated task worktree. Existing directories are accepted; missing directories are created with owner-only permissions so a new permitted development area can be used. The materialiser rejects absolute paths, `..`, `.git`, `.codex`, non-directory components and every symlink component. It never creates or opens a host path outside the task worktree, and it never makes the source checkout writable.
+
+### Structured completion and executed security assertions
+
+Natural-language worker output is never interpreted as task success. Every local Codex task must write a structured completion file under the task worktree's private `.orchestra-tmp` directory:
+
+```json
+{"status":"success"}
+```
+
+or:
+
+```json
+{"status":"failure","reason":"required operation was denied"}
+```
+
+The coordinator marks the task `succeeded` only when the process exits zero, the mandatory result exists and is non-empty, and the structured status is exactly `success`. A zero process exit with a missing, invalid or failure contract is recorded as `failed` (`TaskContractFailed`, `TaskContractInvalid` or `MissingWorkerResult`). The PR #50 Bubblewrap-startup and missing-result protections remain in force.
+
+Standing routine tasks are also verified by a coordinator-controlled security probe. The probe implementation and report live under coordinator-owned state, outside every path writable by the Codex worker. The coordinator launches a separate transient systemd user service and runs `codex sandbox` with the same authoritative routine permission profile used by the real worker. Both paths consume the same `RoutineConfinementPolicy` definition; the probe does not construct an independent stricter sandbox. Codex does not execute, edit or replace the probe, and Codex cannot write the report location.
+
+The probe actually attempts to read `/etc/orchestra/omcp.json` and the Orchestra secret file, write outside the worktree, connect to an external destination, and modify Git metadata. It emits structured evidence with `attempted: true` and `allowed: false` for every required assertion; the coordinator writes the trusted report. A missing report, an unattempted assertion or any `allowed: true` result fails the task with `SecurityAssertionFailed`. The probe does not treat a natural-language claim of denial as evidence, and worker-created files under `.orchestra-tmp` cannot substitute for trusted evidence.
+
+A real Delnavazan canary should use an existing development area such as `platform/tests/`, not a root directory that is absent from the repository.
 
 In required mode, when no exact standing grant matches, the task remains `approval_required`. In disabled mode, a non-matching task is accepted with authorization mode `automatic`, policy `task_approvals_disabled`, and approval status `not_required`. Existing pending approval requests are converted to the same automatic authorization on the next policy tick. Task records and audit events distinguish `standing`, `automatic`, and `explicit` authorization and bind the consequence class into the idempotency digest.
 
@@ -212,7 +240,7 @@ Use Python 3.11 or newer and a current Codex CLI. Create a state directory outsi
   "max_worker_seconds": 1800,
   "max_parallel_tasks": 2,
   "startup_lease_seconds": 30,
-  "task_approval_mode": "required",
+  "task_approval_mode": "disabled",
   "standing_authorizations": [
     {
       "id": "routine-development-v1",

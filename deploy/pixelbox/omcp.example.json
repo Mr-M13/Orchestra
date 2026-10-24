@@ -21,34 +21,34 @@
     "orchestra": {
       "repository": "Mr-M13/Orchestra",
       "project_root": "/home/hamed/orchestra-migration/checkout",
-      "base_ref": "origin/main"
+      "base_ref": "origin/main",
+      "local_worker_git_mode": "owner_synced",
+      "local_worker_source_sha": "REPLACE_WITH_REVIEWED_40_CHARACTER_COMMIT_SHA"
     }
   },
   "default_profile": "orchestra",
   "workers": {
-    "ina": {
+    "ina-codex": {
       "command": ["codex"],
       "codex_home": "/home/hamed/.codex-ina"
     },
-    "codex": {
+    "hamed-codex": {
       "command": ["codex"],
-      "codex_home": "/home/hamed/.codex"
+      "codex_home": "/home/hamed/.codex-hamed"
     },
-    "actions-codex": {
-      "adapter": "github_actions",
-      "agent": "codex",
-      "model": "gpt-5-codex",
-      "github_service_uid": -1,
-      "github_dispatch_socket": "/run/orchestra-github-dispatch/dispatch.sock",
-      "poll_seconds": 10
-    },
-    "actions-deepseek": {
-      "adapter": "github_actions",
-      "agent": "deepseek",
+    "deepseek-primary": {
+      "adapter": "deepseek",
+      "provider": "deepseek",
       "model": "deepseek/deepseek-chat",
-      "github_service_uid": -1,
-      "github_dispatch_socket": "/run/orchestra-github-dispatch/dispatch.sock",
-      "poll_seconds": 10
+      "credential_file": "/etc/orchestra/secrets/deepseek-api-key",
+      "endpoint_addresses": []
+    },
+    "deepseek-secondary": {
+      "adapter": "deepseek",
+      "provider": "deepseek",
+      "model": "deepseek/deepseek-chat",
+      "credential_file": "/etc/orchestra/secrets/deepseek-api-key",
+      "endpoint_addresses": []
     }
   },
   "max_task_bytes": 65536,
@@ -59,6 +59,7 @@
   "startup_lease_seconds": 30,
   "heartbeat_seconds": 15,
   "sandbox_backend": "bubblewrap",
-  "task_approval_mode": "required",
+  "local_worker_launcher": "systemd-user",
+  "task_approval_mode": "disabled",
   "standing_authorizations": []
 }

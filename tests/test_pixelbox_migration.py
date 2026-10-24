@@ -18,6 +18,7 @@ from omcp.github_actions import (
     encode_instructions,
 )
 from omcp.github_runner import _apply_patch, run as run_github_worker
+from omcp.controller import deepseek_runner_command
 from omcp.health import collect_health
 from omcp.platform import (
     SandboxPolicy, SandboxUnavailable, sandbox_backend, sandbox_command,
@@ -120,6 +121,32 @@ class PlatformTests(unittest.TestCase):
                 sandbox_backend("seatbelt")
             report = describe_sandbox("seatbelt")
         self.assertFalse(report["available"])
+
+    def test_systemd_sandbox_is_a_linux_fallback(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("omcp.platform.host_platform", return_value="linux"), \
+                patch("omcp.platform.sandbox_executable", return_value="/usr/bin/systemd-run"):
+            workspace = Path(directory).resolve()
+            command = sandbox_command(SandboxPolicy(
+                read_paths=(workspace,), write_paths=(workspace,),
+                backend="systemd", workdir=workspace,
+            ), ["/usr/bin/true"])
+        self.assertEqual(command[0], "/usr/bin/systemd-run")
+        self.assertIn("--property=ProtectSystem=strict", command)
+        self.assertIn("--property=RestrictAddressFamilies=AF_UNIX", command)
+        self.assertIn("--property=BindReadOnlyPaths=" + str(workspace) + ":" + str(workspace), command)
+        self.assertIn("--property=BindPaths=" + str(workspace) + ":" + str(workspace), command)
+        self.assertEqual(command[-2:], ["--", "/usr/bin/true"])
+
+    def test_direct_deepseek_uses_the_configured_sandbox_backend(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("omcp.platform.host_platform", return_value="linux"), \
+                patch("omcp.platform.sandbox_executable", return_value="/usr/bin/systemd-run"):
+            root = Path(directory)
+            spec = root / "runner.json"; spec.write_text("{}")
+            credential = root / "credential"; credential.write_text("test")
+            with self.assertRaisesRegex(SandboxUnavailable, "IP allowlist"):
+                deepseek_runner_command(spec, root, root, credential, "systemd")
 
 
 class GitHubConfigTests(unittest.TestCase):
@@ -582,8 +609,11 @@ class DeploymentAssetTests(unittest.TestCase):
         example = json.loads((root / "deploy/pixelbox/omcp.example.json").read_text())
         self.assertEqual(example["sandbox_backend"], "bubblewrap")
         self.assertEqual(example["max_parallel_tasks"], 2)
-        self.assertIn("actions-codex", example["workers"])
-        self.assertIn("actions-deepseek", example["workers"])
+        self.assertEqual(set(example["workers"]), {
+            "ina-codex", "hamed-codex", "deepseek-primary", "deepseek-secondary",
+        })
+        self.assertEqual(example["task_approval_mode"], "disabled")
+        self.assertEqual(example["local_worker_launcher"], "systemd-user")
         self.assertNotEqual(
             Path(example["state_dir"]), Path(example["project_root"]),
         )
@@ -594,20 +624,10 @@ class DeploymentAssetTests(unittest.TestCase):
         self.assertIn("execstart=/usr/bin/python3 -m omcp.server", unit.lower())
         self.assertNotIn("docker", unit.lower())
         self.assertNotIn("systemctl", unit.lower())
-        broker = (
-            root / "deploy/pixelbox/systemd/orchestra-github-dispatch.service"
-        ).read_text()
-        self.assertIn("User=orchestra-github", broker)
-        self.assertIn("Group=orchestra-ipc", broker)
-        self.assertIn("github_dispatch_service", broker)
-        for worker_name in ("actions-codex", "actions-deepseek"):
-            worker = example["workers"][worker_name]
-            self.assertNotIn("credential_file", worker)
-            self.assertNotIn("github_repository", worker)
-            self.assertEqual(
-                worker["github_dispatch_socket"],
-                "/run/orchestra-github-dispatch/dispatch.sock",
-            )
+        self.assertTrue(all(
+            worker.get("adapter") != "github_actions"
+            for worker in example["workers"].values()
+        ))
         # Workflow implementation is Ina-owned and may be absent from a scoped
         # deployment-review worktree. Validate it when present without making
         # this suite create or alter it.

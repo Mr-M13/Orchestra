@@ -61,6 +61,14 @@ bwrap --version
 git --version
 ```
 
+The supplied configuration uses a systemd transient-service sandbox. It is the
+compatible fallback for a host where Bubblewrap cannot construct its private
+root filesystem (for example, `Can't open source /: Function not implemented`).
+It retains `ProtectSystem=strict`, private temporary storage,
+no-new-privileges, restricted address families, and explicit read/write bind
+paths. Do not replace it with unsandboxed execution. Bubblewrap remains
+available for hosts where a real worker preflight succeeds.
+
 Install the reviewed Codex CLI for the service user, or place it on the service
 `PATH`. Confirm:
 
@@ -125,6 +133,28 @@ before starting workers. The coordinator checks that the ref matches the pin
 and does not fetch. This pin is not evidence of freshness or upstream approval;
 the owner must independently verify the SHA and repeat the sync/pin update for
 new revisions. Never put GitHub credentials in the coordinator.
+
+Each repository profile may override the global `local_worker_git_mode` and
+`local_worker_source_sha`. This is the required shape for multiple unrelated
+repositories: one profile can stay owner-synced and pinned while another
+fetches its own `origin/main`. Profiles that omit these values inherit the
+global defaults, preserving older configurations. Preparing one profile never
+changes another profile's source strategy.
+
+Routine writable paths are materialised inside the isolated task worktree
+before the worker starts. A missing authorised directory is created safely;
+absolute paths, `..`, `.git`, `.codex`, non-directory components and symlink
+components are rejected. The coordinator does not make the source checkout
+writable or create paths outside the task worktree.
+
+Every local Codex task must emit a structured `.orchestra-tmp/completion.json`
+contract; natural-language output is not used to decide success. Standing
+routine tasks are also verified by a coordinator-controlled security probe.
+The probe and its report live under coordinator state, outside worker-writable
+paths; the coordinator runs it in a separate transient service through
+`codex sandbox` with the same authoritative routine permission profile as the
+worker. Weakening the shared policy weakens both paths. See
+[OMCP standing authorization](OMCP.md#standing-authorization).
 
 ## 4. GitHub Actions worker setup
 
@@ -229,15 +259,59 @@ credential, config, socket, service activation or cutover.
 Start from `deploy/pixelbox/omcp.example.json` and adjust paths and IDs. Minimum
 production settings:
 
-- `task_approval_mode: "required"` until the owner explicitly accepts a broader
-  policy;
+- `task_approval_mode: "disabled"` for automatic `routine_development` work;
+  protected consequence classes, direct DeepSeek work and host operations remain
+  explicitly approved;
 - `max_parallel_tasks: 2` initially;
 - `sandbox_backend: "bubblewrap"` on PixelBox;
+- `local_worker_launcher: "systemd-user"` on PixelBox so local Codex workers
+  run in a separate transient user service rather than inheriting the
+  coordinator's seccomp filter;
 - each `github_actions` worker points only at the reviewed broker socket and
   binds its dedicated `github_service_uid`; target/SHA/token policy stays in
   the broker's private config;
 - no standing authorization for GitHub Actions workers;
 - `repository_profiles` binds each allowlisted checkout and base ref.
+
+### Local Codex worker boundary
+
+On Linux, the `systemd-user` launcher starts each non-DeepSeek local worker in
+a transient `orchestra-worker-<task-id>.service` under the service user's
+systemd manager. The coordinator unit keeps `RestrictSUIDSGID=yes`; the worker
+service deliberately sets `RestrictSUIDSGID=no`.
+
+This is not a cosmetic removal. systemd implements `RestrictSUIDSGID=yes` with
+a seccomp filter that makes `openat2()` return `ENOSYS`, because seccomp cannot
+inspect openat2's flags. Bubblewrap 0.12 uses openat2 for safe path resolution,
+so Codex fails before its first model request with:
+
+```text
+bwrap: Can't mkdir parents for /: Function not implemented
+bwrap: Can't open source /: Function not implemented
+```
+
+The worker service retains `ProtectSystem=strict`, `ProtectHome=read-only`,
+`PrivateTmp=yes`, `NoNewPrivileges=yes`, restricted address families,
+non-root execution, control-group cleanup, and writable paths limited to the
+task directory, its exact worktree and Git metadata, and the configured Codex
+home. Codex's own sandbox still enforces the per-task filesystem and network
+policy. It may read the owner checkout so Git can resolve the external metadata
+of a linked worktree, but routine mode never permits writes there. The routine
+profile also explicitly denies `/etc/orchestra`, because Codex's minimal system
+read set otherwise includes `/etc`.
+
+The launcher fails closed unless the service user has a live systemd user
+manager at `/run/user/<uid>/systemd/private`. On a host where the service user
+does not maintain a login session, enable lingering once with owner approval:
+
+```sh
+sudo loginctl enable-linger hamed
+test -S /run/user/1000/systemd/private
+```
+
+Enabling lingering starts a user manager but does not start this worker
+service; workers are transient and exist only for the lifetime of a task.
+Do not add `RestrictSUIDSGID=no` to `orchestra-omcp.service` as a shortcut.
 
 Install owner-only files:
 
@@ -259,8 +333,22 @@ sudo usermod -a -G orchestra-ipc hamed
 sudo usermod -a -G orchestra-ipc orchestra-github
 sudo install -d -m 0700 -o orchestra-github -g orchestra-github /etc/orchestra/github-dispatch
 sudo install -m 0600 -o orchestra-github -g orchestra-github github-dispatch.example.json /etc/orchestra/github-dispatch/config.json
+# Traverse-only parent access.  Do not grant read/list on /etc/orchestra.
+sudo setfacl -m u:orchestra-github:--x,m::--x /etc/orchestra
 # Enter the token locally without argv, shell history, chat, issue, PR, or log exposure.
 sudo systemctl enable --now orchestra-github-dispatch.service
+```
+
+`install -d -m 0700` rewrites the ACL mask on an existing `/etc/orchestra`,
+which disables the broker's named traverse entry. The installer re-applies this
+narrow ACL after every staging, activation preflight, and rollback preflight.
+Verify the effective entry, not just the mode bits:
+
+```sh
+getfacl -cp /etc/orchestra
+# user:orchestra-github:--x
+# mask::--x
+# other::---
 ```
 
 Edit the files locally. Do not paste secret values into a chat, issue, pull
@@ -530,8 +618,9 @@ of the following evidence is recorded:
 5. The dedicated tunnel profile passes `tunnel-client doctor` and `/readyz`.
 6. ChatGPT discovers all nine OMCP tools and `bridge_status` reports
    `platform=linux`, `sandbox.backend=bubblewrap`, and the expected workers.
-7. An unclassified harmless task remains `approval_required`; approving it
-   locally runs it and returns a terminal result.
+7. A harmless `routine_development` local Codex task starts without approval
+   and returns a terminal result. An unclassified harmless task remains
+   `approval_required`; approving it locally runs it and returns a terminal result.
 8. Idempotent replay returns the same task ID.
 9. A queued task and a running task both cancel terminally; a remote run is
    cancelled in GitHub.

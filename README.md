@@ -18,7 +18,27 @@ Delnavazan may become one project managed by Orchestra, but Orchestra must not c
 
 The same Orchestra should be capable of coordinating unrelated software, infrastructure, data, research and machine-learning projects.
 
-## Foundations and first implementation
+## Current runtime
+
+The supported production path is intentionally small:
+
+```text
+ChatGPT -> authenticated MCP tunnel -> Orchestra coordinator -> local worker lane -> Git branch / PR
+```
+
+The coordinator maintains the durable task queue, isolated Git worktrees,
+timeouts, cancellation and bounded results. PixelBox configuration exposes four
+interchangeable local lanes: separate Ina and Hamed Codex homes plus two direct
+DeepSeek lanes. The scheduler initially runs two tasks at once and can be
+configured by the owner. GitHub Actions remains useful for repository CI; it
+is not a configured AI-worker backend.
+
+For a trusted repository, `task_approval_mode: disabled` grants routine
+development tasks to the configured local lanes without an extra prompt.
+Production, destructive, security and unclassified task classes still require
+explicit approval. Host operations remain separately allowlisted and approved.
+
+## Foundations and historical implementation
 
 The initial foundation set is recorded before runtime implementation:
 
@@ -29,7 +49,10 @@ The initial foundation set is recorded before runtime implementation:
 - design Learning Mode so important technical decisions can be understood, not merely executed;
 - record consequential architectural choices as Architecture Decision Records (ADRs).
 
-The first runtime component is the opt-in Mac Bridge v1. Its implementation and operating boundary are recorded in [ADR-001](docs/decisions/ADR-001-mac-bridge-v1.md). The proposed [OMCP task-control adapter](docs/OMCP.md) adds a direct, authenticated MCP path for task submission and control while keeping ChatGPT responsible for orchestration. Both are narrow instruments, not the complete Orchestra coordinator or authoritative workflow engine.
+The Mac Bridge documents are retained as historical design material only; the
+PixelBox coordinator and authenticated MCP tunnel are the supported runtime.
+The direct [OMCP task-control adapter](docs/OMCP.md) provides task submission,
+status, results, availability and cancellation.
 
 ### Foundation documents
 
@@ -48,6 +71,7 @@ The first runtime component is the opt-in Mac Bridge v1. Its implementation and 
 - [Execution policies and operator runbook](docs/EXECUTION-POLICIES.md) — distinguishes deployed prompt-free worker scheduling from the proposed, not-yet-active automatic merge/deploy policy.
 - [ADR-002: Local MCP task-control adapter](docs/decisions/ADR-002-omcp-task-control.md) — records the direct-control transport, authority and recovery boundary.
 - [ADR-004: PixelBox coordinator and GitHub Actions workers](docs/decisions/ADR-004-pixelbox-linux-actions-workers.md) — records the Linux sandbox, remote-worker, artifact and cutover decisions.
+- [ADR-009: Authenticated authority-to-disposable-adapter integration](docs/decisions/ADR-009-authority-adapter-integration.md) — records atomic consume-before-dispatch and fail-closed crash recovery for the inactive Phase 3C prototype.
 
 The lessons audit remains open to new evidence throughout development; completing the initial audit does not freeze what Orchestra can learn.
 
@@ -57,7 +81,7 @@ Orchestra should increase human capability rather than obscure the system behind
 
 ---
 
-**Status:** Foundation  
+**Status:** Local-worker orchestration implementation in progress
 **Repository:** Private  
 **Initialised:** 27 September 2026
 

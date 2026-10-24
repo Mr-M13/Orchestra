@@ -1,0 +1,4 @@
+# Example only. Install through a reviewed configuration change, not Phase 3A.
+# tmpfiles.d(5): runtime directory is traversable by the client group but not
+# writable by it. The authority owns the directory and creates the socket.
+d /run/orchestra-authority 0750 orchestra-authority orchestra-clients -
