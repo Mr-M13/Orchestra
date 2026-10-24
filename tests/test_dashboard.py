@@ -7,11 +7,13 @@ import socket
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 from wsgiref.util import setup_testing_defaults
 
 from dashboard.app import Dashboard
+from dashboard import omcp as dashboard_omcp
 from dashboard.omcp import OMCPClient, OMCPError
 
 
@@ -328,43 +330,270 @@ class DashboardTests(unittest.TestCase):
 
 
 class OMCPClientTests(unittest.TestCase):
-    def test_task_snapshot_uses_the_fixed_tool_allowlist_over_the_socket(self):
+    class _ScriptedSocket:
+        def __init__(self, parts):
+            self.parts = iter(parts)
+            self.timeouts = []
+
+        def settimeout(self, timeout):
+            self.timeouts.append(timeout)
+
+        def recv(self, _size):
+            part = next(self.parts)
+            if isinstance(part, BaseException):
+                raise part
+            return part
+
+    def _serve_client(self, socket_path, responder):
+        ready = threading.Event()
+        received = []
+
+        def serve():
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                listener.bind(str(socket_path))
+                listener.listen(1)
+                ready.set()
+                connection, _ = listener.accept()
+                with connection:
+                    data = b""
+                    while True:
+                        part = connection.recv(65536)
+                        if not part:
+                            return
+                        data += part
+                        while b"\n" in data:
+                            line, data = data.split(b"\n", 1)
+                            request = json.loads(line)
+                            received.append(request)
+                            response = responder(request, received)
+                            if response is not None:
+                                connection.sendall(json.dumps(response).encode() + b"\n")
+                            if request.get("method") == "tools/call":
+                                return
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        self.assertTrue(ready.wait(2))
+        return thread, received
+
+    @staticmethod
+    def _successful_responder(request, _received):
+        if request["method"] == "initialize":
+            return {"jsonrpc": "2.0", "id": request["id"], "result": {
+                "protocolVersion": "2025-06-18", "capabilities": {},
+                "serverInfo": {"name": "orchestra-omcp", "version": "0.2.0"},
+            }}
+        if request["method"] == "tools/call":
+            return {"jsonrpc": "2.0", "id": request["id"], "result": {
+                "structuredContent": {
+                    "running": [], "queued": [], "recent": [],
+                    "counts": {"running": 0, "queued": 0, "recent": 0},
+                },
+            }}
+        return None
+
+    def test_task_snapshot_initializes_before_fixed_allowlist_tool_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = Path(directory) / "omcp.sock"
+            thread, received = self._serve_client(socket_path, self._successful_responder)
+            snapshot = OMCPClient(str(socket_path)).call(
+                "task_snapshot", {"recent_limit": 20},
+            )
+            thread.join(2)
+            self.assertEqual(snapshot["counts"]["queued"], 0)
+            self.assertEqual([request["method"] for request in received], [
+                "initialize", "notifications/initialized", "tools/call",
+            ])
+            self.assertEqual(received[0]["params"], {
+                "protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": {"name": "orchestra-dashboard", "version": "0.2.0"},
+            })
+            self.assertNotEqual(received[0]["id"], received[2]["id"])
+            self.assertNotIn("id", received[1])
+            self.assertEqual(received[2]["params"]["name"], "task_snapshot")
+            self.assertEqual(received[2]["params"]["arguments"], {"recent_limit": 20})
+
+    def test_initialize_error_fails_closed_before_tool_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = Path(directory) / "omcp.sock"
+
+            def responder(request, _received):
+                return {"jsonrpc": "2.0", "id": request["id"], "error": {
+                    "code": -32002, "message": "MCP server is not initialized",
+                }}
+
+            thread, received = self._serve_client(socket_path, responder)
+            with self.assertRaisesRegex(OMCPError, "initialization failed"):
+                OMCPClient(str(socket_path)).call("bridge_status")
+            thread.join(2)
+            self.assertEqual([request["method"] for request in received], ["initialize"])
+
+    def test_malformed_or_wrong_initialize_response_fails_closed(self):
+        for response in (
+            {"jsonrpc": "2.0", "id": 1, "result": []},
+            {"jsonrpc": "2.0", "id": 999, "result": {"protocolVersion": "2025-06-18"}},
+            {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2024-11-05"}},
+        ):
+            with self.subTest(response=response), tempfile.TemporaryDirectory() as directory:
+                socket_path = Path(directory) / "omcp.sock"
+
+                def responder(_request, _received, response=response):
+                    return response
+
+                thread, received = self._serve_client(socket_path, responder)
+                with self.assertRaises(OMCPError):
+                    OMCPClient(str(socket_path)).call("bridge_status")
+                thread.join(2)
+                self.assertEqual([request["method"] for request in received], ["initialize"])
+
+    def test_initialize_response_ids_are_type_strict(self):
+        for response_id in (True, False, 1.0, "1", 2, None):
+            with self.subTest(response_id=response_id), tempfile.TemporaryDirectory() as directory:
+                socket_path = Path(directory) / "omcp.sock"
+
+                def responder(_request, _received, response_id=response_id):
+                    return {"jsonrpc": "2.0", "id": response_id, "result": {
+                        "protocolVersion": "2025-06-18",
+                    }}
+
+                thread, received = self._serve_client(socket_path, responder)
+                with self.assertRaisesRegex(OMCPError, "invalid response"):
+                    OMCPClient(str(socket_path)).call("bridge_status")
+                thread.join(2)
+                self.assertEqual([request["method"] for request in received], ["initialize"])
+
+    def test_initialize_result_and_error_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = Path(directory) / "omcp.sock"
+
+            def responder(request, _received):
+                return {"jsonrpc": "2.0", "id": request["id"], "result": {
+                    "protocolVersion": "2025-06-18",
+                }, "error": {"code": -32000}}
+
+            thread, received = self._serve_client(socket_path, responder)
+            with self.assertRaisesRegex(OMCPError, "initialization failed"):
+                OMCPClient(str(socket_path)).call("bridge_status")
+            thread.join(2)
+            self.assertEqual([request["method"] for request in received], ["initialize"])
+
+    def test_tool_response_id_validation_remains_in_effect_after_initialization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = Path(directory) / "omcp.sock"
+
+            def responder(request, received):
+                if request["method"] == "tools/call":
+                    return {"jsonrpc": "2.0", "id": request["id"] + 1, "result": {}}
+                return self._successful_responder(request, received)
+
+            thread, received = self._serve_client(socket_path, responder)
+            with self.assertRaisesRegex(OMCPError, "invalid response"):
+                OMCPClient(str(socket_path)).call("bridge_status")
+            thread.join(2)
+            self.assertEqual([request["method"] for request in received], [
+                "initialize", "notifications/initialized", "tools/call",
+            ])
+
+    def test_tool_response_ids_are_type_strict(self):
+        for response_id in (True, False, 2.0, "2", 3, None):
+            with self.subTest(response_id=response_id), tempfile.TemporaryDirectory() as directory:
+                socket_path = Path(directory) / "omcp.sock"
+
+                def responder(request, received, response_id=response_id):
+                    if request["method"] == "tools/call":
+                        return {"jsonrpc": "2.0", "id": response_id, "result": {}}
+                    return self._successful_responder(request, received)
+
+                thread, received = self._serve_client(socket_path, responder)
+                with self.assertRaisesRegex(OMCPError, "invalid response"):
+                    OMCPClient(str(socket_path)).call("bridge_status")
+                thread.join(2)
+                self.assertEqual([request["method"] for request in received], [
+                    "initialize", "notifications/initialized", "tools/call",
+                ])
+
+    def test_tool_result_and_error_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = Path(directory) / "omcp.sock"
+
+            def responder(request, received):
+                if request["method"] == "tools/call":
+                    return {"jsonrpc": "2.0", "id": request["id"], "result": {
+                        "structuredContent": {},
+                    }, "error": {"code": -32000}}
+                return self._successful_responder(request, received)
+
+            thread, _received = self._serve_client(socket_path, responder)
+            with self.assertRaisesRegex(OMCPError, "rejected"):
+                OMCPClient(str(socket_path)).call("bridge_status")
+            thread.join(2)
+
+    def test_response_line_limit_excludes_the_newline_delimiter(self):
+        client = OMCPClient("/unused")
+        prefix, suffix = b'{"payload":"', b'"}'
+        exact_line = prefix + b"x" * (client._MAX_RESPONSE_BYTES - len(prefix) - len(suffix)) + suffix
+        self.assertEqual(len(exact_line), client._MAX_RESPONSE_BYTES)
+        response = client._receive_line(self._ScriptedSocket([exact_line, b"\n"]))
+        self.assertEqual(len(response["payload"]), len(exact_line) - len(prefix) - len(suffix))
+
+    def test_response_line_one_byte_over_limit_is_rejected(self):
+        client = OMCPClient("/unused")
+        prefix, suffix = b'{"payload":"', b'"}'
+        oversized = prefix + b"x" * (client._MAX_RESPONSE_BYTES + 1 - len(prefix) - len(suffix)) + suffix
+        with self.assertRaisesRegex(OMCPError, "invalid response"):
+            client._receive_line(self._ScriptedSocket([oversized]))
+
+    def test_response_line_overflowing_chunk_with_newline_is_rejected(self):
+        client = OMCPClient("/unused")
+        prefix, suffix = b'{"payload":"', b'"}'
+        oversized = prefix + b"x" * (client._MAX_RESPONSE_BYTES + 1 - len(prefix) - len(suffix)) + suffix
+        with self.assertRaisesRegex(OMCPError, "invalid response"):
+            client._receive_line(self._ScriptedSocket([oversized + b"\n"]))
+
+    def test_response_deadline_is_total_not_per_recv(self):
+        client = OMCPClient("/unused", timeout=1.0)
+        connection = self._ScriptedSocket([b"{", b"}", b"\n"])
+        with mock.patch.object(dashboard_omcp.time, "monotonic", side_effect=[0.0, 0.4, 0.8, 1.0]):
+            with self.assertRaises(TimeoutError):
+                client._receive_line(connection)
+        self.assertEqual(connection.timeouts[0], 0.6)
+        self.assertAlmostEqual(connection.timeouts[1], 0.2)
+
+    def test_response_deadline_allows_normal_response_and_preserves_socket_timeout(self):
+        client = OMCPClient("/unused", timeout=1.0)
+        connection = self._ScriptedSocket([b"{}\n"])
+        with mock.patch.object(dashboard_omcp.time, "monotonic", side_effect=[10.0, 10.25]):
+            self.assertEqual(client._receive_line(connection), {})
+        self.assertEqual(connection.timeouts, [0.75])
+
+    def test_stalled_read_fails_closed(self):
+        client = OMCPClient("/unused", timeout=1.0)
+        with mock.patch.object(dashboard_omcp.time, "monotonic", side_effect=[0.0, 0.5]):
+            with self.assertRaises(socket.timeout):
+                client._receive_line(self._ScriptedSocket([socket.timeout("stalled")]))
+
+    def test_socket_and_timeout_failures_are_dashboard_safe(self):
+        with self.assertRaisesRegex(OMCPError, "Orchestra is unavailable"):
+            OMCPClient("/definitely/not/a/socket").call("bridge_status")
         with tempfile.TemporaryDirectory() as directory:
             socket_path = Path(directory) / "omcp.sock"
             ready = threading.Event()
-            received = {}
 
-            def serve():
+            def stall():
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
                     listener.bind(str(socket_path))
                     listener.listen(1)
                     ready.set()
                     connection, _ = listener.accept()
                     with connection:
-                        data = b""
-                        while b"\n" not in data:
-                            data += connection.recv(65536)
-                        request = json.loads(data.split(b"\n", 1)[0])
-                        received.update(request)
-                        response = {
-                            "jsonrpc": "2.0", "id": request["id"],
-                            "result": {"structuredContent": {
-                                "running": [], "queued": [], "recent": [],
-                                "counts": {"running": 0, "queued": 0, "recent": 0},
-                            }},
-                        }
-                        connection.sendall(json.dumps(response).encode() + b"\n")
+                        threading.Event().wait(0.2)
 
-            thread = threading.Thread(target=serve, daemon=True)
+            thread = threading.Thread(target=stall, daemon=True)
             thread.start()
             self.assertTrue(ready.wait(2))
-            snapshot = OMCPClient(str(socket_path)).call(
-                "task_snapshot", {"recent_limit": 20},
-            )
+            with self.assertRaisesRegex(OMCPError, "Orchestra is unavailable"):
+                OMCPClient(str(socket_path), timeout=0.01).call("bridge_status")
             thread.join(2)
-            self.assertEqual(snapshot["counts"]["queued"], 0)
-            self.assertEqual(received["params"]["name"], "task_snapshot")
-            self.assertEqual(received["params"]["arguments"], {"recent_limit": 20})
 
     def test_tools_outside_the_allowlist_never_reach_the_socket(self):
         client = OMCPClient("/definitely/not/a/socket")
