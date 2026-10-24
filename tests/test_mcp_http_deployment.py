@@ -401,7 +401,7 @@ cat "$CONFIG_ROOT/mcp-http.env"
             "ensure_broker_traverse_acl()",
         )]
         self.assertIn('setfacl -m "g:$allowed_group:--x"', helper)
-        self.assertIn('owner_group="$(_acl_permissions "$config_root" "group::")"', helper)
+        self.assertIn('owner_group="$(_acl_permissions "$config_root" "group:")"', helper)
         self.assertIn('[[ "$other" == "---" && "$owner_group" == "---" ]]', helper)
         self.assertNotIn("chmod -R", helper)
         self.assertNotIn("chown -R", helper)

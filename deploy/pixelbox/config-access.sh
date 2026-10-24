@@ -49,7 +49,7 @@ ensure_group_traverse_acl() {
     || { echo "ERROR: getfacl is required to verify group traverse access" >&2; return 1; }
 
   other="$(_acl_permissions "$config_root" "other:")"
-  owner_group="$(_acl_permissions "$config_root" "group::")"
+  owner_group="$(_acl_permissions "$config_root" "group:")"
   [[ "$other" == "---" && "$owner_group" == "---" ]] \
     || { echo "ERROR: $config_root owning group or other access is not private" >&2; return 1; }
 
@@ -96,7 +96,7 @@ ensure_broker_traverse_acl() {
   # Fail closed if the root has already been opened to other users.  Repairing
   # the broker entry must never be used to bless a broader permission change.
   other="$(_acl_permissions "$config_root" "other:")"
-  owner_group="$(_acl_permissions "$config_root" "group::")"
+  owner_group="$(_acl_permissions "$config_root" "group:")"
   [[ "$other" == "---" && "$owner_group" == "---" ]] \
     || { echo "ERROR: $config_root owning group or other access is not private" >&2; return 1; }
 
