@@ -14,17 +14,34 @@ class Gateway:
         return bool(header and header.startswith("Bearer ") and hmac.compare_digest(header[7:], self.token))
     def rpc(self, session: str | None, payload: bytes) -> tuple[str, bytes]:
         request = json.loads(payload); method = request.get("method")
+        if not isinstance(method, str): raise ValueError("invalid MCP method")
         with self.lock:
             if method == "initialize":
+                if session: raise PermissionError("MCP session already exists")
+                version = request.get("params", {}).get("protocolVersion") if isinstance(request.get("params"), dict) else None
+                if version != "2025-06-18": raise ValueError("unsupported MCP protocol version")
                 session = uuid.uuid4().hex
-                self.sessions[session] = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                self.sessions[session].connect(str(self.path))
+                conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); conn.settimeout(10); conn.connect(str(self.path))
+                self.sessions[session] = {"socket": conn, "ready": False}
             if not session or session not in self.sessions: raise PermissionError("MCP session is not initialized")
-            conn = self.sessions[session]; conn.sendall(payload + b"\n")
-            if "id" not in request: return session, b"{}"
-            response = b""
-            while not response.endswith(b"\n"): response += conn.recv(65536)
-            return session, response.rstrip()
+            state = self.sessions[session]
+            if method == "notifications/initialized":
+                state["ready"] = True; state["socket"].sendall(payload + b"\n"); return session, b"{}"
+            if not state["ready"] and method != "initialize": raise PermissionError("MCP session is not initialized")
+            try:
+                conn = state["socket"]; conn.sendall(payload + b"\n")
+                response = b""
+                while not response.endswith(b"\n"):
+                    block = conn.recv(65536)
+                    if not block: raise OSError("backend closed")
+                    response += block
+                return session, response.rstrip()
+            except OSError:
+                state["socket"].close(); del self.sessions[session]; raise
+    def close(self, session: str | None) -> None:
+        with self.lock:
+            state = self.sessions.pop(session, None)
+            if state: state["socket"].close()
 
 def make_handler(gateway: Gateway):
     class Handler(BaseHTTPRequestHandler):
@@ -48,6 +65,9 @@ def make_handler(gateway: Gateway):
             try:
                 session, result = gateway.rpc(self.headers.get("Mcp-Session-Id"), self.rfile.read(size)); self.send(200,result,session)
             except (ValueError, PermissionError, OSError, json.JSONDecodeError): self.send(400,b'{"error":"invalid MCP request"}')
+        def do_DELETE(self):
+            if self.path != "/mcp" or not gateway.allowed(self.headers.get("Authorization")): return self.send(401,b'{"error":"unauthorized"}')
+            gateway.close(self.headers.get("Mcp-Session-Id")); self.send(204)
     return Handler
 
 def main(argv=None):

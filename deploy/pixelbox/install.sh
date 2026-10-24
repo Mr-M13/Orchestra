@@ -247,7 +247,7 @@ stage_configuration() {
     echo "Installed example omcp.json; owner review is required before activation."
     STAGED_ONLY=1
   fi
-  for env_file in omcp.env tunnel.env; do
+  for env_file in omcp.env tunnel.env mcp-http.env; do
     if [[ ! -f "$CONFIG_ROOT/$env_file" ]]; then
       sudo install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_USER" \
         "$release_root/deploy/pixelbox/$env_file.example" "$CONFIG_ROOT/$env_file"
@@ -285,7 +285,7 @@ release_sha_from_link() {
 
 install_units() {
   local release_root="$1" unit
-  for unit in orchestra-omcp.service orchestra-github-dispatch.service orchestra-tunnel.service \
+  for unit in orchestra-omcp.service orchestra-github-dispatch.service orchestra-tunnel.service orchestra-mcp-http.service \
               orchestra-health.service orchestra-health.timer; do
     sudo install -m 0644 "$release_root/deploy/pixelbox/systemd/$unit" \
       "/etc/systemd/system/$unit"

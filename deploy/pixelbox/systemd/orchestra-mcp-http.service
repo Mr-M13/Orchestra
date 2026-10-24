@@ -8,13 +8,14 @@ Group=hamed
 EnvironmentFile=/etc/orchestra/mcp-http.env
 ExecStart=/usr/bin/python3 -m omcp.http_gateway --socket /home/hamed/orchestra-migration/state/mcp.sock --host 127.0.0.1 --port 8090
 Restart=on-failure
+RestartSec=2
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
 PrivateNetwork=no
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/hamed/orchestra-migration/state
+ReadOnlyPaths=/home/hamed/orchestra-migration/state/mcp.sock
 RestrictAddressFamilies=AF_UNIX AF_INET
 [Install]
 WantedBy=multi-user.target
