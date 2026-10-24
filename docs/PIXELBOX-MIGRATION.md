@@ -625,8 +625,13 @@ exposed directly.
 - Idle MCP sessions expire after 15 minutes, a background sweeper removes stale
   sessions, concurrent sessions are capped, and shutdown/`DELETE` closes backend
   sockets.
-- Rollback to a pre-HTTPS release disables and removes the gateway unit. Roll
-  forward again only after another explicit cutover approval.
+- Rollback to a pre-HTTPS release disables and removes the gateway unit. The
+  `orchestra-mcp-http` identity, group traverse ACL, and token file remain
+  dormant; treat a security rollback as token-rotation event and remove those
+  residual objects through an owner-approved cleanup.
+- Staging an HTTPS-capable release requires Linux account tools (`getent`,
+  `groupadd`, `useradd`) and POSIX ACL tools (`setfacl`, `getfacl`). Portable
+  staging on another platform is limited to pre-HTTPS releases.
 - Verify with `deploy/pixelbox/verify_mcp_http.sh` and the Cloudflare ingress
   checks in [CLOUDFLARE-MCP.md](CLOUDFLARE-MCP.md).
 

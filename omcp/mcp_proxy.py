@@ -19,19 +19,34 @@ import time
 from pathlib import Path
 
 
-def _validate_socket_path(path: Path) -> None:
+def _validate_socket_path(path: Path, expected_group: str | None = None) -> None:
     """Fail closed unless this user owns an owner/group-only coordinator socket.
 
     The tunnel proxy runs as the socket owner.  The coordinator may also expose
-    the same socket to the dedicated HTTP gateway group, so 0660 is accepted
-    only when the owner is the current user and no "other" bits are present.
+    the same socket to the dedicated HTTP gateway group.  A 0660 socket is
+    accepted only when its group is the configured gateway group and its parent
+    directory is not group/other writable; 0600 remains the default.
     """
     metadata = path.lstat()
     if not stat.S_ISSOCK(metadata.st_mode):
         raise ConnectionError("OMCP coordinator endpoint is not a Unix socket")
+    if metadata.st_uid != os.getuid():
+        raise PermissionError("OMCP coordinator socket must be owned by this user")
     mode = metadata.st_mode & 0o777
-    if metadata.st_uid != os.getuid() or mode not in {0o600, 0o660}:
+    if mode == 0o600:
+        return
+    expected_group = expected_group or os.environ.get("ORCHESTRA_OMCP_SOCKET_GROUP")
+    if mode != 0o660 or not expected_group:
         raise PermissionError("OMCP coordinator socket must be owner/group-only")
+    try:
+        expected_gid = grp.getgrnam(expected_group).gr_gid
+    except KeyError as exc:
+        raise PermissionError("configured coordinator socket group is unavailable") from exc
+    if metadata.st_gid != expected_gid:
+        raise PermissionError("coordinator socket group does not match policy")
+    parent = path.parent.lstat()
+    if not stat.S_ISDIR(parent.st_mode) or parent.st_mode & 0o022:
+        raise PermissionError("coordinator runtime directory is not private")
 
 
 def validate_gateway_socket(path: Path, owner: str, group: str) -> None:

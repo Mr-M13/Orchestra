@@ -14,6 +14,7 @@ User=hamed
 Group=hamed
 WorkingDirectory=/opt/orchestra/current
 EnvironmentFile=/etc/orchestra/tunnel.env
+Environment=ORCHESTRA_OMCP_SOCKET_GROUP=orchestra-mcp
 ExecStartPre=/usr/bin/test -S /run/orchestra/omcp.sock
 ExecStart=/usr/local/bin/tunnel-client run --profile pixelbox
 Restart=always

@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 from omcp.controller import Config, Principal, TaskController, Worker
 from omcp.http_gateway import (
-    Gateway, GatewayError, GatewayServer, SessionLimitError,
+    MAX_BODY_BYTES, Gateway, GatewayError, GatewayServer, SessionLimitError,
     make_handler,
 )
 from omcp.mcp_proxy import (
@@ -201,6 +201,17 @@ class GatewayLifecycleTests(GatewayTestBase):
                 b'{"jsonrpc":"2.0","method":"notifications/cancelled"}',
             )
 
+    def test_trailing_newline_does_not_desynchronise_backend_framing(self):
+        session = self.ready_session()
+        first = self.gateway.rpc(
+            session, b'{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n\n',
+        )
+        second = self.gateway.rpc(
+            session, b'{"jsonrpc":"2.0","id":3,"method":"tools/list"}',
+        )
+        self.assertEqual(json.loads(first[1])["id"], 2)
+        self.assertEqual(json.loads(second[1])["id"], 3)
+
     def test_session_limit_is_bounded_and_released_by_close(self):
         gateway = Gateway(self.path, TOKEN, max_sessions=2)
         try:
@@ -284,17 +295,20 @@ class GatewaySocketPolicyTests(unittest.TestCase):
         self.listener.close()
         self.temp.cleanup()
 
-    def test_tunnel_socket_validation_accepts_only_owner_or_group_forms(self):
+    def test_tunnel_socket_validation_accepts_only_configured_group_form(self):
         self.path.chmod(0o600)
         _validate_socket_path(self.path)
         self.path.chmod(0o660)
-        _validate_socket_path(self.path)
+        group = grp.getgrgid(os.getgid()).gr_name
+        _validate_socket_path(self.path, expected_group=group)
+        with self.assertRaises(PermissionError):
+            _validate_socket_path(self.path)
         self.path.chmod(0o604)
         with self.assertRaises(PermissionError):
-            _validate_socket_path(self.path)
+            _validate_socket_path(self.path, expected_group=group)
         self.path.chmod(0o666)
         with self.assertRaises(PermissionError):
-            _validate_socket_path(self.path)
+            _validate_socket_path(self.path, expected_group=group)
 
     def test_gateway_accepts_only_exact_owner_group_and_mode(self):
         owner = pwd.getpwuid(os.getuid()).pw_name
@@ -369,9 +383,10 @@ class GatewayHTTPTests(GatewayTestBase):
 
     def test_health_auth_and_malformed_requests_are_bounded(self):
         self.assertEqual(self.request("GET", "/healthz")[0], 200)
-        self.assertEqual(self.request("GET", "/readyz")[0], 200)
+        self.assertEqual(self.request("GET", "/readyz")[0], 401)
+        self.assertEqual(self.request("GET", "/readyz", headers=self.headers)[0], 200)
         self.path.chmod(0o666)
-        self.assertEqual(self.request("GET", "/readyz")[0], 503)
+        self.assertEqual(self.request("GET", "/readyz", headers=self.headers)[0], 503)
         self.path.chmod(0o600)
         self.assertEqual(self.request("GET", "/mcp")[0], 404)
         self.assertEqual(self.request("POST", "/mcp", b"{}")[0], 401)
@@ -406,8 +421,38 @@ class GatewayHTTPTests(GatewayTestBase):
         )[0], 400)
         self.assertEqual(self.request(
             "POST", "/mcp", b"",
-            {**self.headers, "Content-Length": str(4 * 1024 * 1024 + 1)},
+            {**self.headers, "Content-Length": str(MAX_BODY_BYTES + 1)},
         )[0], 413)
+
+    def test_auth_failure_is_audited_without_logging_the_token(self):
+        with self.assertLogs("orchestra.mcp.http", level="WARNING") as captured:
+            self.assertEqual(self.request("POST", "/mcp", b"{}")[0], 401)
+        output = "\n".join(captured.output)
+        self.assertIn("auth_failure", output)
+        self.assertNotIn(TOKEN, output)
+
+    def test_absolute_request_deadline_closes_a_slow_header_connection(self):
+        server = GatewayServer(
+            ("127.0.0.1", 0), make_handler(self.gateway, request_deadline=0.2),
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        connection = socket.create_connection(
+            ("127.0.0.1", server.server_port), timeout=2,
+        )
+        try:
+            connection.sendall(b"GET /healthz HTTP/1.0\r\nX-Slow: ")
+            connection.settimeout(2)
+            try:
+                response = connection.recv(1024)
+            except ConnectionResetError:
+                response = b""
+            self.assertEqual(response, b"")
+        finally:
+            connection.close()
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
 
     def test_http_concurrency_limit_fails_closed_with_503(self):
         self.server._request_slots = threading.BoundedSemaphore(1)

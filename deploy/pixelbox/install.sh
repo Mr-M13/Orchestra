@@ -234,6 +234,9 @@ install_environment_file() {
 
 stage_configuration() {
   local release_root="$RELEASES_ROOT/$RELEASE_SHA" env_file
+  if release_has_gateway_unit "$release_root" && [[ "$(uname -s)" != "Linux" ]]; then
+    fail "staging an HTTPS gateway release requires Linux account and ACL tools"
+  fi
   sudo install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$CONFIG_ROOT"
   sudo install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$CONFIG_ROOT/secrets"
   sudo install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$STATE_ROOT"
@@ -246,8 +249,6 @@ stage_configuration() {
   ensure_broker_traverse_acl "$CONFIG_ROOT" \
     || fail "could not preserve dispatch broker configuration access"
   if release_has_gateway_unit "$release_root"; then
-    [[ "$MCP_HTTP_USER" == "orchestra-mcp-http" && "$MCP_HTTP_GROUP" == "orchestra-mcp" ]] \
-      || fail "the gateway unit requires the reviewed orchestra-mcp-http/orchestra-mcp identity"
     prepare_mcp_identity
     ensure_group_traverse_acl "$CONFIG_ROOT" "$MCP_HTTP_GROUP" \
       || fail "could not grant the HTTP gateway traverse access to $CONFIG_ROOT"
@@ -378,6 +379,20 @@ wait_for_omcp_socket() {
   return 1
 }
 
+wait_for_gateway_health() {
+  local attempt
+  for attempt in {1..50}; do
+    if sudo -u "$MCP_HTTP_USER" /usr/bin/python3 -c \
+        'import http.client; c=http.client.HTTPConnection("127.0.0.1",8090,timeout=2); c.request("GET","/healthz"); r=c.getresponse(); r.read(); c.close(); raise SystemExit(0 if r.status == 200 else 1)' \
+        >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "ERROR: the HTTP gateway did not become healthy on loopback" >&2
+  return 1
+}
+
 preflight_activation() {
   local release_root="$RELEASES_ROOT/$RELEASE_SHA" mode broker_uid
   [[ "$(uname -s)" == "Linux" ]] || fail "activation is supported only on Linux"
@@ -458,6 +473,7 @@ activate_release() {
       && sudo systemctl restart orchestra-omcp.service \
       && { ! release_has_gateway_unit "$release_root" || wait_for_omcp_socket; } \
       && { ! release_has_gateway_unit "$release_root" || { sudo systemctl enable orchestra-mcp-http.service && sudo systemctl restart orchestra-mcp-http.service && sudo systemctl is-active --quiet orchestra-mcp-http.service; }; } \
+      && { ! release_has_gateway_unit "$release_root" || wait_for_gateway_health; } \
       && sudo systemctl is-active --quiet orchestra-omcp.service \
       && sudo systemctl is-active --quiet orchestra-health.timer; then
     if [[ -n "$old_sha" && "$old_sha" != "$RELEASE_SHA" ]]; then
@@ -483,6 +499,8 @@ activate_release() {
   sudo unlink "$CURRENT_LINK" 2>/dev/null || true
   sudo systemctl stop orchestra-mcp-http.service orchestra-omcp.service orchestra-health.timer || true
   sudo systemctl disable orchestra-mcp-http.service orchestra-omcp.service orchestra-health.timer || true
+  sudo rm -f "$UNIT_ROOT/orchestra-mcp-http.service"
+  sudo systemctl daemon-reload || true
   fail "first activation failed; no prior managed release was available"
 }
 

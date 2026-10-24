@@ -41,8 +41,12 @@ Staging an HTTPS-capable release creates the `orchestra-mcp` group and
 The gateway token file is owned by that identity, mode `0600`, and the
 configuration root grants only group traverse access. Existing token contents
 are preserved; activation fails if the token is still a placeholder or shorter
-than 32 non-whitespace characters. Rolling back to a pre-HTTPS release disables
-and removes the gateway unit.
+than 32 non-whitespace characters. Staging an HTTPS-capable release therefore
+requires Linux account tools (`getent`, `groupadd`, `useradd`) and POSIX ACL
+tools (`setfacl`, `getfacl`). Portable staging on another platform is limited to
+pre-HTTPS releases. Rolling back to a pre-HTTPS release disables and removes the
+gateway unit; the identity, ACL, and token remain dormant, so a security
+rollback should include token rotation and owner-approved cleanup.
 
 Portable source and staging tests on another platform do not prove PixelBox or
 Linux ARM64 readiness. Only `verify.sh --live --sha <sha>` on PixelBox can

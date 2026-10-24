@@ -35,11 +35,18 @@ class InstallerSourceTests(unittest.TestCase):
         self.assertIn("User=orchestra-mcp-http", unit)
         self.assertIn("Group=orchestra-mcp", unit)
         self.assertNotIn("Group=orchestra-mcp-http", unit)
+        self.assertIn("WorkingDirectory=/opt/orchestra/current", unit)
+        self.assertIn("Environment=PYTHONPATH=/opt/orchestra/current", unit)
+        self.assertIn(
+            'ExecStartPre=/usr/bin/python3 -c "import omcp.http_gateway"', unit,
+        )
         self.assertIn("ExecStartPre=/usr/bin/test -r /etc/orchestra/mcp-http.env", unit)
         self.assertIn("ExecStartPre=/usr/bin/test -S /run/orchestra/omcp.sock", unit)
         self.assertIn("--host 127.0.0.1", unit)
         self.assertIn("IPAddressDeny=any", unit)
         self.assertIn("IPAddressAllow=127.0.0.1/32", unit)
+        self.assertIn("SocketBindDeny=any", unit)
+        self.assertIn("SocketBindAllow=inet:8090", unit)
         self.assertIn("RestrictAddressFamilies=AF_UNIX AF_INET", unit)
         self.assertIn("PrivateNetwork=no", unit)
         self.assertIn("CapabilityBoundingSet=", unit)
@@ -77,6 +84,42 @@ class InstallerSourceTests(unittest.TestCase):
         remove = install_units.index('rm -f "$UNIT_ROOT/orchestra-mcp-http.service"')
         self.assertLess(disable, remove)
         self.assertIn('release_has_gateway_unit "$old_root"', source)
+
+    def test_first_activation_failure_removes_the_gateway_unit(self):
+        source = INSTALL.read_text()
+        failure = source[source.index('echo "Activation failed; restoring'):source.index("main()")]
+        self.assertIn('rm -f "$UNIT_ROOT/orchestra-mcp-http.service"', failure)
+        self.assertIn("systemctl daemon-reload", failure)
+
+    def test_activation_waits_for_gateway_health_before_declaring_success(self):
+        source = INSTALL.read_text()
+        activation = source[source.index("activate_release()"):source.index("main()")]
+        self.assertIn("wait_for_gateway_health", activation)
+        self.assertIn("wait_for_omcp_socket", activation)
+        unit = (ROOT / "deploy/pixelbox/systemd/orchestra-mcp-http.service").read_text()
+        self.assertIn("WorkingDirectory=/opt/orchestra/current", unit)
+
+    def test_tunnel_proxy_group_policy_is_explicit(self):
+        tunnel = (ROOT / "deploy/pixelbox/systemd/orchestra-tunnel.service").read_text()
+        self.assertIn("Environment=ORCHESTRA_OMCP_SOCKET_GROUP=orchestra-mcp", tunnel)
+        proxy = (ROOT / "omcp/mcp_proxy.py").read_text()
+        self.assertIn("expected_group", proxy)
+        self.assertIn("coordinator socket group does not match policy", proxy)
+
+    def test_portable_staging_rejects_gateway_releases(self):
+        source = INSTALL.read_text()
+        self.assertIn(
+            "staging an HTTPS gateway release requires Linux account and ACL tools",
+            source,
+        )
+
+    def test_live_verifier_checks_identity_mode_and_negative_auth(self):
+        verifier = (ROOT / "deploy/pixelbox/verify_mcp_http.sh").read_text()
+        self.assertIn("gateway environment must be owned by", verifier)
+        self.assertIn("gateway environment must have group", verifier)
+        self.assertIn("coordinator socket identity/mode does not match policy", verifier)
+        self.assertIn("Bearer wrong-token", verifier)
+        self.assertIn("127.0.0.1:8090", verifier)
 
 
 class InstallerFunctionTests(unittest.TestCase):

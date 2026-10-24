@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hmac
 import json
+import logging
 import os
 import re
 import signal
@@ -19,16 +20,27 @@ from typing import Any
 
 from omcp.mcp_proxy import _validate_socket_path, connect_gateway
 
-MAX_BODY_BYTES = 4 * 1024 * 1024
+MAX_MCP_LINE_BYTES = 4 * 1024 * 1024
+# Leave room for the newline that terminates the backend line.
+MAX_BODY_BYTES = MAX_MCP_LINE_BYTES - 1
 SESSION_TTL_SECONDS = 900
 MAX_SESSIONS = 64
 SWEEP_INTERVAL_SECONDS = 30
 SOCKET_TIMEOUT_SECONDS = 10.0
 HTTP_TIMEOUT_SECONDS = 15.0
+HTTP_REQUEST_DEADLINE_SECONDS = 20.0
 MAX_HTTP_CONCURRENCY = 64
 PROTOCOL_VERSION = "2025-06-18"
 SESSION_ID_RE = re.compile(r"[0-9a-f]{32}")
 MIN_TOKEN_LENGTH = 32
+
+LOGGER = logging.getLogger("orchestra.mcp.http")
+LOGGER.addHandler(logging.NullHandler())
+
+
+def audit(event: str, level: int = logging.INFO, **fields: Any) -> None:
+    """Emit a bounded, token-free lifecycle/security event."""
+    LOGGER.log(level, json.dumps({"event": event, **fields}, sort_keys=True))
 
 
 class GatewayError(Exception):
@@ -121,6 +133,7 @@ class Gateway:
             self.sessions.clear()
         for state in sessions:
             self._close_state(state)
+        audit("gateway_shutdown", closed=len(sessions))
 
     @property
     def session_count(self) -> int:
@@ -150,10 +163,15 @@ class Gateway:
 
     def rpc(self, session: str | None, payload: bytes) -> tuple[str, bytes]:
         request, method = self._parse(payload)
+        # Forward one canonical line.  This strips trailing whitespace/newlines
+        # that would otherwise desynchronise the backend's line framing.
+        canonical = json.dumps(
+            request, separators=(",", ":"), ensure_ascii=True,
+        ).encode("utf-8")
         if method == "initialize":
             if session:
                 raise GatewayError("MCP session already exists")
-            return self._initialize(request, payload)
+            return self._initialize(request, canonical)
         if not session:
             raise GatewayError("MCP session is required")
         state = self._lookup(session)
@@ -164,7 +182,7 @@ class Gateway:
                 raise GatewayError("MCP session is not initialized")
             now = time.monotonic()
             if now - state.last >= self.session_ttl:
-                self._drop(session, state)
+                self._drop(session, state, "expired")
                 raise GatewayError("MCP session expired")
             if method == "notifications/initialized":
                 if request.get("id") is not None:
@@ -172,9 +190,9 @@ class Gateway:
                 if state.ready:
                     raise GatewayError("MCP session is already initialized")
                 try:
-                    self._send(state, payload)
+                    self._send(state, canonical)
                 except OSError as exc:
-                    self._drop(session, state)
+                    self._drop(session, state, "backend_failure")
                     raise BackendUnavailable() from exc
                 state.ready = True
                 state.last = now
@@ -184,9 +202,9 @@ class Gateway:
             if not state.ready:
                 raise GatewayError("MCP session is not initialized")
             try:
-                response = self._relay(state, payload)
+                response = self._relay(state, canonical)
             except OSError as exc:
-                self._drop(session, state)
+                self._drop(session, state, "backend_failure")
                 raise BackendUnavailable() from exc
             state.last = time.monotonic()
             return session, response
@@ -196,8 +214,10 @@ class Gateway:
             return
         with self._lock:
             state = self.sessions.pop(session, None)
+            active = len(self.sessions)
         if state is not None:
             self._close_state(state)
+            audit("session_closed", reason="client", active=active)
 
     def _parse(self, payload: bytes) -> tuple[dict[str, Any], str]:
         if not payload or len(payload) > MAX_BODY_BYTES:
@@ -220,6 +240,7 @@ class Gateway:
         if not isinstance(params, dict) or params.get("protocolVersion") != PROTOCOL_VERSION:
             raise GatewayError("unsupported MCP protocol version")
         if not self._slots.acquire(blocking=False):
+            audit("session_limit", logging.WARNING, active=self.session_count)
             raise SessionLimitError()
         connection: socket.socket | None = None
         try:
@@ -238,7 +259,9 @@ class Gateway:
                 if self._stop.is_set():
                     raise BackendUnavailable()
                 self.sessions[session] = state
+                active = len(self.sessions)
             connection = None
+            audit("session_created", active=active)
             return session, response.rstrip()
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             if connection is not None:
@@ -293,11 +316,15 @@ class Gateway:
                 raise OSError("backend response exceeds the size limit")
         return bytes(response).split(b"\n", 1)[0].rstrip()
 
-    def _drop(self, session: str, state: Session) -> None:
+    def _drop(self, session: str, state: Session, reason: str) -> None:
         with self._lock:
-            if self.sessions.get(session) is state:
+            removed = self.sessions.get(session) is state
+            if removed:
                 del self.sessions[session]
+            active = len(self.sessions)
         self._close_state(state)
+        if removed:
+            audit("session_closed", reason=reason, active=active)
 
     def _close_state(self, state: Session) -> None:
         if state.closed:
@@ -334,6 +361,10 @@ class Gateway:
                     state.lock.release()
         for state in expired:
             self._close_state(state)
+        if expired:
+            with self._lock:
+                active = len(self.sessions)
+            audit("session_expired", count=len(expired), active=active)
         return len(expired)
 
     def _sweep_loop(self) -> None:
@@ -387,7 +418,8 @@ def _json_error(status: int, code: str) -> tuple[int, bytes]:
     return status, json.dumps({"error": code}, separators=(",", ":")).encode()
 
 
-def make_handler(gateway: Gateway):
+def make_handler(gateway: Gateway,
+                 request_deadline: float = HTTP_REQUEST_DEADLINE_SECONDS):
     class Handler(BaseHTTPRequestHandler):
         server_version = "Orchestra"
         sys_version = ""
@@ -399,24 +431,46 @@ def make_handler(gateway: Gateway):
             super().setup()
             self.connection.settimeout(HTTP_TIMEOUT_SECONDS)
 
+        def handle_one_request(self) -> None:
+            def abort_slow_request() -> None:
+                audit("request_timeout", logging.WARNING)
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+            timer = threading.Timer(max(0.05, request_deadline), abort_slow_request)
+            timer.daemon = True
+            timer.start()
+            try:
+                super().handle_one_request()
+            finally:
+                timer.cancel()
+
         def send(self, status: int, body: bytes = b"",
                  session: str | None = None) -> None:
-            self.send_response(status)
-            if body:
-                self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            if session:
-                self.send_header("Mcp-Session-Id", session)
-            self.end_headers()
-            if body:
-                self.wfile.write(body)
+            try:
+                self.send_response(status)
+                if body:
+                    self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                if session:
+                    self.send_header("Mcp-Session-Id", session)
+                self.end_headers()
+                if body:
+                    self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                self.close_connection = True
 
         def do_GET(self) -> None:
             if self.path == "/healthz":
                 return self.send(200, b'{"status":"ok"}')
             if self.path == "/readyz":
+                if not gateway.allowed(self.headers.get("Authorization")):
+                    audit("auth_failure", logging.WARNING, status=401)
+                    return self.send(401, b'{"error":"unauthorized"}')
                 if gateway.ready():
                     return self.send(200, b'{"ready":true}')
                 return self.send(503, b'{"ready":false}')
@@ -426,8 +480,11 @@ def make_handler(gateway: Gateway):
             if self.path != "/mcp":
                 return self.send(404, b"{}")
             if not gateway.allowed(self.headers.get("Authorization")):
+                audit("auth_failure", logging.WARNING, status=401)
                 return self.send(401, b'{"error":"unauthorized"}')
             if self.headers.get("Transfer-Encoding"):
+                audit("request_rejected", logging.WARNING, status=400,
+                      code="invalid_request_size")
                 return self.send(400, b'{"error":"invalid request size"}')
             lengths = self.headers.get_all("Content-Length") or []
             if len(lengths) != 1:
@@ -447,10 +504,16 @@ def make_handler(gateway: Gateway):
             try:
                 session, result = gateway.rpc(session, body)
             except GatewayError as exc:
+                audit("request_rejected", logging.WARNING,
+                      status=exc.status, code=exc.code)
                 return self.send(*_json_error(exc.status, exc.code))
             except (ValueError, json.JSONDecodeError):
+                audit("request_rejected", logging.WARNING,
+                      status=400, code="invalid_request")
                 return self.send(400, b'{"error":"invalid MCP request"}')
-            except Exception:
+            except Exception as exc:
+                audit("internal_error", logging.ERROR,
+                      error_type=type(exc).__name__)
                 return self.send(500, b'{"error":"internal_error"}')
             self.send(200, result, session)
 
@@ -494,7 +557,9 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         parser.error(str(exc))
     os.umask(0o077)
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     gateway.start()
+    audit("gateway_started", host=args.host, port=args.port)
     server: GatewayServer | None = None
     worker: threading.Thread | None = None
     stop = threading.Event()

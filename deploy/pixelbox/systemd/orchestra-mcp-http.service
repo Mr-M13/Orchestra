@@ -6,11 +6,14 @@ Conflicts=shutdown.target
 
 [Service]
 Type=simple
+WorkingDirectory=/opt/orchestra/current
 User=orchestra-mcp-http
 Group=orchestra-mcp
 EnvironmentFile=/etc/orchestra/mcp-http.env
 Environment=PYTHONDONTWRITEBYTECODE=1
-# Exercise the same identity that reads the token and connects to the socket.
+Environment=PYTHONPATH=/opt/orchestra/current
+# Exercise the same identity and module path used by the service.
+ExecStartPre=/usr/bin/python3 -c "import omcp.http_gateway"
 ExecStartPre=/usr/bin/test -r /etc/orchestra/mcp-http.env
 ExecStartPre=/usr/bin/test -S /run/orchestra/omcp.sock
 ExecStart=/usr/bin/python3 -m omcp.http_gateway --socket /run/orchestra/omcp.sock --socket-owner hamed --socket-group orchestra-mcp --host 127.0.0.1 --port 8090
@@ -42,6 +45,9 @@ RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_UNIX AF_INET
 IPAddressDeny=any
 IPAddressAllow=127.0.0.1/32
+# systemd >= 249: the gateway may bind only its reviewed loopback listener.
+SocketBindDeny=any
+SocketBindAllow=inet:8090
 
 [Install]
 WantedBy=multi-user.target
