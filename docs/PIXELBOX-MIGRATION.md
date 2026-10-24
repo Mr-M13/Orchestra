@@ -464,12 +464,13 @@ Activation is refused unless the host is Linux ARM64 and the reviewed PixelBox
 paths and service user are in use. Static broker configuration and ownership
 validation completes before any systemd state changes. The installer then
 installs units that point at `/opt/orchestra/current`, replaces that symlink
-with one atomic rename, starts the broker, validates the coordinator against the
-live owner-checked socket, and only then restarts the coordinator and health
-timer. A failed activation restores the prior symlink and unit files and
-restarts the prior broker/coordinator. It does not touch Nextcloud, Docker,
-Tailscale, the Mac coordinator, or the tunnel. Enable the tunnel separately
-only after its profile is verified.
+with one atomic rename, restarts the coordinator and health timer, starts the
+gateway when the release includes it, and verifies an authenticated backend
+cycle before reporting success. A failed activation restores the prior symlink
+and unit files, re-enables and health-checks the prior gateway when applicable,
+and reports a hard failure if restoration is incomplete. It does not touch
+Nextcloud, Docker, Tailscale, the Mac coordinator, or the tunnel. Enable the
+tunnel separately only after its profile is verified.
 
 `--apply` stages and activates in one invocation for compatibility. If it
 creates templates or finds the dedicated broker config/token absent, it exits with status `3`

@@ -46,8 +46,12 @@ import re
 import sys
 from pathlib import Path
 
+raw = Path(sys.argv[1]).read_bytes()
+if b"\r" in raw:
+    raise SystemExit(1)
+text = raw.decode("utf-8")
 values = []
-for line in Path(sys.argv[1]).read_text().splitlines():
+for line in text.split("\n"):
     if not line or line.startswith("#"):
         continue
     if not line.startswith("ORCHESTRA_MCP_HTTP_TOKEN="):

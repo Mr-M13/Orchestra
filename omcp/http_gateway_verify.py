@@ -36,8 +36,12 @@ def _require(condition: bool, message: str) -> None:
 
 
 def read_token_file(path: Path) -> str:
+    raw = path.read_bytes()
+    if b"\r" in raw:
+        raise VerificationError("gateway environment must use LF line endings")
+    text = raw.decode("utf-8")
     values = []
-    for line in path.read_text().splitlines():
+    for line in text.split("\n"):
         if not line or line.startswith("#"):
             continue
         if not line.startswith("ORCHESTRA_MCP_HTTP_TOKEN="):

@@ -139,7 +139,7 @@ class InstallerSourceTests(unittest.TestCase):
 
     def test_stable_verifier_is_installed_independently_of_target_release(self):
         source = INSTALL.read_text()
-        self.assertIn('VERIFIER_PATH="$VERIFIER_ROOT/http_gateway_verify.py"', source)
+        self.assertIn('VERIFIER_PATH="${ORCHESTRA_VERIFIER_PATH:-$VERIFIER_ROOT/http_gateway_verify.py}"', source)
         installer = source[source.index("install_gateway_verifier()"):source.index("stage_configuration()")]
         self.assertIn("$SOURCE_ROOT/omcp/http_gateway_verify.py", installer)
         self.assertIn("$RELEASES_ROOT/$RELEASE_SHA/omcp/http_gateway_verify.py", installer)

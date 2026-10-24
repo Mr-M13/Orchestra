@@ -108,6 +108,11 @@ class GatewayVerifierTests(unittest.TestCase):
             path.write_text(" \nORCHESTRA_MCP_HTTP_TOKEN=" + "x" * 40 + "\n")
             with self.assertRaises(VerificationError):
                 read_token_file(path)
+            path.write_bytes(
+                b"ORCHESTRA_MCP_HTTP_TOKEN=" + b"x" * 40 + b"\r\n",
+            )
+            with self.assertRaises(VerificationError):
+                read_token_file(path)
 
 
 if __name__ == "__main__":

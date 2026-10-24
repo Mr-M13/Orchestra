@@ -16,7 +16,7 @@ STATE_ROOT="${ORCHESTRA_STATE_ROOT:-/home/hamed/orchestra-migration/state}"
 SERVICE_USER="${ORCHESTRA_SERVICE_USER:-hamed}"
 UNIT_ROOT="${ORCHESTRA_SYSTEMD_UNIT_ROOT:-/etc/systemd/system}"
 VERIFIER_ROOT="${ORCHESTRA_VERIFIER_ROOT:-/usr/local/lib/orchestra}"
-VERIFIER_PATH="$VERIFIER_ROOT/http_gateway_verify.py"
+VERIFIER_PATH="${ORCHESTRA_VERIFIER_PATH:-$VERIFIER_ROOT/http_gateway_verify.py}"
 RELEASES_ROOT="$INSTALL_ROOT/releases"
 CURRENT_LINK="$INSTALL_ROOT/current"
 PREVIOUS_LINK="$INSTALL_ROOT/previous"
@@ -246,11 +246,12 @@ install_environment_file() {
 }
 
 install_gateway_verifier() {
-  local candidate="$SOURCE_ROOT/omcp/http_gateway_verify.py"
-  if [[ ! -f "$candidate" ]]; then
-    candidate="$RELEASES_ROOT/$RELEASE_SHA/omcp/http_gateway_verify.py"
+  local candidate="$RELEASES_ROOT/$RELEASE_SHA/omcp/http_gateway_verify.py"
+  if [[ ! -s "$candidate" ]]; then
+    candidate="$SOURCE_ROOT/omcp/http_gateway_verify.py"
   fi
   [[ -f "$candidate" ]] || return 0
+  [[ -s "$candidate" ]] || fail "the HTTPS MCP verifier source is empty"
   command -v sha256sum >/dev/null || fail "sha256sum is required for the stable verifier"
   sudo install -d -m 0755 -o root -g root "$VERIFIER_ROOT"
   sudo install -m 0644 -o root -g root "$candidate" "$VERIFIER_PATH"
@@ -425,8 +426,12 @@ import re
 import sys
 from pathlib import Path
 
+raw = Path(sys.argv[1]).read_bytes()
+if b"\r" in raw:
+    raise SystemExit(1)
+text = raw.decode("utf-8")
 values = []
-for line in Path(sys.argv[1]).read_text().splitlines():
+for line in text.split("\n"):
     if not line or line.startswith("#"):
         continue
     if not line.startswith("ORCHESTRA_MCP_HTTP_TOKEN="):
@@ -454,7 +459,9 @@ wait_for_omcp_socket() {
 
 wait_for_gateway_health() {
   local attempt verifier_args=()
-  if [[ -f "$VERIFIER_PATH" ]]; then
+  if [[ -e "$VERIFIER_PATH" ]]; then
+    [[ -s "$VERIFIER_PATH" ]] \
+      || { echo "ERROR: stable verifier is empty" >&2; return 1; }
     [[ -f "$VERIFIER_PATH.sha256" ]] \
       || { echo "ERROR: stable verifier digest is missing" >&2; return 1; }
     [[ "$(cat "$VERIFIER_PATH.sha256")" == "$(sha256sum "$VERIFIER_PATH" | awk '{print $1}')" ]] \
