@@ -57,7 +57,7 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
         self.assertLess(staged_gate, daemon_reload)
         self.assertLess(daemon_reload, coordinator_config_gate)
         self.assertLess(coordinator_config_gate, coordinator_start)
-        self.assertNotIn("orchestra-github-dispatch.service", source)
+        self.assertIn("orchestra-github-dispatch.service", source)
         self.assertIn("--apply requires a Linux ARM64 host", source)
         self.assertIn("units use this path", source)
 

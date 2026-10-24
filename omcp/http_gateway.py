@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse, hmac, json, os, socket, threading, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from omcp.mcp_proxy import _validate_socket_path
 
 MAX = 4 * 1024 * 1024
 
@@ -20,13 +21,15 @@ class Gateway:
                 if session: raise PermissionError("MCP session already exists")
                 version = request.get("params", {}).get("protocolVersion") if isinstance(request.get("params"), dict) else None
                 if version != "2025-06-18": raise ValueError("unsupported MCP protocol version")
+                if len(self.sessions) >= 64: raise PermissionError("MCP session limit reached")
+                _validate_socket_path(self.path)
                 session = uuid.uuid4().hex
                 conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); conn.settimeout(10); conn.connect(str(self.path))
                 self.sessions[session] = {"socket": conn, "ready": False}
             if not session or session not in self.sessions: raise PermissionError("MCP session is not initialized")
             state = self.sessions[session]
             if method == "notifications/initialized":
-                state["ready"] = True; state["socket"].sendall(payload + b"\n"); return session, b"{}"
+                state["socket"].sendall(payload + b"\n"); state["ready"] = True; return session, b"{}"
             if not state["ready"] and method != "initialize": raise PermissionError("MCP session is not initialized")
             try:
                 conn = state["socket"]; conn.sendall(payload + b"\n")
@@ -35,6 +38,11 @@ class Gateway:
                     block = conn.recv(65536)
                     if not block: raise OSError("backend closed")
                     response += block
+                if method == "initialize":
+                    negotiated = json.loads(response).get("result", {}).get("protocolVersion")
+                    if negotiated != version:
+                        conn.close(); del self.sessions[session]
+                        raise ValueError("backend negotiated unsupported MCP protocol")
                 return session, response.rstrip()
             except OSError:
                 state["socket"].close(); del self.sessions[session]; raise
@@ -60,7 +68,8 @@ def make_handler(gateway: Gateway):
         def do_POST(self):
             if self.path != "/mcp": return self.send(404,b'{}')
             if not gateway.allowed(self.headers.get("Authorization")): return self.send(401,b'{"error":"unauthorized"}')
-            size=int(self.headers.get("Content-Length","0"))
+            try: size=int(self.headers.get("Content-Length","0"))
+            except ValueError: return self.send(400,b'{"error":"invalid request size"}')
             if size < 1 or size > MAX: return self.send(413,b'{"error":"invalid request size"}')
             try:
                 session, result = gateway.rpc(self.headers.get("Mcp-Session-Id"), self.rfile.read(size)); self.send(200,result,session)

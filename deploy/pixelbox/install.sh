@@ -309,7 +309,7 @@ preflight_activation() {
   command -v systemctl >/dev/null || fail "systemctl is required"
   [[ -x /usr/bin/python3 ]] || fail "/usr/bin/python3 is required by the systemd units"
   validate_release_tree "$release_root"
-  for file in omcp.json omcp.env tunnel.env; do
+  for file in omcp.json omcp.env tunnel.env mcp-http.env; do
     [[ -f "$CONFIG_ROOT/$file" ]] || fail "required owner configuration is missing: $CONFIG_ROOT/$file"
     mode="$(sudo stat -c '%a' "$CONFIG_ROOT/$file")"
     [[ "$mode" == "600" ]] || fail "$CONFIG_ROOT/$file must have mode 0600"
@@ -358,6 +358,9 @@ activate_release() {
       && sudo systemctl enable orchestra-omcp.service \
       && sudo systemctl enable --now orchestra-health.timer \
       && sudo systemctl restart orchestra-omcp.service \
+      && sudo systemctl enable orchestra-mcp-http.service \
+      && sudo systemctl restart orchestra-mcp-http.service \
+      && sudo systemctl is-active --quiet orchestra-mcp-http.service \
       && sudo systemctl is-active --quiet orchestra-omcp.service \
       && sudo systemctl is-active --quiet orchestra-health.timer; then
     if [[ -n "$old_sha" && "$old_sha" != "$RELEASE_SHA" ]]; then

@@ -16,6 +16,15 @@ PrivateNetwork=no
 ProtectSystem=strict
 ProtectHome=read-only
 ReadOnlyPaths=/home/hamed/orchestra-migration/state/mcp.sock
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+NoNewPrivileges=yes
 RestrictAddressFamilies=AF_UNIX AF_INET
 [Install]
 WantedBy=multi-user.target
