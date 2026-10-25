@@ -494,10 +494,27 @@ class GitHubActionsClient:
             f"{self.api_url}/repos/{self.repository}/actions/runs/{run_id}"
             if isinstance(run_id, int) and not isinstance(run_id, bool) else None
         )
-        if (not isinstance(run_id, int) or isinstance(run_id, bool) or run_id <= 0
-                or result.get("run_url") != expected_url):
-            raise GitHubActionsError("GitHub dispatch did not return a valid run identity")
-        return self.status(run_id, identity)
+        if (isinstance(run_id, int) and not isinstance(run_id, bool) and run_id > 0
+                and result.get("run_url") == expected_url):
+            return self.status(run_id, identity)
+
+        query = urllib.parse.urlencode({
+            "event": "workflow_dispatch", "branch": self.ref, "per_page": 100,
+        })
+        for attempt in range(6):
+            discovered = self._request("GET", self._workflow_path + "/runs?" + query)
+            runs = discovered.get("workflow_runs") if isinstance(discovered, dict) else None
+            matches = [
+                state for item in runs or []
+                if (state := self._run_state(item, identity)) is not None
+            ]
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                raise GitHubActionsError("GitHub dispatch matched multiple trusted runs")
+            if attempt < 5:
+                self.sleep(1)
+        raise GitHubActionsError("GitHub dispatch did not expose an exact trusted run")
 
     def _verify_protected_ref(self, source_sha: str) -> None:
         """Fail closed unless the configured branch is protected at its exact SHA."""
