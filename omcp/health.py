@@ -152,15 +152,21 @@ def _backup_check(config: Any, backup_dir: str | None) -> tuple[dict[str, Any], 
     path = Path(backup_dir).expanduser() if backup_dir else config.state_dir.parent / "backup"
     if not path.is_dir():
         return {"checked": False, "status": "not_configured"}, []
+    candidates: list[Path] = []
+    for pattern in ("state-*.tar.gz", "state-*.tar.gz.gpg", "orchestra-state-*.tar.gz"):
+        candidates.extend(path.glob(pattern))
     archives = [
-        item for item in path.glob("state-*.tar.gz")
+        item for item in candidates
         if item.is_file() and not item.is_symlink()
     ]
     if not archives:
+        # An owner may keep unrelated snapshots in this directory.  Do not
+        # claim a backup is healthy or failed when no reviewed state archive
+        # naming convention is present.
         return {
-            "checked": True, "ok": False, "status": "failed",
-            "reason": "no_archives", "path": str(path),
-        }, ["backup_archive_missing"]
+            "checked": False, "status": "unverified",
+            "reason": "no_recognized_state_archive", "path": str(path),
+        }, []
     newest = max(archives, key=lambda item: item.stat().st_mtime)
     age = max(0.0, time.time() - newest.stat().st_mtime)
     ok = age <= 7 * 86_400
