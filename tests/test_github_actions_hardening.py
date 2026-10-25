@@ -345,6 +345,30 @@ class HttpHardeningTests(unittest.TestCase):
         self.assertEqual([request.method for request in requests], ["GET", "POST"])
         self.assertIn("event=workflow_dispatch", requests[0].full_url)
 
+    def test_dispatch_discovers_exact_run_when_post_returns_no_identity(self):
+        identity = dispatch_identity()
+        exact = {"id": 41, "display_title": identity.run_name, "event": "workflow_dispatch", "head_sha": TASK_SHA, "head_branch": "main", "created_at": identity.dispatched_at, "path": ".github/workflows/orchestra-worker.yml", "run_attempt": 1, "actor": {"login": "orchestra-bot"}, "triggering_actor": {"login": "orchestra-bot"}, "status": "waiting", "conclusion": None, "html_url": "https://github.com/example/run/41"}
+        requests = []
+        responses = iter((
+            {"name": "main", "protected": True, "commit": {"sha": TASK_SHA}},
+            {"name": "orchestra-workers", "protection_rules": [{"type": "required_reviewers", "prevent_self_review": True, "reviewers": [{"type": "User"}]}], "deployment_branch_policy": {"protected_branches": True}},
+            {},
+            {"workflow_runs": [exact]},
+        ))
+        def opener(request, **_kwargs):
+            requests.append(request)
+            return Response(json.dumps(next(responses)).encode())
+        with tempfile.TemporaryDirectory() as directory:
+            token = Path(directory) / "token"
+            token.write_text("secret-token\n")
+            token.chmod(0o600)
+            state = GitHubActionsClient(
+                "owner/repo", "orchestra-worker.yml", "main", TASK_SHA, token,
+                dispatch_actor="orchestra-bot", opener=opener, sleep=lambda _s: None,
+            ).dispatch(identity, "codex", "gpt-5", "task")
+        self.assertEqual(state.run_id, exact["id"])
+        self.assertEqual([r.method for r in requests], ["GET", "GET", "POST", "GET"])
+
     def test_dispatch_fails_closed_for_unprotected_ref_before_post(self):
         requests = []
 
