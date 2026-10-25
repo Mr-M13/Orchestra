@@ -103,6 +103,7 @@ workspace = probe_root / "workspace"
 task_dir.mkdir(mode=0o700)
 workspace.mkdir(mode=0o700)
 
+sys.path.insert(0, str(root))
 from omcp.platform import SandboxPolicy, sandbox_command  # noqa: E402
 
 policy = SandboxPolicy(
