@@ -334,22 +334,38 @@ task-local `.orchestra-tmp` directory as writable for
 probe derive their rules from the same policy. A task matching this grant still
 has `network: false`, no external credentials and read-only Git metadata.
 
-### Local Codex worker boundary
+### Local worker boundary
 
-On Linux, the `systemd-user` launcher starts each non-DeepSeek local worker in
-a transient `orchestra-worker-<task-id>.service` under the service user's
-systemd manager. The coordinator unit keeps `RestrictSUIDSGID=yes`; the worker
-service deliberately sets `RestrictSUIDSGID=no`.
+On Linux, the `systemd-user` launcher starts every local worker (Codex,
+OpenCode, and the direct response-only DeepSeek adapter) in a transient
+`orchestra-worker-<task-id>.service` under the service user's systemd manager.
+The coordinator unit keeps `RestrictSUIDSGID=yes`; the worker service
+deliberately sets `RestrictSUIDSGID=no`.
 
 This is not a cosmetic removal. systemd implements `RestrictSUIDSGID=yes` with
 a seccomp filter that makes `openat2()` return `ENOSYS`, because seccomp cannot
 inspect openat2's flags. Bubblewrap 0.12 uses openat2 for safe path resolution,
-so Codex fails before its first model request with:
+so Codex or a direct DeepSeek runner fails before it can write a startup lease
+or worker log with:
 
 ```text
 bwrap: Can't mkdir parents for /: Function not implemented
 bwrap: Can't open source /: Function not implemented
 ```
+
+Before changing the launcher, reproduce this without a provider call:
+
+```sh
+cd /opt/orchestra/current
+./deploy/pixelbox/reproduce-worker-startup.sh --config /etc/orchestra/omcp.json
+```
+
+The probe builds the same DeepSeek Bubblewrap policy, substitutes
+`/usr/bin/true` for the Python runner, and runs it through transient user
+services with `RestrictSUIDSGID=yes` and `RestrictSUIDSGID=no`. It reads no
+credential content, opens no network connection and consumes no credits. The
+expected result is `REPRODUCED`: the restricted launch fails, the user-service
+launcher succeeds. The script prints only bounded, sanitized stderr.
 
 The worker service retains `ProtectSystem=strict`, `ProtectHome=read-only`,
 `PrivateTmp=yes`, `NoNewPrivileges=yes`, restricted address families,

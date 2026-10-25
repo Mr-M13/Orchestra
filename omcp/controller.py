@@ -10,6 +10,7 @@ import signal
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -57,6 +58,65 @@ OPENCODE_DIAGNOSTIC_CATEGORIES = {
     "tls", "unknown",
 }
 OPENCODE_EXIT_CAUSES = {"process_exit", "signal", "timeout"}
+# The launcher may fail before omcp.runner can create worker.log.  Keep a
+# bounded stderr capture for that window and expose only a fixed category.
+STARTUP_DIAGNOSTIC_LIMIT = 16 * 1024
+STARTUP_SETTLE_SECONDS = 0.05
+STARTUP_CATEGORIES = {
+    "sandbox_mount_failed", "sandbox_namespace_denied", "sandbox_openat2_unsupported",
+    "systemd_user_launcher_failed", "executable_missing", "permission_denied",
+    "no_startup_diagnostics", "unknown",
+}
+# Only these reviewed fragments become a public category.  Raw launcher output
+# may contain paths, environment values or provider text, so it is never stored
+# in task state, the audit log or the system journal.
+_STARTUP_DIAGNOSTIC_RULES = (
+    ((b"openat2", b"function not implemented"), "sandbox_openat2_unsupported"),
+    ((b"openat2", b"enosys"), "sandbox_openat2_unsupported"),
+    ((b"bwrap:", b"no permissions to create new namespace"), "sandbox_namespace_denied"),
+    ((b"bwrap:", b"creating new namespace failed"), "sandbox_namespace_denied"),
+    ((b"bwrap:", b"failed to unshare"), "sandbox_namespace_denied"),
+    ((b"bwrap:", b"can't open source"), "sandbox_mount_failed"),
+    ((b"bwrap:", b"can't mkdir parents"), "sandbox_mount_failed"),
+    ((b"failed to start transient service"), "systemd_user_launcher_failed"),
+    ((b"failed to connect to bus"), "systemd_user_launcher_failed"),
+    ((b"user manager", b"unavailable"), "systemd_user_launcher_failed"),
+    ((b"no such file or directory"), "executable_missing"),
+    ((b"executable file not found"), "executable_missing"),
+    ((b"permission denied"), "permission_denied"),
+)
+
+
+def classify_startup_diagnostics(path: Path | None) -> str:
+    """Return a fixed, non-sensitive category from bounded launcher stderr."""
+    if path is None:
+        return "no_startup_diagnostics"
+    try:
+        with path.open("rb") as diagnostic:
+            raw = diagnostic.read(STARTUP_DIAGNOSTIC_LIMIT)
+    except OSError:
+        return "no_startup_diagnostics"
+    lowered = raw.lower()
+    for fragments, category in _STARTUP_DIAGNOSTIC_RULES:
+        if all(fragment in lowered for fragment in fragments):
+            return category
+    return "unknown" if raw.strip() else "no_startup_diagnostics"
+
+
+def startup_failure(task: dict[str, Any], exit_code: int | None) -> dict[str, Any]:
+    """Build the bounded public failure record for a runner that never completed."""
+    raw_path = task.get("startup_log_path")
+    category = classify_startup_diagnostics(
+        Path(raw_path) if isinstance(raw_path, str) else None,
+    )
+    if category not in STARTUP_CATEGORIES:
+        category = "unknown"
+    failure: dict[str, Any] = {
+        "type": "runner_startup_failed", "category": category,
+    }
+    if exit_code is not None:
+        failure["exit_code"] = exit_code
+    return failure
 
 
 def utc_now() -> str:
@@ -807,6 +867,10 @@ class TaskController:
         self.heartbeat_path = config.state_dir / "heartbeat.json"
         self.started_at = utc_now()
         self._last_heartbeat = 0.0
+        # Retain the Popen handle until reconciliation.  Dropping it lets
+        # CPython's Popen.__del__ reap the child first, losing the exit status
+        # and turning an immediate startup failure into runner_disappeared.
+        self._children: dict[str, subprocess.Popen[Any]] = {}
         self.state = self._load()
         try:
             self._drain_legacy_github_runs()
@@ -965,7 +1029,11 @@ class TaskController:
         try:
             return self.state["tasks"][task_id]
         except KeyError:
-            raise KeyError("task not found") from None
+            raise KeyError(
+                "task not found in this coordinator state; "
+                "use list_tasks(status=...) to query durable terminal records "
+                "and compare bridge_status.state_dir with the active coordinator"
+            ) from None
 
     @staticmethod
     def _public(task: dict[str, Any]) -> dict[str, Any]:
@@ -1301,6 +1369,11 @@ class TaskController:
             counts[task["status"]] = counts.get(task["status"], 0) + 1
         default_profile = self.config.profile(None)
         result = {"service": "omcp", "status": "ok", "task_counts": counts,
+                  # Stable identity for diagnosing a lookup that reached a
+                  # different coordinator or state directory.
+                  "state_dir": str(self.config.state_dir),
+                  "coordinator_pid": os.getpid(),
+                  "coordinator_started_at": self.started_at,
                   "repository": default_profile.repository,
                   "task_approval_mode": self.config.task_approval_mode,
                   "active_tasks": sum(task["status"] in ACTIVE
@@ -1337,7 +1410,9 @@ class TaskController:
             raise ValueError("limit must be an integer from 1 to 500")
         tasks = [task for task in self.state["tasks"].values()
                  if status is None or task["status"] == status]
-        tasks.sort(key=lambda item: item["created_at"], reverse=True)
+        tasks.sort(
+            key=lambda item: (item["created_at"], item["task_id"]), reverse=True,
+        )
         result = [self._public(task) for task in tasks[:limit]]
         self._audit("task.list", None, "allowed", {"status": status, "count": len(result)})
         return {"tasks": result}
@@ -1657,6 +1732,9 @@ class TaskController:
                 break
             self._claim(task)
             self._start(task)
+            # Reconcile an immediately exiting child before the loop considers
+            # the next queued task, so a broken lane cannot consume two slots.
+            self.reconcile()
         self._heartbeat()
 
     def _next_runnable_task(self) -> dict[str, Any] | None:
@@ -1851,7 +1929,7 @@ class TaskController:
                         **diagnostic,
                     }
                 changed = True
-                self._reap_child(task.get("runner_pid"))
+                self._retire_task_child(task["task_id"], task.get("runner_pid"))
                 self._stop_worker_unit(task)
                 self._audit("task.complete", task["task_id"], "allowed", {"status": task["status"]})
                 continue
@@ -1909,40 +1987,95 @@ class TaskController:
                             task["failure"] = {"type": "startup_lease_expired"}
                         changed = True
             elif pid:
-                wait_status = self._reap_child(pid)
-                if wait_status is not None:
-                    cancelled = task["status"] == "cancel_requested"
-                    task.update({
-                        "status": "cancelled" if cancelled else "interrupted",
-                        "exit_code": os.waitstatus_to_exitcode(wait_status),
-                        "finished_at": utc_now(),
-                    })
-                    if not cancelled:
-                        task["failure"] = {"type": "runner_exited_without_completion"}
-                    self._release_reservation(task, task["finished_at"])
+                reaped, exit_code = self._reap_task_child(task)
+                if reaped:
+                    self._finish_runner_without_completion(task, exit_code)
                     changed = True
-                    self._stop_worker_unit(task)
-                    self._cancel_remote_if_actions(task)
-                    self._audit("task.reconcile", task["task_id"], "allowed", {
-                        "status": task["status"], "reason": "runner_reaped_without_completion",
-                    })
                     continue
                 try:
                     os.kill(int(pid), 0)
                 except ProcessLookupError:
-                    cancelled = task["status"] == "cancel_requested"
-                    task.update({"status": "cancelled" if cancelled else "interrupted",
-                                 "finished_at": utc_now()})
-                    if not cancelled:
-                        task["failure"] = {"type": "runner_disappeared"}
-                    self._release_reservation(task, task["finished_at"])
+                    # The process was already reaped outside this coordinator
+                    # (for example before a restart), so no exit status remains.
+                    # Keep a durable failure category instead of a bare
+                    # runner_disappeared state.
+                    self._finish_runner_without_completion(task, None)
                     changed = True
-                    self._reap_child(pid)
-                    self._stop_worker_unit(task)
-                    self._cancel_remote_if_actions(task)
-                    self._audit("task.reconcile", task["task_id"], "allowed", {"status": task["status"]})
         if changed:
             self._save()
+
+    @staticmethod
+    def _lease_present(task: dict[str, Any]) -> bool:
+        lease = task.get("startup_lease", {})
+        path = lease.get("path") if isinstance(lease, dict) else None
+        return isinstance(path, str) and Path(path).exists()
+
+    def _reap_task_child(self, task: dict[str, Any]) -> tuple[bool, int | None]:
+        """Return a retained Popen exit before falling back to waitpid."""
+        task_id = task["task_id"]
+        process = self._children.get(task_id)
+        if process is not None:
+            exit_code = process.poll()
+            if exit_code is None:
+                return False, None
+            self._children.pop(task_id, None)
+            return True, exit_code
+        wait_status = self._reap_child(task.get("runner_pid"))
+        if wait_status is None:
+            return False, None
+        return True, os.waitstatus_to_exitcode(wait_status)
+
+    def _retire_task_child(self, task_id: str, pid: int | None) -> None:
+        """Reap a completed task's child without leaving a zombie or handle."""
+        process = self._children.pop(task_id, None)
+        if process is None:
+            self._reap_child(pid)
+            return
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+    def _finish_runner_without_completion(
+        self, task: dict[str, Any], exit_code: int | None,
+    ) -> None:
+        """Make an exited runner terminal and release its scheduler slot."""
+        cancelled = task["status"] == "cancel_requested"
+        lease_present = self._lease_present(task)
+        task.update({
+            "status": "cancelled" if cancelled else "interrupted",
+            "finished_at": utc_now(),
+        })
+        if exit_code is not None:
+            task["exit_code"] = exit_code
+        if not cancelled:
+            task["failure"] = (
+                {
+                    "type": "runner_exited_without_completion",
+                    **({"exit_code": exit_code} if exit_code is not None else {}),
+                }
+                if lease_present
+                else startup_failure(task, exit_code)
+            )
+        self._release_reservation(task, task["finished_at"])
+        self._stop_worker_unit(task)
+        self._cancel_remote_if_actions(task)
+        self._audit("task.reconcile", task["task_id"], "allowed", {
+            "status": task["status"],
+            "reason": (
+                "runner_reaped_without_completion"
+                if lease_present else "runner_exited_before_startup_lease"
+            ),
+            "exit_code": exit_code,
+        })
 
     def _cancel_remote_if_actions(self, task: dict[str, Any]) -> None:
         worker = self.config.workers.get(task.get("worker"))
@@ -2019,6 +2152,7 @@ class TaskController:
             os.chmod(task_dir, 0o700)
             prompt_path = task_dir / "prompt.txt"
             log_path = task_dir / "worker.log"
+            startup_log_path = task_dir / "startup.log"
             result_path = task_dir / "result.txt"
             completion_path = task_dir / "completion.json"
             github_state_path = task_dir / "github-state.json"
@@ -2084,6 +2218,7 @@ class TaskController:
             task.update({
                 "workspace": str(workspace), "result_path": str(result_path),
                 "completion_path": str(completion_path), "log_path": str(log_path),
+                "startup_log_path": str(startup_log_path),
                 "requires_completion_contract": worker.adapter == "codex",
                 "requires_security_assertions": (
                     worker.adapter == "codex" and execution_capabilities is not None
@@ -2126,8 +2261,12 @@ class TaskController:
                 runner_environment["PYTHONDONTWRITEBYTECODE"] = "1"
             runner_environment["GIT_TERMINAL_PROMPT"] = "0"
             worker_unit: str | None = None
-            if (worker.adapter not in {"deepseek", "github_actions"}
+            if (worker.adapter != "github_actions"
                     and self.config.local_worker_launcher == "systemd-user"):
+                # Direct provider adapters embed their own Bubblewrap command.
+                # They need the same transient user-service context as Codex so
+                # the coordinator's RestrictSUIDSGID seccomp filter does not
+                # break Bubblewrap's openat2 path resolution.
                 runner_command, worker_unit, _ = systemd_user_worker_command(
                     runner_command, task_id=task_id, task_dir=task_dir,
                     workspace=workspace, git_metadata_paths=tuple(git_metadata_paths),
@@ -2137,12 +2276,30 @@ class TaskController:
                     max_worker_seconds=self.config.max_worker_seconds,
                     environment=runner_environment,
                 )
-            proc = self.popen(
-                runner_command,
-                cwd=Path(__file__).resolve().parent.parent, env=runner_environment,
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True, close_fds=True,
+            startup_descriptor = os.open(
+                startup_log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600,
             )
+            try:
+                proc = self.popen(
+                    runner_command,
+                    cwd=Path(__file__).resolve().parent.parent, env=runner_environment,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=startup_descriptor,
+                    start_new_session=True, close_fds=True,
+                )
+            finally:
+                os.close(startup_descriptor)
+            if isinstance(proc, subprocess.Popen):
+                # Own the handle before any other code can drop the reference.
+                self._children[task_id] = proc
+                # A launcher mismatch normally exits almost immediately.  This
+                # bounded settle lets the same tick reconcile its real status
+                # instead of scheduling a dead task and reporting a generic
+                # disappearance on the next heartbeat.
+                try:
+                    proc.wait(timeout=STARTUP_SETTLE_SECONDS)
+                except subprocess.TimeoutExpired:
+                    pass
             task.update({
                 "status": "running", "runner_pid": proc.pid, "started_at": utc_now(),
             })
@@ -2151,6 +2308,7 @@ class TaskController:
             try:
                 self._save()
             except Exception:
+                self._children.pop(task_id, None)
                 self._stop_worker_unit(task)
                 try:
                     os.killpg(proc.pid, signal.SIGTERM)
@@ -2158,6 +2316,7 @@ class TaskController:
                     pass
                 raise
         except Exception as exc:
+            self._children.pop(task_id, None)
             finished_at = utc_now()
             self._release_reservation(task, finished_at)
             task.update({"status": "failed", "finished_at": finished_at,
