@@ -63,6 +63,7 @@ class TrustedProbeCommandTests(unittest.TestCase):
                 patch("omcp.trusted_probe.subprocess.run", side_effect=fake_run):
             checks = trusted_probe.run_trusted_security_probe(
                 self.workspace, self.state, self.task_id, ("platform",), (),
+                writable_files=("dashboard/system.py",),
             )
         self.assertEqual(set(checks), set(worker_contract.REQUIRED_SECURITY_CHECKS))
         command = calls[0][0]
@@ -78,6 +79,12 @@ class TrustedProbeCommandTests(unittest.TestCase):
         self.assertIn("--property=ReadWritePaths=" + str(self.workspace), command)
         self.assertIn("permissions.orchestra-routine.network.enabled=false", command)
         self.assertIn("permissions.orchestra-routine.filesystem./etc/orchestra=\"deny\"", command)
+        self.assertIn(
+            'permissions.orchestra-routine.filesystem.:workspace_roots={'
+            '"."="read",".orchestra-tmp"="write","platform"="write",'
+            '"dashboard/system.py"="write"}',
+            command,
+        )
         self.assertIn("--report", command)
         self.assertIn("-", command)
         self.assertFalse((self.workspace / ".orchestra-tmp").exists())
@@ -112,6 +119,7 @@ class TrustedProbeCommandTests(unittest.TestCase):
     def test_worker_and_probe_share_the_same_policy_arguments(self):
         policy = RoutineConfinementPolicy(
             ("platform", "theme"), ("/tmp/owner-checkout",),
+            writable_files=("dashboard/system.py",),
             network_enabled=False, deny_orchestra_config=True,
         )
         worker = policy.worker_command("/usr/bin/codex", self.workspace, self.base / "result")

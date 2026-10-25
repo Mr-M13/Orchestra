@@ -7,7 +7,8 @@ import unittest
 from pathlib import Path
 
 from omcp.routine_paths import (
-    UnsafeWritablePath, materialize_writable_paths, normalize_writable_path,
+    UnsafeWritablePath, materialize_writable_files, materialize_writable_paths,
+    normalize_writable_file, normalize_writable_path,
 )
 
 
@@ -27,6 +28,26 @@ class RoutinePathValidationTests(unittest.TestCase):
         ):
             with self.subTest(value=value), self.assertRaises(UnsafeWritablePath):
                 normalize_writable_path(value)
+
+    def test_accepts_exact_safe_files(self):
+        for value, expected in (
+            ("dashboard/system.py", "dashboard/system.py"),
+            ("dashboard/app.py", "dashboard/app.py"),
+            ("dashboard/static/system.js", "dashboard/static/system.js"),
+            ("dashboard/README.md", "dashboard/README.md"),
+            ("single.py", "single.py"),
+        ):
+            self.assertEqual(normalize_writable_file(value), expected)
+
+    def test_rejects_unsafe_files_and_directories_masquerading_as_files(self):
+        for value in (
+            "", " ", "/etc/passwd", "../outside.py", "dashboard/../outside.py",
+            "dashboard/.git/config", ".git/config", ".codex/config",
+            "dashboard/a b.py", "dashboard/a;b.py", "dashboard/a\\b.py",
+            "dashboard/subdir/", ".orchestra-tmp/file.py",
+        ):
+            with self.subTest(value=value), self.assertRaises(UnsafeWritablePath):
+                normalize_writable_file(value)
 
 
 class RoutinePathMaterializationTests(unittest.TestCase):
@@ -91,6 +112,52 @@ class RoutinePathMaterializationTests(unittest.TestCase):
         linked_workspace.symlink_to(self.outside, target_is_directory=True)
         with self.assertRaisesRegex(UnsafeWritablePath, "real directory"):
             materialize_writable_paths(linked_workspace, ["tests"])
+
+    def test_file_grants_create_only_parents_and_leave_files_to_the_worker(self):
+        paths = materialize_writable_files(
+            self.workspace,
+            ["dashboard/system.py", "dashboard/static/system.js"],
+        )
+        self.assertEqual(len(paths), 2)
+        self.assertTrue((self.workspace / "dashboard").is_dir())
+        self.assertTrue((self.workspace / "dashboard/static").is_dir())
+        self.assertFalse((self.workspace / "dashboard/system.py").exists())
+        self.assertFalse((self.workspace / "dashboard/static/system.js").exists())
+        (self.workspace / "dashboard/system.py").write_text("allowed\n")
+        self.assertEqual(
+            (self.workspace / "dashboard/system.py").read_text(), "allowed\n",
+        )
+        self.assertFalse((self.workspace / "dashboard/other.py").exists())
+
+    def test_file_grants_accept_existing_regular_files_and_reject_symlinks_and_dirs(self):
+        dashboard = self.workspace / "dashboard"
+        dashboard.mkdir()
+        target = dashboard / "system.py"
+        target.write_text("keep\n")
+        self.assertEqual(
+            materialize_writable_files(self.workspace, ["dashboard/system.py"]),
+            (target.resolve(),),
+        )
+        self.assertEqual(target.read_text(), "keep\n")
+
+        link = dashboard / "app.py"
+        link.symlink_to(self.outside / "outside.py")
+        with self.assertRaisesRegex(UnsafeWritablePath, "symlink"):
+            materialize_writable_files(self.workspace, ["dashboard/app.py"])
+
+        (dashboard / "README.md").mkdir()
+        with self.assertRaisesRegex(UnsafeWritablePath, "regular file"):
+            materialize_writable_files(self.workspace, ["dashboard/README.md"])
+
+    def test_file_grants_reject_symlinked_parent_and_traversal(self):
+        link = self.workspace / "dashboard"
+        link.symlink_to(self.outside, target_is_directory=True)
+        with self.assertRaisesRegex(UnsafeWritablePath, "symlink"):
+            materialize_writable_files(self.workspace, ["dashboard/system.py"])
+        self.assertEqual(list(self.outside.iterdir()), [])
+        for value in ("../outside.py", "dashboard/../../outside.py", "/tmp/outside.py"):
+            with self.subTest(value=value), self.assertRaises(UnsafeWritablePath):
+                materialize_writable_files(self.workspace, [value])
 
 
 if __name__ == "__main__":

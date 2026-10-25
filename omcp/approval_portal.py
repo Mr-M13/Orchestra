@@ -9,9 +9,11 @@ import hmac
 import html
 import http.cookies
 import ipaddress
+import json
 import os
 import secrets
 import ssl
+import stat
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -32,21 +34,41 @@ def owner_state_dir(path: Path) -> Path:
 
 
 def ensure_owner_secret(path: Path) -> str:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(path.parent, 0o700)
+    """Read or create the owner-only portal token without weakening a mount.
+
+    A service unit may expose the state directory read-only.  An existing token
+    is therefore validated in place rather than chmod-ed on every start.  A
+    missing token is created atomically with mode 0600 when the directory is
+    writable; otherwise startup fails closed.
+    """
+    parent = path.parent
+    if parent.exists():
+        if parent.is_symlink() or not parent.is_dir():
+            raise PermissionError("approval token directory must be a real directory")
+        metadata = parent.stat()
+        if metadata.st_mode & 0o077 or metadata.st_uid != os.getuid():
+            raise PermissionError("approval token directory must be owner-only")
+    else:
+        parent.mkdir(parents=True, mode=0o700)
+        os.chmod(parent, 0o700)
     try:
-        value = path.read_text().strip()
+        metadata = path.lstat()
     except FileNotFoundError:
         value = secrets.token_hex(32)
         temporary = path.with_suffix(path.suffix + ".tmp")
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             os.write(fd, (value + "\n").encode())
             os.fsync(fd)
         finally:
             os.close(fd)
         temporary.replace(path)
-    os.chmod(path, 0o600)
+    else:
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise PermissionError("approval token must be a regular file")
+        if metadata.st_uid != os.getuid() or metadata.st_mode & 0o777 != 0o600:
+            raise PermissionError("approval token must be owner-only (mode 0600)")
+        value = path.read_text().strip()
     if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
         raise ValueError("approval portal token must be a 32-byte lowercase hex value")
     return value
@@ -188,8 +210,28 @@ def make_handler(
             else:
                 controls = f"<div class=\"card\"><strong>No decision is available.</strong> Current status: {html.escape(str(details.get('status')))}. <a href=\"/history\">View approval history</a>.</div>"
             notice = f"<div class=\"card\">{html.escape(message)}</div>" if message else ""
+            authority = details.get("authorization") if isinstance(details.get("authorization"), dict) else {}
+            capabilities = details.get("execution_capabilities")
+            authority_lines = [
+                "Mode: " + str(authority.get("mode", "unclassified")),
+                "Standing authorisation: " + str(authority.get("authorization_id") or "none"),
+                "Repository: " + str(details.get("repository") or "unknown"),
+                "Profile / base ref: " + str(details.get("repository_profile") or "unknown") + " / " + str(details.get("base_ref") or "unknown"),
+                "Worker: " + str(details.get("worker") or "unknown"),
+                "Consequence: " + str(details.get("consequence_class") or "unclassified"),
+            ]
+            if capabilities is not None:
+                authority_lines.append("Execution capabilities: " + json.dumps(
+                    capabilities, sort_keys=True, separators=(",", ":"), default=str,
+                ))
+            else:
+                authority_lines.append(
+                    "Execution capabilities: no standing grant; explicit approval "
+                    "uses the normal isolated-worktree worker profile."
+                )
+            authority_html = html.escape("\n".join(authority_lines))
             body = f"""{notice}<div class="card"><h2>{html.escape(str(details.get('title', 'Task approval')))}</h2><div class="meta">{meta_html}</div></div>
-<div class="card risk"><h2>Risk and authority</h2><p>{html.escape(_risk_summary(details))}</p></div>
+<div class="card risk"><h2>Risk and authority</h2><p>{html.escape(_risk_summary(details))}</p><pre>{authority_html}</pre></div>
 <div class="card"><h2>Complete instructions</h2><pre>{html.escape(str(details.get('instructions', '')))}</pre></div>{controls}"""
             self._send_page(200, "Orchestra approval", body)
 
@@ -257,9 +299,12 @@ def make_handler(
                 self._send_page(403, "Forbidden", "<div class=\"card\">Invalid decision token.</div>")
                 return
             decision = form.get("decision", [""])[0]
-            reason = form.get("reason", [""])[0]
+            reason = form.get("reason", [""])[0].strip()
             if decision not in {"approve", "reject"}:
                 self._send_page(400, "Invalid decision", "<div class=\"card\">Decision must be approve or reject.</div>")
+                return
+            if not reason or len(reason) > 1000:
+                self._send_page(400, "Invalid decision", "<div class=\"card\">A reason of 1-1000 characters is required.</div>")
                 return
             try:
                 result = local_request(state_dir, {

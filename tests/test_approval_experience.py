@@ -32,6 +32,15 @@ def pending_task():
         "status": "approval_required",
         "created_at": "2026-10-12T00:00:00+00:00",
         "consequence_class": "security_change",
+        "authorization": {"mode": "explicit"},
+        "execution_capabilities": {
+            "profile": "routine_development_v1",
+            "writable_paths": ["tests"],
+            "writable_files": ["dashboard/system.py"],
+            "network": False,
+            "external_credentials": False,
+            "git_metadata": "read_only",
+        },
         "approval": {
             "status": "pending",
             "requested_at": "2026-10-12T00:00:00+00:00",
@@ -170,6 +179,27 @@ class PortalAuthTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
 
+    def test_existing_owner_secret_is_readable_without_chmod_for_read_only_units(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state" / "portal.token"
+            first = ensure_owner_secret(path)
+            with patch("omcp.approval_portal.os.chmod", side_effect=AssertionError("chmod not allowed")):
+                self.assertEqual(ensure_owner_secret(path), first)
+            path.chmod(0o644)
+            with self.assertRaisesRegex(PermissionError, "0600"):
+                ensure_owner_secret(path)
+
+    def test_owner_secret_rejects_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state" / "portal.token"
+            path.parent.mkdir(mode=0o700)
+            target = Path(directory) / "target"
+            target.write_text("00" * 32)
+            target.chmod(0o600)
+            path.symlink_to(target)
+            with self.assertRaisesRegex(PermissionError, "regular file"):
+                ensure_owner_secret(path)
+
     def test_portal_requires_owner_only_state_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
@@ -225,6 +255,9 @@ class ApprovalPortalHTTPTests(unittest.TestCase):
         self.assertIn("Inspect all changes and run tests.", page)
         self.assertIn("Mr-M13/Orchestra", page)
         self.assertIn("security boundary", page)
+        self.assertIn("Mode: explicit", page)
+        self.assertIn("Execution capabilities", page)
+        self.assertIn("dashboard/system.py", page)
 
     def test_csrf_protected_approval_uses_local_resolution(self):
         page = self.opener.open(
@@ -252,6 +285,26 @@ class ApprovalPortalHTTPTests(unittest.TestCase):
             ))
         self.assertEqual(context.exception.code, 403)
         self.assertEqual(len(self.decisions), 1)
+
+    def test_reason_is_required_server_side(self):
+        page = self.opener.open(
+            self.base + f"/bootstrap/{self.token}/task/{TASK_ID}"
+        ).read().decode()
+        marker = 'name="csrf" value="'
+        csrf = page.split(marker, 1)[1].split('"', 1)[0]
+        for reason in ("", "   ", "x" * 1001):
+            with self.subTest(reason_length=len(reason)):
+                data = urllib.parse.urlencode({
+                    "csrf": csrf, "decision": "approve", "reason": reason,
+                }).encode()
+                with self.assertRaises(urllib.error.HTTPError) as context:
+                    self.opener.open(urllib.request.Request(
+                        self.base + f"/task/{TASK_ID}/decision", data=data,
+                        method="POST",
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    ))
+                self.assertEqual(context.exception.code, 400)
+        self.assertEqual(self.decisions, [])
 
 
 if __name__ == "__main__":

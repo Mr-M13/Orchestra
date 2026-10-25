@@ -109,6 +109,50 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
             containing = coordinator if "codex" in optional else tunnel
             self.assertIn("ReadWritePaths=-" + optional, containing)
 
+    def test_dashboard_and_approval_portal_units_are_loopback_only_and_hardened(self):
+        dashboard = (DEPLOY / "systemd" / "orchestra-dashboard.service").read_text()
+        portal = (DEPLOY / "systemd" / "orchestra-approval-portal.service").read_text()
+        install = (DEPLOY / "install.sh").read_text()
+        for unit, port in ((dashboard, "8082"), (portal, "8767")):
+            self.assertIn("User=hamed", unit)
+            self.assertIn("NoNewPrivileges=yes", unit)
+            self.assertIn("ProtectSystem=strict", unit)
+            self.assertIn("ProtectHome=read-only", unit)
+            self.assertIn("ReadOnlyPaths=/home/hamed/orchestra-migration/state", unit)
+            self.assertIn("RestrictAddressFamilies=AF_UNIX AF_INET", unit)
+            self.assertIn("CapabilityBoundingSet=", unit)
+            self.assertIn("AmbientCapabilities=", unit)
+            self.assertNotIn("--allow-remote", unit)
+        self.assertIn("ORCHESTRA_DASHBOARD_PORT=8082", dashboard)
+        self.assertNotIn("APPROVAL_STATE_DIR", dashboard)
+        self.assertNotIn("APPROVER_IDENTITY", dashboard)
+        self.assertIn("--listen-host 127.0.0.1 --listen-port 8767", portal)
+        self.assertIn("approval-portal.token", portal)
+        self.assertNotIn("ReadWritePaths", portal)
+        self.assertIn("orchestra-dashboard.service", install)
+        self.assertIn("orchestra-approval-portal.service", install)
+
+    def test_dashboard_standing_authorization_template_is_exact_and_not_auto_installed(self):
+        import json
+        fragment = json.loads(
+            (DEPLOY / "omcp.dashboard-development.example.json").read_text()
+        )
+        self.assertEqual(set(fragment["repository_profiles"]), {"orchestra-dashboard"})
+        template = fragment["standing_authorizations"][0]
+        self.assertEqual(template["repository_profiles"], ["orchestra-dashboard"])
+        self.assertEqual(template["workers"], ["ina"])
+        self.assertEqual(template["writable_paths"], [])
+        self.assertEqual(template["writable_files"], [
+            "dashboard/app.py", "dashboard/system.py",
+            "dashboard/static/system.js", "dashboard/README.md",
+        ])
+        example = json.loads((DEPLOY / "omcp.example.json").read_text())
+        self.assertNotIn(
+            template["id"],
+            {item.get("id") for item in example.get("standing_authorizations", [])},
+        )
+        self.assertNotIn("orchestra-dashboard", example["repository_profiles"])
+
     def test_bubblewrap_isolates_namespaces_and_clears_service_environment(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)

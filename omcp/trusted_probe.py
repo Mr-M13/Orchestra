@@ -129,6 +129,7 @@ def run_trusted_security_probe(
     workspace: Path, state_dir: Path, task_id: str,
     writable_paths: tuple[str, ...], read_only_paths: tuple[str, ...],
     read_write_paths: tuple[str, ...] = (), *,
+    writable_files: tuple[str, ...] = (),
     policy: RoutineConfinementPolicy | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Run the probe under the exact routine policy and validate its evidence."""
@@ -140,6 +141,7 @@ def run_trusted_security_probe(
         policy = RoutineConfinementPolicy(
             tuple(writable_paths),
             tuple(dict.fromkeys((*read_only_paths, str(probe_root)))),
+            writable_files=tuple(writable_files),
         )
     elif str(probe_root) not in policy.read_only_paths:
         raise TrustedProbeError("trusted probe root is not in the shared policy")

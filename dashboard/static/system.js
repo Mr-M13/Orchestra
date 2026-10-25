@@ -7,27 +7,78 @@
   var button = document.getElementById("refresh-system");
   var status = document.getElementById("system-updated");
   var lastUpdated = "";
-  function set(key, value) {
-    document.getElementById("system-" + key).textContent = value;
+  function node(key) { return document.getElementById("system-" + key); }
+  function set(key, value) { node(key).textContent = value; }
+  function label(value) {
+    if (value === "up") return "up";
+    if (value === "down") return "down";
+    if (value === "healthy") return "healthy";
+    if (value === "reachable") return "reachable";
+    if (value === "unhealthy") return "unhealthy";
+    return "unavailable";
   }
-  function bytes(value) { return (value / 1073741824).toFixed(1) + " GiB"; }
-  function usage(value) {
-    return value ? bytes(value.used_bytes) + " used / " + bytes(value.total_bytes) : "Unavailable";
+  function stateList(values) {
+    return Object.keys(values || {}).map(function (key) {
+      return key + ": " + label(values[key]);
+    }).join("\n") || "Unavailable";
   }
+  function storage(value, fallback) {
+    if (!value || value.text === "Unavailable") return fallback || "Unavailable";
+    var parts = [value.text];
+    if (value.percent !== null && value.percent !== undefined) parts.push(value.percent + "% used");
+    if (value.online === false) parts.push("offline");
+    return parts.join(" · ");
+  }
+  function count(value) { return value === null || value === undefined ? "unavailable" : value; }
   function render(data) {
-    var m = data.metrics;
-    set("load", m.load ? m.load.join(" / ") + " (1 / 5 / 15 min), " + (m.cpu_count || "unknown") + " CPUs" : "Unavailable");
-    set("memory", usage(m.memory));
-    set("disk", usage(m.disk));
-    set("uptime", m.uptime_seconds === null ? "Unavailable" : (m.uptime_seconds / 3600).toFixed(1) + " hours");
-    set("temperature", m.temperature_c === null ? "Unavailable" : m.temperature_c + " °C");
-    set("services", Object.keys(data.services).map(function (key) { return key + ": " + data.services[key]; }).join("\n"));
-    var docker = data.docker;
-    set("docker", docker.state === "available" ? docker.running + " / " + docker.containers + " containers running; Nextcloud " + docker.nextcloud_running + " / " + docker.nextcloud_containers + " running" : "Unavailable (no access or Docker absent)");
-    set("public", data.public.host + ": " + data.public.state + (data.public.http_status ? " (HTTP " + data.public.http_status + ")" : ""));
-    set("tailscale", data.tailscale.state + (data.tailscale.addresses.length ? " · " + data.tailscale.addresses.join(", ") : ""));
-    lastUpdated = data.generated_at;
-    status.textContent = "Collected " + lastUpdated + " · cached up to 30 seconds";
+    var pixelbox = data.pixelbox || {};
+    var system = pixelbox.system || {};
+    var photo = pixelbox.photo || {};
+    var mbox = data.mbox || {};
+    var publicHealth = data.public || {};
+    if (data.state !== "available") {
+      set("pixelbox", "PixelBox status unavailable (fixed loopback GET /api/status did not respond).");
+      set("photo", "Unavailable");
+      set("photo-timers", "Unavailable");
+      set("photo-recent", "Unavailable");
+      set("mbox", "Unavailable");
+      set("nextcloud", "Unavailable");
+      set("pixelbox-services", "Unavailable");
+      set("orchestra-services", "Unavailable");
+    } else {
+      var temperature = system.temperature_c === null || system.temperature_c === undefined
+        ? "temperature unavailable" : system.temperature_c + " °C";
+      set("pixelbox", "Health: " + (pixelbox.health || "Unavailable") +
+        " · Uptime: " + (system.uptime || "Unavailable") +
+        " · Load: " + (system.load || "Unavailable") +
+        " · Memory: " + (system.memory || "Unavailable") +
+        " · CPU: " + temperature +
+        " · Root disk: " + storage(system.storage) +
+        " · Tailscale: " + label(system.tailscale));
+      set("photo", "Connected: " + label(photo.connected) +
+        " · Waiting: " + count(photo.waiting) +
+        " · Queued: " + count(photo.queued) +
+        " · Verifying: " + count(photo.verifying) +
+        " · Backed up: " + count(photo.backed_up) +
+        " · Photo DB: " + label(photo.db_available) +
+        " · Pixel storage: " + storage(photo.storage));
+      set("photo-timers", stateList(photo.timers));
+      set("photo-recent", (photo.recent || []).map(function (item) {
+        return (item.event_at || "Unknown time") + " · " + (item.status || "Unknown status");
+      }).join("\n") || "No recent photo events");
+      set("mbox", "HDD: " + (mbox.hdd || "Unavailable") +
+        " · Storage: " + storage(mbox.storage) +
+        " · Nextcloud: " + (mbox.nextcloud || "Unavailable"));
+      set("nextcloud", "State: " + (data.nextcloud && data.nextcloud.state || "Unavailable") +
+        " · Docker container: " + label(data.nextcloud && data.nextcloud.docker));
+      set("pixelbox-services", stateList(pixelbox.services));
+      set("orchestra-services", stateList(data.orchestra_services));
+    }
+    set("public", (publicHealth.host || "mcp.delnavazan.com") + ": " +
+      label(publicHealth.state) +
+      (publicHealth.http_status ? " (HTTP " + publicHealth.http_status + ")" : ""));
+    lastUpdated = data.generated_at || "";
+    status.textContent = "Collected " + (lastUpdated || "unknown time") + " · cached up to 30 seconds";
   }
   function refresh() {
     if (busy || document.hidden) return;

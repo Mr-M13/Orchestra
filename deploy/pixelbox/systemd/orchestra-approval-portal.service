@@ -1,0 +1,40 @@
+[Unit]
+Description=Orchestra owner-only local approval portal
+Documentation=file:/opt/orchestra/current/docs/OMCP.md
+After=network-online.target orchestra-omcp.service
+Wants=network-online.target
+Requires=orchestra-omcp.service
+Conflicts=shutdown.target
+
+[Service]
+Type=simple
+User=hamed
+Group=hamed
+WorkingDirectory=/opt/orchestra/current
+Environment=PYTHONPATH=/opt/orchestra/current
+# The state directory is mounted read-only.  The token must already exist as a
+# 0600 owner-only file; the portal validates it in place without chmod.
+ExecStartPre=/usr/bin/test -f /home/hamed/orchestra-migration/state/approval-portal.token
+ExecStart=/usr/bin/python3 -B -m omcp.approval_portal --state-dir /home/hamed/orchestra-migration/state --listen-host 127.0.0.1 --listen-port 8767 --token-path /home/hamed/orchestra-migration/state/approval-portal.token
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+UMask=0077
+
+# The portal binds only to loopback and uses the existing owner-only Unix
+# approval capability.  It never exposes the socket or token over the network.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=/opt/orchestra/current
+ReadOnlyPaths=/home/hamed/orchestra-migration/state
+RestrictAddressFamilies=AF_UNIX AF_INET
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

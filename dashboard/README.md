@@ -35,30 +35,54 @@ only terminal history. The dashboard never reads OMCP state files directly.
 
 ## Deployment status
 
-The current `deploy/pixelbox` assets stage the coordinator, tunnel, health and
-approval services only. They do not install this dashboard or create an OMCP
-Unix socket for it. Until an owner approves a dedicated loopback dashboard
-service and socket, the dashboard remains a manually operated local service and
-must not be exposed through a public port.
+The repository includes `deploy/pixelbox/systemd/orchestra-dashboard.service`,
+which binds the dashboard to `127.0.0.1:8082` with read-only host views and no
+approval authority. It also includes
+`deploy/pixelbox/systemd/orchestra-approval-portal.service`, which binds the
+separate owner approval portal to `127.0.0.1:8767`. `install.sh` copies unit
+files during an approved release activation, but does not enable or restart
+either unit. Enabling them is a separate owner-approved operation. The legacy
+PixelBox dashboard on `127.0.0.1:8080` remains in place and is not retired by
+this checkout.
+
+Cloudflare Access is only the outer access boundary for the public dashboard.
+The dashboard deliberately does not accept approval decisions or trust
+forwarded identity headers, so it never turns that boundary into approval
+authority.
 
 ## High-risk approval decisions
 
 Routine-development work follows OMCP's configured automatic policy. Protected
-tasks remain pending. To display working Approve and Reject controls, start the
-dashboard only as the trusted local approver with both values below configured
-by its owner-controlled service launcher:
+tasks remain pending. The public dashboard is read-only for approvals: it lists
+pending tasks and explains where to review them, but renders no Approve or
+Reject form and exposes no `/tasks/<id>/approval` action.
+
+Approval decisions use the existing, separate owner-authenticated local portal
+in `omcp/approval_portal.py`. Start it only on loopback with a pre-created
+owner-only token and the owner-only OMCP state directory; the repository unit
+does this for `127.0.0.1:8767`. The portal:
+
+- binds loopback only and calls the existing owner-only Unix approval socket;
+- requires a bootstrap session established from an owner-only token, with a
+  short-lived signed session cookie;
+- displays complete instructions, risk, requested authority/capabilities,
+  repository, worker, consequence, expiry and a required reason;
+- enforces CSRF, expiry, self-approval rejection and audit in the existing
+  coordinator; and
+- never exposes the socket, token, or a web approval RPC to the tunnel.
+
+Access it from an owner-controlled client through an authenticated SSH tunnel:
 
 ```sh
-ORCHESTRA_DASHBOARD_APPROVAL_STATE_DIR=/owner-only/omcp-state
-ORCHESTRA_DASHBOARD_APPROVER_IDENTITY=local:dashboard:owner
+ssh -N -L 8767:127.0.0.1:8767 hamed@<pixelbox-tailscale-host>
+# then open the bootstrap URL with the token read from the owner-only state file
 ```
 
-The dashboard then calls the existing owner-only local approval socket and
-capability token server-side. It never exposes that token to a browser and does
-not add an OMCP approval RPC. Do not enable these values unless the dashboard is
-behind an independently authenticated private access boundary; it deliberately
-does not trust forwarded identity headers. Without both values, approvals are
-read-only and remain available through OMCP's existing local approval interface.
+Do not put the bootstrap token in chat, logs, a browser bookmark or the public
+dashboard. Do not expose port 8767 through Cloudflare, Tailscale Serve, or a
+reverse proxy. The token file must already exist with mode `0600`; the systemd
+unit mounts the state directory read-only and fails closed if it is missing or
+unsafe.
 
 ## V1 integration gaps
 
@@ -71,58 +95,43 @@ The smallest future addition would be a read-only `task_submission_preview`
 tool accepting the same bounded submit fields and returning only the server's
 policy decision and structured execution capabilities.
 
-OMCP exposes no network approval RPC. Dashboard controls, when explicitly
-configured as above, use the existing local human approval channel.
+OMCP exposes no network approval RPC. The dashboard deliberately exposes no
+approval controls; the separate loopback approval portal uses the existing local
+human approval channel.
 
 ## Unified PixelBox home
 
-The existing home page now includes a read-only system overview alongside the
-unchanged Orchestra workers, task groups and task controls. The overview also
-loads when OMCP is unavailable. `GET /api/system` is independent of OMCP and uses
-`no-store`, CSP, MIME-sniffing protection, frame denial and no-referrer headers.
-Other methods receive 405. It inherits the dashboard's existing private access
-boundary; it does not add authentication or permit public binding.
+The home page includes a read-only overview of PixelBox, the photo pipeline,
+Mbox storage, Nextcloud, existing PixelBox and Orchestra services, Tailscale and
+public MCP health, alongside the unchanged Orchestra workers, task groups and
+task controls. The overview also loads when OMCP is unavailable.
+
+`GET /api/system` is independent of OMCP and uses `no-store`, CSP,
+MIME-sniffing protection, frame denial and no-referrer headers. Other methods
+receive 405. It inherits the dashboard's private access boundary; it does not
+add authentication or permit public binding.
+
+PixelBox data comes only from the exact legacy loopback endpoint
+`GET http://127.0.0.1:8080/api/status`, with:
+
+- a fixed host, port and path, no query parameters and no redirect following;
+- a 2.5-second total deadline and a 128 KiB response cap enforced while reading;
+- JSON/object validation and an explicit allowlisted field projection;
+- no Docker, sudo, systemctl, shell or legacy POST control invocation; and
+- omission of internal URLs, service names outside the allowlist, unknown timer
+  names and original photo filenames.
+
+Public MCP health is a separate fixed `GET https://mcp.delnavazan.com/healthz`
+request with certificate verification, no redirect following, a 2.5-second
+deadline and a 4 KiB cap. Only the status code is retained. 2xx is healthy,
+3xx/4xx reachable (including authentication gates), and 5xx unhealthy; this does
+not prove origin, Cloudflare configuration or tunnel health.
 
 The browser refreshes the overview every 30 seconds while visible, with a manual
-refresh button and explicit unavailable/stale states. The server caches samples
-for 30 seconds. Metrics describe the dashboard host: CPU count and 1/5/15-minute
-load averages (not instantaneous CPU utilisation), memory, root filesystem disk
-usage, uptime and a recognised CPU thermal zone when accessible. Missing OS
-interfaces and sensors display unavailable.
-
-`dashboard/system.py` is the only collector. It reads bounded fixed `/proc` and
-CPU thermal paths and filesystem usage, and permits exactly four executable/argv
-tuples with absolute `/usr/bin` paths:
-
-- `systemctl show` for the eight named services, selecting only unit ID, load
-  state and active state. Missing/inaccessible units are unavailable.
-- `sudo -n /usr/bin/docker container ls --all --format` with a fixed
-  state/image projection. The API publishes
-  aggregate counts and counts for images whose basename is `nextcloud`, never
-  names, image strings, labels, mounts, logs, inspect data or environment values.
-  Nextcloud container state is not an application health check.
-- `tailscale status --json`, projecting only recognised backend state and up to
-  eight validated local IP addresses. Peer identities and login URLs are dropped.
-- A credential-free HTTPS GET request to `https://mcp.delnavazan.com/healthz` with curl
-  config disabled, no proxy, no redirects, certificate verification and short
-  connection/total timeouts. Only the HTTP status is retained. 2xx is healthy,
-  3xx/4xx reachable (including authentication gates), and 5xx unhealthy. This does
-  not prove origin, Cloudflare configuration or tunnel health.
-
-Every child runs without a shell, with closed input, discarded stderr, a minimal
-fixed environment and no inherited credentials or CLI configuration. Each probe
-has a 2.5-second deadline and a 64 KiB output cap enforced while reading; failure,
-excess output or denied access becomes unavailable. Executable paths and arguments
-cannot be supplied through HTTP. Samples contain selected numbers, enums and
-validated addresses rather than raw probe output. Browser rendering uses
-`textContent`; existing server rendering continues to HTML-escape task data.
-
-Run with existing host permissions only. The Docker probe uses one exact
-non-interactive sudo argv tuple; no other sudo command is permitted. Do not change
-sudoers, groups, Docker socket access, service permissions or credentials for this
-dashboard; denied access is an expected unavailable result. There are no host/service/container
-control endpoints or configuration writes. Deployment and infrastructure assets
-are unchanged.
+refresh button and explicit unavailable/stale states. The server caches the
+validated sample for 30 seconds. Browser rendering uses `textContent`; server
+rendering continues to HTML-escape task data. There are no host, service,
+container, storage or configuration control endpoints.
 
 Validation (repository root):
 
@@ -131,5 +140,6 @@ PYTHONPATH=.:tests TMPDIR=/tmp python3 -m unittest test_dashboard.DashboardTests
 node --test tests/test_dashboard_polling.js tests/test_dashboard_system.js
 ```
 
-The broader `test_dashboard.OMCPClientTests` includes real Unix-socket integration
-tests and requires an environment that permits local socket binding.
+The broader `test_dashboard.OMCPClientTests` includes real Unix-socket
+integration tests and requires an environment that permits local socket
+binding.

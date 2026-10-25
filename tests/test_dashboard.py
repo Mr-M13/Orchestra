@@ -28,6 +28,7 @@ class FakeOMCP:
     def __init__(self, offline: bool = False) -> None:
         self.offline = offline
         self.calls = []
+        self.approvals = []
         self.task = {
             "task_id": TASK_ID, "title": "<script>alert(1)</script>", "worker": "Ina",
             "repository_profile": "Delnavazan", "status": "running",
@@ -82,7 +83,7 @@ class FakeOMCP:
         if tool == "list_tasks":
             return {"tasks": [self.task]}
         if tool == "list_approvals":
-            return {"approvals": []}
+            return {"approvals": self.approvals}
         if tool == "task_status":
             return self.task
         if tool == "task_result":
@@ -92,15 +93,6 @@ class FakeOMCP:
         if tool == "cancel_task":
             return {**self.task, "status": "cancel_requested"}
         raise AssertionError(tool)
-
-
-class FakeApproval:
-    def __init__(self):
-        self.calls = []
-
-    def resolve(self, task_id, decision, reason):
-        self.calls.append((task_id, decision, reason))
-        return {"task_id": task_id, "status": "accepted"}
 
 
 def request(app, path="/", method="GET", form="", content_length=None, body=None):
@@ -277,26 +269,49 @@ class DashboardTests(unittest.TestCase):
         self.assertTrue(seen["status"].startswith("303"))
         self.assertEqual(client.calls[-1], ("cancel_task", {"task_id": TASK_ID, "reason": "Stop"}))
 
-    def test_dashboard_approval_uses_only_configured_local_approval_client(self):
-        client = FakeOMCP()
-        client.task["status"] = "approval_required"
-        approval = FakeApproval()
-        app = Dashboard(client, approval)
-        _, page = request(app, "/tasks/" + TASK_ID)
-        self.assertIn("Approve", page)
-        form = f"csrf={app.csrf_token}&decision=approve&reason=Owner+reviewed"
-        seen, _ = request(app, "/tasks/" + TASK_ID + "/approval", "POST", form)
-        self.assertTrue(seen["status"].startswith("303"))
-        self.assertEqual(approval.calls, [(TASK_ID, "approve", "Owner reviewed")])
+    def test_dashboard_source_has_no_web_approval_environment_or_route(self):
+        source = Path(__file__).resolve().parents[1] / "dashboard" / "app.py"
+        text = source.read_text()
+        self.assertNotIn("ORCHESTRA_DASHBOARD_APPROVAL_STATE_DIR", text)
+        self.assertNotIn("ORCHESTRA_DASHBOARD_APPROVER_IDENTITY", text)
+        self.assertNotIn('/approval"', text)
+        self.assertNotIn("approval_client", text)
 
-    def test_unconfigured_dashboard_cannot_resolve_approval(self):
+    def test_public_dashboard_never_renders_web_approval_controls(self):
         client = FakeOMCP()
         client.task["status"] = "approval_required"
         app = Dashboard(client)
         _, page = request(app, "/tasks/" + TASK_ID)
-        self.assertIn("configured local approval interface", page)
+        self.assertIn("does not accept approval decisions", page)
+        self.assertIn("owner-only local approval portal", page)
+        self.assertIn("127.0.0.1:8767", page)
+        self.assertNotIn('name="decision"', page)
+        self.assertNotIn(f'action="/tasks/{TASK_ID}/approval"', page)
         seen, _ = request(app, "/tasks/" + TASK_ID + "/approval", "POST", "")
         self.assertTrue(seen["status"].startswith("404"))
+
+    def test_approvals_page_is_read_only_and_explains_the_local_boundary(self):
+        client = FakeOMCP()
+        client.approvals = [{
+            "task_id": APPROVAL_ID, "title": "Needs review", "worker": "Ina",
+            "status": "approval_required", "created_at": NOW,
+        }]
+        app = Dashboard(client)
+        _, page = request(app, "/approvals")
+        self.assertIn("No approval controls are available", page)
+        self.assertIn("ssh -N -L 8767:127.0.0.1:8767", page)
+        self.assertIn("Needs review", page)
+        self.assertNotIn('name="decision"', page)
+        self.assertNotIn("Approve", page)
+        self.assertNotIn("Reject", page)
+        self.assertEqual(client.calls[-1], ("list_approvals", {}))
+
+    def test_home_approval_badge_links_to_the_read_only_approvals_page(self):
+        client = FakeOMCP()
+        app = Dashboard(client)
+        _, page = request(app, "/")
+        self.assertIn('href="/approvals"', page)
+        self.assertIn("waiting for approval", page)
 
     def test_malformed_task_ids_are_not_sent_to_omcp(self):
         for path, method in (

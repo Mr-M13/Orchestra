@@ -363,7 +363,8 @@ install_units() {
     stop_gateway_or_fail
   fi
   for unit in orchestra-omcp.service orchestra-github-dispatch.service orchestra-tunnel.service \
-              orchestra-health.service orchestra-health.timer; do
+              orchestra-health.service orchestra-health.timer \
+              orchestra-dashboard.service orchestra-approval-portal.service; do
     if sudo test -f "$release_root/deploy/pixelbox/systemd/$unit"; then
       sudo install -m 0644 "$release_root/deploy/pixelbox/systemd/$unit" \
         "$UNIT_ROOT/$unit"

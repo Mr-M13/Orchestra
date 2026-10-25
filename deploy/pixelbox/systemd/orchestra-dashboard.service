@@ -1,0 +1,40 @@
+[Unit]
+Description=Orchestra unified dashboard (PixelBox)
+Documentation=file:/opt/orchestra/current/dashboard/README.md
+After=network-online.target orchestra-omcp.service
+Wants=network-online.target
+Requires=orchestra-omcp.service
+Conflicts=shutdown.target
+
+[Service]
+Type=simple
+User=hamed
+Group=hamed
+WorkingDirectory=/opt/orchestra/current
+Environment=PYTHONPATH=/opt/orchestra/current
+Environment=ORCHESTRA_OMCP_SOCKET=/run/orchestra/omcp.sock
+Environment=ORCHESTRA_DASHBOARD_HOST=127.0.0.1
+Environment=ORCHESTRA_DASHBOARD_PORT=8082
+ExecStart=/usr/bin/python3 -B -m dashboard.app
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+UMask=0077
+
+# Read-only monitoring only.  The dashboard never receives approval authority,
+# Docker/sudo access, or a writable repository checkout.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=/opt/orchestra/current
+ReadOnlyPaths=/home/hamed/orchestra-migration/state
+RestrictAddressFamilies=AF_UNIX AF_INET
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
