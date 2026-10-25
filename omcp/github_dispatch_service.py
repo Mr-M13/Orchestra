@@ -229,7 +229,10 @@ class DispatchClient:
         finally:
             connection.close()
         if response.get("ok") is not True:
-            raise GitHubActionsError("GitHub dispatch broker rejected the request")
+            error_type = response.get("error_type")
+            if not isinstance(error_type, str) or not error_type.isidentifier() or len(error_type) > 80:
+                error_type = "unknown"
+            raise GitHubActionsError(f"GitHub dispatch broker rejected the request ({error_type})")
         return response.get("result")
 
     def dispatch(self, identity: DispatchIdentity, agent: str, model: str,
@@ -387,10 +390,11 @@ class DispatchService:
                         result = self.handle(request)
                         _send(connection, {"ok": True, "result": result},
                               MAX_RESPONSE_BYTES)
-                    except Exception:
-                        # Never reflect request content, GitHub bodies, or secrets.
+                    except Exception as exc:
+                        # Return only the exception class for bounded diagnostics;
+                        # never reflect exception text, request content, GitHub bodies, or secrets.
                         try:
-                            _send(connection, {"ok": False}, MAX_RESPONSE_BYTES)
+                            _send(connection, {"ok": False, "error_type": type(exc).__name__}, MAX_RESPONSE_BYTES)
                         except Exception:
                             pass
         finally:
