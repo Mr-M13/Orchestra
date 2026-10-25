@@ -557,6 +557,7 @@ class GitHubActionsClient:
     def _run_state_for_name(
         self, run: object, run_name: str, dispatched_at: str,
         *, require_current_head: bool, require_first_attempt: bool,
+        require_creation_window: bool = True,
     ) -> RunState | None:
         if not isinstance(run, dict):
             return None
@@ -592,7 +593,8 @@ class GitHubActionsClient:
         except ValueError:
             return None
         dispatched = _parse_utc(dispatched_at)
-        if not dispatched - RUN_CREATION_SKEW <= created <= dispatched + RUN_CREATION_WINDOW:
+        if (require_creation_window
+                and not dispatched - RUN_CREATION_SKEW <= created <= dispatched + RUN_CREATION_WINDOW):
             return None
         run_id = run.get("id")
         if not isinstance(run_id, int) or isinstance(run_id, bool):
@@ -627,7 +629,11 @@ class GitHubActionsClient:
         result = self._request(
             "GET", f"/repos/{self.repository}/actions/runs/{int(run_id)}",
         )
-        state = self._run_state(result, identity)
+        state = self._run_state_for_name(
+            result, identity.run_name, identity.dispatched_at,
+            require_current_head=True, require_first_attempt=True,
+            require_creation_window=False,
+        )
         if state is None or state.run_id != int(run_id):
             raise GitHubActionsError("invalid GitHub Actions run response")
         return state
