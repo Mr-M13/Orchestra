@@ -8,7 +8,7 @@ import sys
 import tempfile
 import unittest
 import zlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -692,7 +692,66 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(report["status"], "ok")
         self.assertTrue(report["checks"]["state"]["ok"])
         self.assertEqual(report["checks"]["sandbox"]["backend"], "bubblewrap")
+        self.assertEqual(report["checks"]["dashboard"]["status"], "unchecked")
+        self.assertEqual(report["checks"]["mcp_gateway"]["status"], "unchecked")
         self.assertNotIn("instructions", json.dumps(report))
+
+    def test_health_surfaces_stale_and_startup_failures_without_task_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "project"
+            root.mkdir()
+            codex = base / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            state = base / "state"
+            state.mkdir(mode=0o700)
+            old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+            now = datetime.now(timezone.utc).isoformat()
+            (state / "state.json").write_text(json.dumps({
+                "schema_version": 1,
+                "requests": {},
+                "scheduler": {"last_repository": None},
+                "tasks": {
+                    "11111111-1111-1111-1111-111111111111": {
+                        "task_id": "11111111-1111-1111-1111-111111111111",
+                        "status": "accepted", "created_at": old, "worker": "ina",
+                        "instructions": "private task content",
+                    },
+                    "22222222-2222-2222-2222-222222222222": {
+                        "task_id": "22222222-2222-2222-2222-222222222222",
+                        "status": "failed", "created_at": now, "finished_at": now,
+                        "worker": "ina", "failure": {"type": "runner_startup_failed"},
+                        "instructions": "private task content",
+                    },
+                },
+            }))
+            (state / "state.json").chmod(0o600)
+            (state / "audit.jsonl").write_text("")
+            (state / "audit.jsonl").chmod(0o600)
+            (state / "heartbeat.json").write_text(json.dumps({
+                "pid": os.getpid(),
+                "last_tick": now,
+                "active_tasks": 0, "execution_limit": 2,
+            }))
+            config_path = base / "omcp.json"
+            config_path.write_text(json.dumps({
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(state), "workers": {"ina": {"command": ["codex"]}},
+                "principal": {"identity": "chatgpt:test", "permissions": ["status:read"]},
+            }))
+            config_path.chmod(0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)), \
+                    patch("omcp.platform.sandbox_executable", return_value="/usr/bin/bwrap"), \
+                    patch("omcp.platform.host_platform", return_value="linux"):
+                report = collect_health(config_path)
+        self.assertEqual(report["status"], "degraded")
+        for warning in (
+            "stale_accepted_tasks", "runner_startup_failures",
+            "failed_tasks_present",
+        ):
+            self.assertIn(warning, report["warnings"])
+        self.assertNotIn("private task content", json.dumps(report))
 
 
 if __name__ == "__main__":
