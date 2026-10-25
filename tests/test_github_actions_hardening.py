@@ -662,6 +662,19 @@ class DispatchBrokerBoundaryTests(unittest.TestCase):
             service.handle(request)
         service.github.dispatch.assert_not_called()
 
+    def test_dispatch_api_returns_json_serializable_run(self):
+        service = self.service()
+        service.github.dispatch.return_value = RunState(41, "waiting", None, "https://github.com/example/run/41")
+        result = service.handle(self.request(
+            "dispatch", agent="codex", model="gpt-5-codex",
+            instructions="bounded task",
+        ))
+        self.assertEqual(result, {
+            "run_id": 41, "status": "waiting", "conclusion": None,
+            "url": "https://github.com/example/run/41",
+        })
+        json.dumps({"ok": True, "result": result})
+
     def test_dispatch_api_enforces_model_allowlist(self):
         service = self.service()
         with self.assertRaisesRegex(ValueError, "not allowlisted"):
