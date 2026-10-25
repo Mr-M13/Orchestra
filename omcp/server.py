@@ -213,18 +213,21 @@ class MCPServer:
                 "isError": True,
             })
 
-    def _start_auxiliary(self) -> tuple[LocalApprovalServer, threading.Thread]:
-        local_approval = LocalApprovalServer(self.controller, self.controller_lock)
-        local_approval.start()
+    def _start_auxiliary(self) -> tuple[LocalApprovalServer | None, threading.Thread]:
+        local_approval = None
+        if self.controller.config.task_approval_mode != "disabled":
+            local_approval = LocalApprovalServer(self.controller, self.controller_lock)
+            local_approval.start()
         ticker = threading.Thread(target=self._tick_loop, name="omcp-reconciler", daemon=True)
         ticker.start()
         return local_approval, ticker
 
-    def _stop_auxiliary(self, local_approval: LocalApprovalServer,
+    def _stop_auxiliary(self, local_approval: LocalApprovalServer | None,
                         ticker: threading.Thread) -> None:
         self.stop_event.set()
         ticker.join(timeout=2)
-        local_approval.stop()
+        if local_approval is not None:
+            local_approval.stop()
 
     def _stdio_response(self, line: str, session: "MCPSession") -> dict[str, Any] | None:
         try:

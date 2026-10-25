@@ -1119,6 +1119,16 @@ class TaskController:
             raise ValueError("the server approval policy is mandatory and cannot be disabled by the caller")
         if consequence_class not in CONSEQUENCE_CLASSES:
             raise ValueError("unknown consequence_class")
+        if (self.config.task_approval_mode == "disabled"
+                and consequence_class != "routine_development"):
+            self._audit("task.submit", None, "denied", {
+                "reason": "autonomous_mode_requires_routine_development",
+                "consequence_class": consequence_class,
+            })
+            raise ValueError(
+                "autonomous mode accepts only routine_development tasks; "
+                "other classes are rejected without human approval"
+            )
         standing_authorization = self.config.standing_authorization(
             consequence_class, profile.profile_id, worker,
         )
@@ -1136,13 +1146,12 @@ class TaskController:
             return {**self._public(previous), "acknowledged": True, "idempotent_replay": True}
         task_id = self.id_factory()
         now = utc_now()
-        # A missing classification is consequential, not routine. Direct
-        # provider egress also always needs a fresh local decision.
-        requires_explicit_approval = self.config.workers[worker].adapter == "deepseek"
+        # Autonomous mode only accepts an explicitly routine classification.
+        # Direct DeepSeek is response-only and therefore uses the same bounded,
+        # non-interactive scheduling policy as the other configured workers.
         approvals_disabled = (
             self.config.task_approval_mode == "disabled"
             and consequence_class == "routine_development"
-            and not requires_explicit_approval
         )
         status = "accepted" if standing_authorization or approvals_disabled else "approval_required"
         task = {
@@ -1209,6 +1218,14 @@ class TaskController:
     ) -> dict[str, Any]:
         """Queue one built-in host operation; no command or arguments cross the MCP boundary."""
         self._authorize("host_operations:submit", "host_operation.submit")
+        if self.config.task_approval_mode == "disabled":
+            self._audit("host_operation.submit", None, "denied", {
+                "reason": "host_operations_unavailable_in_autonomous_mode",
+            })
+            raise ValueError(
+                "host operations are unavailable in autonomous mode; "
+                "they are rejected rather than awaiting human approval"
+            )
         if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id):
             raise ValueError("request_id must be 1-128 safe characters")
         operations = self.config.host_operations or {}
@@ -1597,14 +1614,23 @@ class TaskController:
             self._expire_pending_approvals()
             return
         now = utc_now()
-        changed_task_ids: list[str] = []
+        changed_tasks: list[tuple[str, str]] = []
         for task in self.state["tasks"].values():
             if task.get("status") != "approval_required":
                 continue
             if (task.get("kind") == "host_operation"
-                    or task.get("consequence_class") != "routine_development"
-                    or self.config.workers[task["worker"]].adapter == "deepseek"):
-                self._expire_approval(task)
+                    or task.get("consequence_class") != "routine_development"):
+                task["status"] = "rejected"
+                task["finished_at"] = now
+                task["authorization"] = {
+                    "mode": "automatic_rejection",
+                    "policy": "autonomous_mode_requires_routine_development",
+                }
+                task["approval"] = {
+                    "status": "not_required", "decided_at": now,
+                    "decided_by": "policy:autonomous_mode",
+                }
+                changed_tasks.append((task["task_id"], "rejected"))
                 continue
             task["status"] = "accepted"
             task["authorization"] = {
@@ -1614,11 +1640,11 @@ class TaskController:
                 "status": "not_required", "decided_at": now,
                 "decided_by": "policy:task_approvals_disabled",
             }
-            changed_task_ids.append(task["task_id"])
-        if changed_task_ids:
+            changed_tasks.append((task["task_id"], "accepted"))
+        if changed_tasks:
             self._save()
-            for task_id in changed_task_ids:
-                self._audit("approval.bypass", task_id, "allowed", {
+            for task_id, outcome in changed_tasks:
+                self._audit("approval.bypass", task_id, outcome, {
                     "policy": "task_approvals_disabled",
                 })
 
