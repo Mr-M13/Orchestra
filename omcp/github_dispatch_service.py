@@ -232,7 +232,10 @@ class DispatchClient:
             error_type = response.get("error_type")
             if not isinstance(error_type, str) or not error_type.isidentifier() or len(error_type) > 80:
                 error_type = "unknown"
-            raise GitHubActionsError(f"GitHub dispatch broker rejected the request ({error_type})")
+            error_code = response.get("error_code")
+            if error_code not in {"run_not_discovered", "multiple_runs", "invalid_run_response", "other"}:
+                error_code = "unknown"
+            raise GitHubActionsError(f"GitHub dispatch broker rejected the request ({error_type}:{error_code})")
         return response.get("result")
 
     def dispatch(self, identity: DispatchIdentity, agent: str, model: str,
@@ -394,7 +397,12 @@ class DispatchService:
                         # Return only the exception class for bounded diagnostics;
                         # never reflect exception text, request content, GitHub bodies, or secrets.
                         try:
-                            _send(connection, {"ok": False, "error_type": type(exc).__name__}, MAX_RESPONSE_BYTES)
+                            safe_codes = {
+                                "GitHub dispatch did not expose an exact trusted run": "run_not_discovered",
+                                "GitHub dispatch matched multiple trusted runs": "multiple_runs",
+                                "invalid GitHub Actions run response": "invalid_run_response",
+                            }
+                            _send(connection, {"ok": False, "error_type": type(exc).__name__, "error_code": safe_codes.get(str(exc), "other")}, MAX_RESPONSE_BYTES)
                         except Exception:
                             pass
         finally:
