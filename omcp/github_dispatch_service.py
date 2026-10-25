@@ -320,7 +320,7 @@ class DispatchService:
             instructions = request.get("instructions")
             if not isinstance(instructions, str):
                 raise ValueError("instructions must be text")
-            return self.github.dispatch(identity, agent, model, instructions)
+            return _run_json(self.github.dispatch(identity, agent, model, instructions))
         run_id = request.get("run_id")
         if not isinstance(run_id, int) or isinstance(run_id, bool) or run_id <= 0:
             raise ValueError("run_id is invalid")
