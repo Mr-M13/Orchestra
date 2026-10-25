@@ -569,6 +569,8 @@ activate_release() {
       && sudo systemctl enable orchestra-omcp.service \
       && sudo systemctl enable --now orchestra-health.timer \
       && sudo systemctl restart orchestra-omcp.service \
+      && sudo systemctl restart orchestra-github-dispatch.service \
+      && sudo systemctl is-active --quiet orchestra-github-dispatch.service \
       && { ! release_has_gateway_unit "$release_root" || wait_for_omcp_socket; } \
       && { ! release_has_gateway_unit "$release_root" || { sudo systemctl enable orchestra-mcp-http.service && sudo systemctl restart orchestra-mcp-http.service && sudo systemctl is-active --quiet orchestra-mcp-http.service; }; } \
       && { ! release_has_gateway_unit "$release_root" || { wait_for_gateway_health && sudo systemctl is-active --quiet orchestra-mcp-http.service; }; } \
@@ -589,6 +591,8 @@ activate_release() {
     sudo systemctl daemon-reload
     sudo systemctl restart orchestra-omcp.service \
       || fail "activation failed and the prior coordinator could not restart"
+    sudo systemctl restart orchestra-github-dispatch.service \
+      || fail "activation failed and the prior GitHub dispatch broker could not restart"
     sudo systemctl start orchestra-health.timer \
       || fail "activation failed and the prior health timer could not restart"
     if release_has_gateway_unit "$old_root"; then
