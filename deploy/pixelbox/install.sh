@@ -172,6 +172,7 @@ validate_release_tree() {
     .github/workflows/orchestra-worker.yml \
     deploy/pixelbox/install.sh \
     deploy/pixelbox/verify.sh \
+    deploy/pixelbox/reproduce-worker-startup.sh \
     deploy/pixelbox/systemd/orchestra-omcp.service; do
     sudo test -r "$release_root/$required" \
       || fail "staged release is missing reviewed file: $required"
@@ -189,6 +190,7 @@ validate_release_tree() {
     || fail "staged release content differs from its validated digest"
   bash -n "$release_root/deploy/pixelbox/install.sh"
   bash -n "$release_root/deploy/pixelbox/verify.sh"
+  bash -n "$release_root/deploy/pixelbox/reproduce-worker-startup.sh"
   if [[ -r "$release_root/deploy/pixelbox/verify_mcp_http.sh" ]]; then
     bash -n "$release_root/deploy/pixelbox/verify_mcp_http.sh"
   fi

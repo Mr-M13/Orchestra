@@ -29,6 +29,10 @@ starts the tunnel or touches unrelated host services.
 - `verify.sh` — read-only staging checks by default; `--live` makes missing or
   inactive installed services, tunnel health, platform, and exact active SHA a
   failure.
+- `reproduce-worker-startup.sh` — credit-free, `/usr/bin/true` reproduction of
+  the Bubblewrap-versus-`RestrictSUIDSGID` startup failure using the configured
+  DeepSeek filesystem policy. It reads no credential contents and opens no
+  provider connection.
 - `verify_mcp_http.sh` — read-only live check for the loopback HTTP gateway. It
   reads the token as the gateway identity without printing it, verifies the
   loopback-only listener, and runs authenticated initialize/tools/delete cycles.

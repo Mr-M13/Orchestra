@@ -320,6 +320,117 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.popen.call_args.args[0][0], "/usr/bin/systemd-run")
         launch.assert_called_once()
 
+    def _deepseek_controller(self, **overrides):
+        self.controller.close()
+        credential = Path(self.temp.name) / "deepseek-key"
+        credential.write_text("test-key-not-used\n")
+        os.chmod(credential, 0o600)
+        config = Config(
+            "owner/repo", self.root, self.state, "origin/main",
+            {"deepseek": Worker(
+                "deepseek", (), adapter="deepseek", provider="deepseek",
+                model="deepseek/deepseek-chat",
+                credential_file=str(credential), endpoint_host="api.deepseek.com",
+            )},
+            Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+            **overrides,
+        )
+        self.controller = TaskController(
+            config, popen=self.popen, workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: "11111111-1111-1111-1111-111111111111",
+        )
+        submitted = self.controller.submit_task(
+            "deepseek-request", "DeepSeek task", "Respond without editing",
+            "deepseek", True, None, "routine_development",
+        )
+        self.controller.resolve_approval(
+            submitted["task_id"], "approve", "approved",
+            approver_identity="local:test-operator",
+        )
+        return submitted["task_id"]
+
+    def test_systemd_user_launcher_is_used_for_direct_deepseek_worker(self):
+        unit = "orchestra-worker-11111111-1111-1111-1111-111111111111"
+        launch = Mock(return_value=(
+            ["/usr/bin/systemd-run", "--user", "--unit=" + unit], unit, self.root,
+        ))
+        with patch("omcp.controller.deepseek_runner_command",
+                   return_value=["/usr/bin/bwrap", "--", "/usr/bin/true"]), \
+                patch("omcp.controller.systemd_user_worker_command", launch):
+            self._deepseek_controller(local_worker_launcher="systemd-user")
+        launch.assert_called_once()
+        self.assertEqual(self.popen.call_args.args[0][0], "/usr/bin/systemd-run")
+        task = next(iter(self.controller.state["tasks"].values()))
+        self.assertEqual(task["worker_unit"], unit)
+
+    def test_immediate_deepseek_child_exit_retains_exit_code_and_category(self):
+        self.controller.close()
+        credential = Path(self.temp.name) / "deepseek-key"
+        credential.write_text("test-key-not-used\n")
+        os.chmod(credential, 0o600)
+        self.controller = TaskController(
+            Config(
+                "owner/repo", self.root, self.state, "origin/main",
+                {"deepseek": Worker(
+                    "deepseek", (), adapter="deepseek", provider="deepseek",
+                    model="deepseek/deepseek-chat",
+                    credential_file=str(credential), endpoint_host="api.deepseek.com",
+                )},
+                Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+            ),
+            popen=subprocess.Popen, workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: "11111111-1111-1111-1111-111111111111",
+        )
+        command = [
+            "/bin/sh", "-c",
+            "echo 'bwrap: No permissions to create new namespace' >&2; exit 7",
+        ]
+        with patch("omcp.controller.deepseek_runner_command", return_value=command):
+            submitted = self.controller.submit_task(
+                "immediate", "Immediate", "Fail before the lease",
+                "deepseek", True, None, "routine_development",
+            )
+            task = self.controller.resolve_approval(
+                submitted["task_id"], "approve", "approved",
+                approver_identity="local:test-operator",
+            )
+        self.assertEqual(task["status"], "interrupted")
+        self.assertEqual(task["exit_code"], 7)
+        self.assertEqual(task["failure"], {
+            "type": "runner_startup_failed", "category": "sandbox_namespace_denied",
+            "exit_code": 7,
+        })
+        self.assertEqual(task["reservation"]["status"], "released")
+        self.assertFalse(self.controller._children)
+        task_dir = self.state / "tasks" / task["task_id"]
+        self.assertIn("No permissions", (task_dir / "startup.log").read_text())
+        persisted = (self.state / "state.json").read_text()
+        self.assertNotIn("No permissions", persisted)
+        self.assertNotIn("bwrap:", persisted)
+
+    def test_disappeared_runner_keeps_a_bounded_startup_category(self):
+        submitted = self.submit("disappeared")
+        task = self.controller.state["tasks"][submitted["task_id"]]
+        task["runner_pid"] = 999999
+        task_dir = self.state / "tasks" / submitted["task_id"]
+        task["startup_log_path"] = str(task_dir / "startup.log")
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / "startup.log").write_text(
+            "bwrap: Failed to unshare user namespace\n",
+        )
+        self.controller.reconcile()
+        self.assertEqual(task["status"], "interrupted")
+        self.assertEqual(task["failure"], {
+            "type": "runner_startup_failed", "category": "sandbox_namespace_denied",
+        })
+        self.assertEqual(task["reservation"]["status"], "released")
+
+    def test_bridge_status_identifies_the_durable_state_directory(self):
+        status = self.controller.bridge_status()
+        self.assertEqual(status["state_dir"], str(self.state))
+        self.assertEqual(status["coordinator_pid"], os.getpid())
+        self.assertIsInstance(status["coordinator_started_at"], str)
+
     def test_cancelling_transient_worker_stops_its_unit(self):
         self.controller.config = replace(
             self.config, local_worker_launcher="systemd-user",
