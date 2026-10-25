@@ -14,12 +14,14 @@ from typing import Any, Callable
 from urllib.parse import parse_qs
 
 from dashboard.omcp import LocalApprovalClient, OMCPClient, OMCPError
+from dashboard.system import SystemCollector
 
 
 TERMINAL = {"succeeded", "failed", "cancelled", "rejected", "interrupted"}
 TASK_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 RECENT_LIMIT = 20
 STATIC_FILES = {
+    "/static/system.js": ("system.js", "text/javascript; charset=utf-8"),
     "/static/dashboard.css": ("dashboard.css", "text/css; charset=utf-8"),
     "/static/dashboard.js": ("dashboard.js", "text/javascript; charset=utf-8"),
 }
@@ -79,10 +81,11 @@ def state_badge(status: Any) -> str:
 
 
 class Dashboard:
-    """A WSGI app whose routes map to explicit OMCP operations only."""
+    """A WSGI app with explicit OMCP operations and fixed read-only host probes."""
 
     def __init__(self, client: Any, approval_client: Any | None = None,
-                 static_root: Path | None = None) -> None:
+                 static_root: Path | None = None, system_collector: Any | None = None) -> None:
+        self.system_collector = system_collector or SystemCollector()
         self.client = client
         self.approval_client = approval_client
         self.static_root = static_root or Path(__file__).with_name("static")
@@ -97,6 +100,11 @@ class Dashboard:
         try:
             if path in STATIC_FILES and method == "GET":
                 return self._static(path, start_response)
+            if path == "/api/system":
+                if method != "GET":
+                    return self._json(start_response, HTTPStatus.METHOD_NOT_ALLOWED,
+                                      {"error": "method_not_allowed"}, [("Allow", "GET")])
+                return self._json(start_response, HTTPStatus.OK, self.system_collector.snapshot())
             if path == "/api/tasks":
                 return self._api_tasks(method, start_response)
             if path == "/" and method == "GET":
@@ -134,6 +142,8 @@ class Dashboard:
             ("Content-Security-Policy", "default-src 'none'"),
             ("X-Content-Type-Options", "nosniff"),
             ("Cache-Control", "no-store"),
+            ("X-Frame-Options", "DENY"),
+            ("Referrer-Policy", "no-referrer"),
         ]
         response_headers.extend(headers or [])
         start_response(f"{status.value} {status.phrase}", response_headers)
@@ -164,10 +174,10 @@ class Dashboard:
         return [encoded]
 
     def layout(self, title: str, content: str, status: str = "") -> str:
-        return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{esc(title)} · Orchestra</title><link rel="stylesheet" href="/static/dashboard.css"><script src="/static/dashboard.js" defer></script></head><body><header><a class="brand" href="/">Orchestra</a>{status}<a class="button" href="/new-task">+ New Task</a></header><main id="task-dashboard" data-recent-limit="{RECENT_LIMIT}">{content}</main></body></html>'''
+        return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{esc(title)} · PixelBox</title><link rel="stylesheet" href="/static/dashboard.css"><script src="/static/dashboard.js" defer></script><script src="/static/system.js" defer></script></head><body><header><a class="brand" href="/">PixelBox · Orchestra</a>{status}<a class="button" href="/new-task">+ New Task</a></header><main id="task-dashboard" data-recent-limit="{RECENT_LIMIT}">{content}</main></body></html>'''
 
     def unavailable(self) -> str:
-        return self.layout("Offline", "<section class=\"panel empty\"><h1>Orchestra is offline</h1><p>The dashboard could not reach OMCP. No task action was attempted.</p></section>", state_badge("offline"))
+        return self.layout("Offline", self.system_panel() + "<section class=\"panel empty\"><h1>Orchestra is offline</h1><p>The dashboard could not reach OMCP. No task action was attempted.</p></section>", state_badge("offline"))
 
     @staticmethod
     def _items(value: Any) -> list[dict[str, Any]]:
@@ -195,7 +205,17 @@ class Dashboard:
         )
         recent_detail = f'Latest {int(counts.get("recent_limit", RECENT_LIMIT))}'
         monitor = f'''<section class="monitor-bar" aria-label="Task refresh controls"><div><strong>Live task monitor</strong><span id="refresh-status" role="status" aria-live="polite" data-generated-at="{esc(generated_at)}">Updated {timestamp(generated_at)}</span></div><button class="button secondary" id="refresh-tasks" type="button">Refresh</button></section><div class="warning" id="refresh-warning" role="status" aria-live="polite" hidden></div>'''
-        return self.layout("Dashboard", f'''<section class="intro"><div><h1>Dashboard</h1><p>Task and worker state from Orchestra.</p></div>{approvals_html}</section>{monitor}<section><h2>Workers</h2><div class="workers">{worker_rows}</div></section><div class="task-sections">{self.task_section("running", "Running Tasks", running, "No tasks are running.", True)}{self.task_section("queued", "Queued Tasks", queued, "No tasks are queued or awaiting approval.", True, queued_detail)}{self.task_section("recent", "Recent Tasks", recent, "No recent terminal tasks.", False, recent_detail)}</div>''', state_badge(status.get("status", "offline")))
+        return self.layout("Dashboard", f'''<section class="intro"><div><h1>PixelBox home</h1><p>System overview and Orchestra tasks.</p></div>{approvals_html}</section>{self.system_panel()}{monitor}<section><h2>Workers</h2><div class="workers">{worker_rows}</div></section><div class="task-sections">{self.task_section("running", "Running Tasks", running, "No tasks are running.", True)}{self.task_section("queued", "Queued Tasks", queued, "No tasks are queued or awaiting approval.", True, queued_detail)}{self.task_section("recent", "Recent Tasks", recent, "No recent terminal tasks.", False, recent_detail)}</div>''', state_badge(status.get("status", "offline")))
+
+    def system_panel(self) -> str:
+        labels = [
+            ("load", "CPU / load"), ("memory", "Memory"), ("disk", "Root disk"),
+            ("uptime", "Uptime"), ("temperature", "CPU temperature"),
+            ("services", "Service health"), ("docker", "Docker / Nextcloud"),
+            ("public", "Cloudflare public health"), ("tailscale", "Tailscale"),
+        ]
+        cards = "".join(f'<article class="panel"><h3>{esc(label)}</h3><p id="system-{esc(key)}">Unavailable — awaiting collection</p></article>' for key, label in labels)
+        return f'''<section id="system-overview" aria-labelledby="system-heading"><h2 id="system-heading">System overview · read only</h2><p id="system-updated" role="status" aria-live="polite">Loading system overview…</p><button class="button secondary" id="refresh-system" type="button">Refresh overview</button><div class="system-grid">{cards}</div><p>Nextcloud counts describe container state, not application health. Public HTTP reachability does not verify the origin or tunnel.</p></section>'''
 
     def task_section(self, key: str, heading: str, tasks: list[dict[str, Any]],
                      empty: str, expanded: bool, detail: str = "") -> str:

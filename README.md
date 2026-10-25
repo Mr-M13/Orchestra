@@ -38,6 +38,14 @@ development tasks to the configured local lanes without an extra prompt.
 Production, destructive, security and unclassified task classes still require
 explicit approval. Host operations remain separately allowlisted and approved.
 
+## PixelBox home dashboard
+
+The existing [Orchestra dashboard](dashboard/README.md) now combines task and
+worker monitoring with a read-only PixelBox system overview: host metrics, fixed
+service health, Docker/Nextcloud counts, public MCP HTTP reachability and local
+Tailscale state. It remains loopback-only with the existing task security controls.
+No infrastructure or deployment changes are included.
+
 ## Foundations and historical implementation
 
 The initial foundation set is recorded before runtime implementation:
