@@ -506,7 +506,7 @@ class GitHubActionsClient:
             runs = discovered.get("workflow_runs") if isinstance(discovered, dict) else None
             matches = [
                 state for item in runs or []
-                if (state := self._run_state(item, identity)) is not None
+                if (state := self._run_state_for_name(item, identity.run_name, identity.dispatched_at, require_current_head=True, require_first_attempt=True)) is not None
             ]
             if len(matches) == 1:
                 return matches[0]
