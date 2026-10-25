@@ -525,33 +525,26 @@ class GitHubActionsClient:
             raise GitHubActionsError("GitHub source SHA does not match protected ref")
 
     def _verify_secret_environment(self) -> None:
-        """Require the external approval boundary that guards provider keys."""
+        """Require a protected-branch environment with no human review gate."""
         environment = urllib.parse.quote(WORKER_ENVIRONMENT, safe="")
         result = self._request(
             "GET", f"/repos/{self.repository}/environments/{environment}",
         )
         rules = result.get("protection_rules") if isinstance(result, dict) else None
-        reviewer_rule = next(
-            (
-                rule for rule in rules
-                if isinstance(rule, dict) and rule.get("type") == "required_reviewers"
-            ),
-            None,
-        ) if isinstance(rules, list) else None
-        reviewers = (
-            reviewer_rule.get("reviewers") if isinstance(reviewer_rule, dict) else None
-        )
         policy = (
             result.get("deployment_branch_policy")
             if isinstance(result, dict) else None
         )
-        if (not isinstance(reviewer_rule, dict)
-                or reviewer_rule.get("prevent_self_review") is not True
-                or not isinstance(reviewers, list) or not reviewers
+        if (not isinstance(rules, list)
+                or any(
+                    isinstance(rule, dict)
+                    and rule.get("type") == "required_reviewers"
+                    for rule in rules
+                )
                 or not isinstance(policy, dict)
                 or policy.get("protected_branches") is not True):
             raise GitHubActionsError(
-                "GitHub worker environment does not enforce protected-branch review"
+                "GitHub worker environment must use protected branches without human review"
             )
 
     def _run_state_for_name(

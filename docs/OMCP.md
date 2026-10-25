@@ -169,14 +169,13 @@ and verifies the artifact summary against the same identity.
 
 The workflow needs an `orchestra-workers` environment containing
 `OPENAI_API_KEY` and/or `DEEPSEEK_API_KEY`; do not add tunnel, approval or GitHub
-tokens there. Configure required reviewers and prevent self-review, and approve
-only when the run head SHA equals the configured `workflow_sha`. The coordinator
-requires `workflow_ref` to resolve to that exact SHA on a protected branch before
-dispatch, and fails closed unless the environment API confirms required
-reviewers, self-review prevention and protected-branch-only deployments. A
-secretless workflow job repeats the SHA check before the dependent
-environment-gated job can receive provider keys, mitigating a ref move between
-lookup and dispatch. The pinned Codex CLI runs the `codex` agent. The pinned
+tokens there. The environment must have no required-reviewer rule and allow only
+protected branches. The coordinator requires `workflow_ref` to resolve to the
+exact configured `workflow_sha` on a protected branch before dispatch, and fails
+closed if the environment introduces human review or drops protected-branch-only
+deployments. A secretless workflow job repeats the SHA check before the dependent
+environment-scoped job can receive provider keys, mitigating a ref move between
+lookup and dispatch without a human gate. The pinned Codex CLI runs the `codex` agent. The pinned
 OpenCode CLI runs the `deepseek` agent against the DeepSeek chat API, because
 current Codex releases no longer accept DeepSeek's chat wire protocol. Provider
 keys and OpenCode runtime directories are kept outside the uploaded artifact.
