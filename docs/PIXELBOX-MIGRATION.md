@@ -273,6 +273,10 @@ production settings:
   protected consequence classes, direct DeepSeek work and host operations remain
   explicitly approved;
 - `max_parallel_tasks: 2` initially;
+- `repository_parallelism: "serialized"` for existing installations. Set
+  `"isolated_worktrees"` only as a reviewed rollout to allow two distinct
+  workers to write the same repository in separate worktrees. Keep
+  `max_parallel_tasks` at `2` for the initial rollout;
 - `sandbox_backend: "bubblewrap"` on PixelBox;
 - `local_worker_launcher: "systemd-user"` on PixelBox so local Codex workers
   run in a separate transient user service rather than inheriting the

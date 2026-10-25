@@ -98,7 +98,40 @@ Each profile may independently set `local_worker_git_mode` (`fetch` or `owner_sy
 
 `max_parallel_tasks` is an owner-only operating limit from 1 through 64. Omitting it preserves the previous single-task behavior. The initial voluntary operating policy is `2`; that value is configuration, not a code ceiling, so a reviewed installation can later select 4, 8 or more lanes without changing the scheduler. Each configured worker still runs at most one task at a time.
 
-Admission is durable and server-derived. Before worktree or process side effects, OMCP atomically changes an accepted task to `starting` and records a lane, worker, normalized repository identity, access mode and private startup lease. A writer conflicts with every active task for the same repository, even when different repository profile IDs or checkouts name it. A read-only standing-authorized task may share its repository with other readers; callers cannot declare read-only access themselves. Every task retains a distinct branch and worktree.
+Admission is durable and server-derived. Before worktree or process side effects, OMCP atomically changes an accepted task to `starting` and records a lane, worker, normalized repository identity, access mode and private startup lease.
+
+`repository_parallelism` is an owner-only mode with two values:
+
+- `serialized` (the default, and the only behavior for existing installations):
+  a writer conflicts with every active task for the same repository, even when
+  different repository profile IDs or checkouts name it. A read-only
+  standing-authorized task may share its repository with other readers.
+- `isolated_worktrees`: two distinct workers may write the same repository at
+  the same time when each task has a distinct task ID, worktree path and branch
+  name. Initial production use is limited to two active tasks and one task per
+  worker by keeping `max_parallel_tasks: 2`. A read-only response task (for
+  example the direct DeepSeek adapter) may share the repository with a writer
+  because it cannot write the worktree. Callers cannot declare read-only access
+  themselves.
+
+Worktree creation and the durable workspace/branch metadata update run under a
+repository-scoped setup lock. The lock is released before any worker process
+starts, so long model calls do not serialize unrelated setup. Two tasks that
+would share a branch or worktree fail closed with
+`DuplicateWorkspaceIdentity`; a pre-execution failure removes only the exact
+task worktree it created.
+
+Direct DeepSeek is recorded as `access: read` because its sandbox grants no
+workspace write. It does not reserve a coding-writer slot, and in
+`isolated_worktrees` mode it may run beside a writer. In the default
+`serialized` mode it still waits behind an active writer, preserving the
+previous conservative behavior.
+
+`worker_availability` distinguishes idle process capacity (`available`) from
+scheduling readiness for the next queued task (`runnable`) and reports a
+`reason` (`worker_busy`, `execution_limit_reached`, `repository_serialized`,
+`duplicate_task_identity`, or `no_queued_task`). A dashboard must use
+`runnable`/`reason` before advertising usable capacity.
 
 Queue order is FIFO within each repository and round-robin across repositories using a durable cursor. A blocked repository head is not bypassed by younger work from that repository. Completion, cancellation, startup failure and interruption release the reservation. A restarted coordinator adopts a runner only when its owner-only lease matches the persisted task and lease IDs. Missing or mismatched startup leases expire fail-closed; a completion record already written during the PID-persistence crash window remains authoritative. The state-directory lock still permits only one local coordinator, so these leases are process-recovery records, not multi-host election authority.
 
@@ -276,6 +309,7 @@ Use Python 3.11 or newer and a current Codex CLI. Create a state directory outsi
   "approval_ttl_seconds": 1800,
   "max_worker_seconds": 1800,
   "max_parallel_tasks": 2,
+  "repository_parallelism": "serialized",
   "startup_lease_seconds": 30,
   "task_approval_mode": "disabled",
   "instance_role": "authoritative",
