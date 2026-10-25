@@ -3,10 +3,6 @@
 # read-only plan. No mode manages the tunnel or unrelated host services.
 set -euo pipefail
 
-# system account tools live in sbin directories on Debian; non-interactive SSH omits them.
-PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-export PATH
-
 SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DEPLOY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=config-access.sh
@@ -389,19 +385,32 @@ install_units() {
   fi
 }
 
+system_account_tool() {
+  local tool="$1" candidate
+  candidate="$(command -v "$tool" 2>/dev/null || true)"
+  if [[ -z "$candidate" ]]; then
+    for candidate in "/usr/sbin/$tool" "/sbin/$tool"; do
+      [[ -x "$candidate" ]] && break
+    done
+  fi
+  [[ -n "$candidate" && -x "$candidate" ]] \
+    || fail "$tool is required to create the HTTPS MCP identity"
+  printf "%s\\n" "$candidate"
+}
+
 prepare_mcp_identity() {
-  local desired_gid primary_gid
+  local desired_gid primary_gid groupadd_bin useradd_bin
   command -v getent >/dev/null 2>&1 || fail "getent is required to manage the HTTPS MCP identity"
-  command -v groupadd >/dev/null 2>&1 || fail "groupadd is required to create $MCP_HTTP_GROUP"
-  command -v useradd >/dev/null 2>&1 || fail "useradd is required to create $MCP_HTTP_USER"
+  groupadd_bin="$(system_account_tool groupadd)"
+  useradd_bin="$(system_account_tool useradd)"
   if ! getent group "$MCP_HTTP_GROUP" >/dev/null 2>&1; then
-    sudo groupadd --system "$MCP_HTTP_GROUP"
+    sudo "$groupadd_bin" --system "$MCP_HTTP_GROUP"
   fi
   desired_gid="$(getent group "$MCP_HTTP_GROUP" | awk -F: 'NR == 1 {print $3}')"
   [[ "$desired_gid" =~ ^[0-9]+$ ]] \
     || fail "could not resolve the $MCP_HTTP_GROUP group ID"
   if ! id "$MCP_HTTP_USER" >/dev/null 2>&1; then
-    sudo useradd --system --no-create-home --home-dir /nonexistent \
+    sudo "$useradd_bin" --system --no-create-home --home-dir /nonexistent \
       --shell /usr/sbin/nologin --gid "$MCP_HTTP_GROUP" "$MCP_HTTP_USER"
   fi
   primary_gid="$(id -g "$MCP_HTTP_USER")"
