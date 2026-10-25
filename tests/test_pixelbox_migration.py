@@ -622,6 +622,8 @@ class DeploymentAssetTests(unittest.TestCase):
         self.assertIn("ReadWritePaths=/home/hamed/orchestra-migration/state", unit)
         self.assertEqual(unit.lower().count("execstart="), 1)
         self.assertIn("execstart=/usr/bin/python3 -m omcp.server", unit.lower())
+        self.assertIn("KillMode=process", unit)
+        self.assertNotIn("KillMode=control-group", unit)
         self.assertNotIn("docker", unit.lower())
         self.assertNotIn("systemctl", unit.lower())
         self.assertTrue(all(

@@ -20,7 +20,9 @@ ExecStart=/usr/bin/python3 -m omcp.server --config /etc/orchestra/omcp.json --so
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=45
-KillMode=control-group
+# Task runners use independent sessions and are reconciled by PID after coordinator restart.
+# Kill only the coordinator process so an in-flight task survives a release activation.
+KillMode=process
 UMask=0077
 
 # Defence in depth.  Worker worktrees and owner state are the only writable
