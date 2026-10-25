@@ -162,6 +162,64 @@ class TrustedProbeCommandTests(unittest.TestCase):
 
 
 @unittest.skipUnless(
+    os.environ.get("ORCHESTRA_FILE_GRANT_SANDBOX") == "1"
+    and sys.platform == "darwin"
+    and shutil.which("codex"),
+    "opt-in macOS Codex file-grant sandbox integration test",
+)
+class FileGrantSandboxIntegrationTests(unittest.TestCase):
+    def test_exact_file_and_completion_are_writable_but_peers_are_denied(self):
+        with tempfile.TemporaryDirectory(prefix="orchestra-file-grant-") as directory:
+            workspace = Path(directory) / "work"
+            workspace.mkdir()
+            (workspace / "dashboard").mkdir()
+            (workspace / "dashboard/system.py").write_text("original\n")
+            (workspace / "tests").mkdir()
+            (workspace / ".git").mkdir()
+            (workspace / ".orchestra-tmp").mkdir()
+            probe = workspace / "probe.sh"
+            probe.write_text(r"""
+attempt() {
+  name="$1"; path="$2"; data="$3"
+  if printf '%s\n' "$data" > "$path" 2>/dev/null; then printf '%s allowed\n' "$name"; else printf '%s denied\n' "$name"; fi
+}
+cd "$1"
+attempt exact_file dashboard/system.py changed
+attempt sibling_file dashboard/other.py denied
+attempt tests tests/escape.txt denied
+attempt completion .orchestra-tmp/orchestra-completion.json '{"status":"success"}'
+attempt outside /tmp/orchestra-file-grant-outside.txt denied
+attempt git .git/config denied
+""")
+            policy = RoutineConfinementPolicy(
+                (), writable_files=("dashboard/system.py",),
+            )
+            codex = shutil.which("codex")
+            self.assertIsNotNone(codex)
+            completed = subprocess.run(
+                policy.probe_command(
+                    codex, workspace,
+                    ["/bin/sh", str(probe), str(workspace)],
+                ),
+                cwd=workspace, capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            lines = set(completed.stdout.splitlines())
+            self.assertEqual(lines, {
+                "exact_file allowed", "sibling_file denied", "tests denied",
+                "completion allowed", "outside denied", "git denied",
+            })
+            self.assertEqual(
+                (workspace / "dashboard/system.py").read_text(), "changed\n",
+            )
+            self.assertTrue(
+                (workspace / ".orchestra-tmp/orchestra-completion.json").is_file(),
+            )
+            self.assertFalse((workspace / "dashboard/other.py").exists())
+            self.assertFalse((workspace / "tests/escape.txt").exists())
+
+
+@unittest.skipUnless(
     sys.platform.startswith("linux")
     and os.environ.get("ORCHESTRA_TRUSTED_PROBE_INTEGRATION") == "1"
     and shutil.which("bwrap")
