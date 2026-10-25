@@ -351,7 +351,7 @@ class HttpHardeningTests(unittest.TestCase):
         requests = []
         responses = iter((
             {"name": "main", "protected": True, "commit": {"sha": TASK_SHA}},
-            {"name": "orchestra-workers", "protection_rules": [{"type": "required_reviewers", "prevent_self_review": True, "reviewers": [{"type": "User"}]}], "deployment_branch_policy": {"protected_branches": True}},
+            {"name": "orchestra-workers", "protection_rules": [], "deployment_branch_policy": {"protected_branches": True}},
             {"workflow_run_id": 999, "run_url": "https://api.github.com/repos/owner/repo/actions/runs/999"},
             {"workflow_runs": [exact]},
         ))
@@ -439,7 +439,7 @@ class HttpHardeningTests(unittest.TestCase):
                 client.dispatch(identity, "codex", "gpt-5", "task")
         self.assertEqual([request.method for request in requests], ["GET"])
 
-    def test_dispatch_requires_review_protected_secret_environment(self):
+    def test_dispatch_rejects_human_review_environment(self):
         requests = []
         responses = iter((
             {
@@ -448,7 +448,11 @@ class HttpHardeningTests(unittest.TestCase):
             },
             {
                 "name": "orchestra-workers",
-                "protection_rules": [],
+                "protection_rules": [{
+                    "type": "required_reviewers",
+                    "prevent_self_review": True,
+                    "reviewers": [{"type": "User"}],
+                }],
                 "deployment_branch_policy": {"protected_branches": True},
             },
         ))
@@ -465,7 +469,7 @@ class HttpHardeningTests(unittest.TestCase):
                 "owner/repo", "orchestra-worker.yml", "main", TASK_SHA, token,
                 opener=opener,
             )
-            with self.assertRaisesRegex(GitHubActionsError, "environment"):
+            with self.assertRaisesRegex(GitHubActionsError, "human review"):
                 client.dispatch(dispatch_identity(), "codex", "gpt-5", "task")
         self.assertEqual([request.method for request in requests], ["GET", "GET"])
 

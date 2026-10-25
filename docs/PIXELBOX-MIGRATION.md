@@ -200,17 +200,14 @@ workflow secrets. The Actions token is available to the workflow automatically
 but is not exported to the agent process; `persist-credentials: false` also
 keeps it out of the checkout.
 
-Configure required reviewers on the `orchestra-workers` environment and enable
-"Prevent self-review". Do not store provider keys as repository or organization
-secrets: they must remain environment secrets so GitHub does not release them to
-the secretless SHA-verification job. Before approving an environment deployment,
-the reviewer must confirm that the run's head SHA is exactly the configured
-`workflow_sha`. Reject the deployment if the ref moved or the SHA is unfamiliar.
-This review is the fail-closed backstop for a protection-rule bypass or a branch
-move in the short interval between the coordinator's lookup and dispatch. Before
-dispatch, the coordinator reads this environment through the GitHub API and
-fails closed unless it has at least one required reviewer, prevents self-review,
-and permits deployments only from protected branches.
+Do not configure required reviewers or a wait timer on the `orchestra-workers`
+environment. Keep provider keys as environment secrets so GitHub releases them
+only to the dependent execution job, not to the secretless SHA-verification job.
+The coordinator and workflow each require the run head SHA to exactly match the
+configured `workflow_sha`; they reject a moved or unfamiliar ref. Before dispatch,
+the coordinator reads the environment through the GitHub API and fails closed
+unless it has no human-review rule and permits deployments only from protected
+branches.
 
 ### Credential-isolated GitHub dispatch broker
 

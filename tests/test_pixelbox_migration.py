@@ -262,11 +262,7 @@ class GitHubActionsClientTests(unittest.TestCase):
                 }).encode(),
                 json.dumps({
                     "name": "orchestra-workers",
-                    "protection_rules": [{
-                        "type": "required_reviewers",
-                        "prevent_self_review": True,
-                        "reviewers": [{"type": "User", "reviewer": {"id": 1}}],
-                    }],
+                    "protection_rules": [],
                     "deployment_branch_policy": {"protected_branches": True},
                 }).encode(),
                 json.dumps({
