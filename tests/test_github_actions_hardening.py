@@ -197,6 +197,45 @@ class HttpHardeningTests(unittest.TestCase):
                         "owner/repo", "orchestra-worker.yml", ref, TASK_SHA, token,
                     )
 
+    def test_status_accepts_github_bare_workflow_path(self):
+        created = datetime.fromisoformat(DISPATCHED_AT)
+        run = {
+            "id": 73,
+            "display_title": dispatch_identity().run_name,
+            "event": "workflow_dispatch",
+            "head_sha": TASK_SHA,
+            "head_branch": "main",
+            "created_at": created.isoformat(),
+            "path": ".github/workflows/orchestra-worker.yml",
+            "run_attempt": 1,
+            "actor": {"login": "orchestra-bot"},
+            "triggering_actor": {"login": "orchestra-bot"},
+            "status": "waiting",
+            "conclusion": None,
+            "html_url": "https://github.com/owner/repo/actions/runs/73",
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            token = Path(directory) / "token"
+            token.write_text("secret-token\n")
+            token.chmod(0o600)
+
+            client = GitHubActionsClient(
+                "owner/repo",
+                "orchestra-worker.yml",
+                "main",
+                TASK_SHA,
+                token,
+                dispatch_actor="orchestra-bot",
+                opener=lambda *_args, **_kwargs: Response(json.dumps(run).encode()),
+            )
+
+            state = client.status(73, dispatch_identity())
+
+        self.assertEqual(state.run_id, 73)
+        self.assertEqual(state.status, "waiting")
+        self.assertIsNone(state.conclusion)
+
     def test_status_rejects_spoofed_run_even_with_matching_title_sha_and_time(self):
         created = datetime.fromisoformat(DISPATCHED_AT)
         spoof = {

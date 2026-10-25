@@ -566,6 +566,7 @@ class GitHubActionsClient:
         workflow_path = str(run.get("path", ""))
         expected_path = f".github/workflows/{self.workflow}"
         if workflow_path not in {
+            expected_path,
             f"{expected_path}@{self.ref}",
             f"{expected_path}@refs/heads/{self.ref}",
         }:
