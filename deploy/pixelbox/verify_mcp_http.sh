@@ -83,10 +83,13 @@ for expected in \
   "PartOf=orchestra-omcp.service" \
   "IPAddressAllow=127.0.0.1/32" \
   "SocketBindDeny=any" \
-  "SocketBindAllow=ipv4:tcp:8090"; do
+  ; do
   "$GREP" -qx "$expected" <<<"$UNIT_SHOW" \
     || { echo "gateway unit property mismatch: $expected" >&2; exit 1; }
 done
+SOCKET_ALLOW="$("$SYSTEMCTL" show orchestra-mcp-http.service -p SocketBindAllow --value)"
+[[ "$SOCKET_ALLOW" == "ipv4:tcp:8090" || "$SOCKET_ALLOW" == "ipv4:tcp8090" ]] \
+  || { echo "gateway unit property mismatch: SocketBindAllow must permit only IPv4 TCP port 8090" >&2; exit 1; }
 IP_DENY="$("$SYSTEMCTL" show orchestra-mcp-http.service -p IPAddressDeny --value)"
 [[ "$IP_DENY" == "any" || "$IP_DENY" == "0.0.0.0/0 ::/0" || "$IP_DENY" == "::/0 0.0.0.0/0" ]] \
   || { echo "gateway unit property mismatch: IPAddressDeny must deny all IPv4 and IPv6 addresses" >&2; exit 1; }
