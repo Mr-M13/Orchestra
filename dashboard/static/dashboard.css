@@ -209,3 +209,7 @@ textarea { min-height: 150px; resize: vertical; }
   .task-row { flex-direction: column; gap: 8px; }
   .task-side { flex-direction: row; align-items: center; flex-wrap: wrap; }
 }
+
+.system-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); margin-top: 12px; }
+.system-grid h3 { font-size: .95rem; }
+.system-grid p { white-space: pre-line; overflow-wrap: anywhere; font-size: .88rem; }

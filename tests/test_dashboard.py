@@ -198,7 +198,7 @@ class DashboardTests(unittest.TestCase):
             self.assertIn(f'data-section-toggle="{name}"', body)
             self.assertIn(f'aria-controls="{name}-panel"', body)
             self.assertIn(f'id="{name}-toggle"', body)
-        self.assertEqual(body.count('type="button"'), 4)  # three sections + Refresh
+        self.assertEqual(body.count('type="button"'), 5)  # three sections + task/system Refresh
 
     def test_refresh_updates_contents_without_collapsing_or_scrolling(self):
         source = (Path(__file__).resolve().parents[1] / "dashboard/static/dashboard.js").read_text()

@@ -73,3 +73,63 @@ policy decision and structured execution capabilities.
 
 OMCP exposes no network approval RPC. Dashboard controls, when explicitly
 configured as above, use the existing local human approval channel.
+
+## Unified PixelBox home
+
+The existing home page now includes a read-only system overview alongside the
+unchanged Orchestra workers, task groups and task controls. The overview also
+loads when OMCP is unavailable. `GET /api/system` is independent of OMCP and uses
+`no-store`, CSP, MIME-sniffing protection, frame denial and no-referrer headers.
+Other methods receive 405. It inherits the dashboard's existing private access
+boundary; it does not add authentication or permit public binding.
+
+The browser refreshes the overview every 30 seconds while visible, with a manual
+refresh button and explicit unavailable/stale states. The server caches samples
+for 30 seconds. Metrics describe the dashboard host: CPU count and 1/5/15-minute
+load averages (not instantaneous CPU utilisation), memory, root filesystem disk
+usage, uptime and a recognised CPU thermal zone when accessible. Missing OS
+interfaces and sensors display unavailable.
+
+`dashboard/system.py` is the only collector. It reads bounded fixed `/proc` and
+CPU thermal paths and filesystem usage, and permits exactly four executable/argv
+tuples with absolute `/usr/bin` paths:
+
+- `systemctl show` for the eight named services, selecting only unit ID, load
+  state and active state. Missing/inaccessible units are unavailable.
+- `sudo -n /usr/bin/docker container ls --all --format` with a fixed
+  state/image projection. The API publishes
+  aggregate counts and counts for images whose basename is `nextcloud`, never
+  names, image strings, labels, mounts, logs, inspect data or environment values.
+  Nextcloud container state is not an application health check.
+- `tailscale status --json`, projecting only recognised backend state and up to
+  eight validated local IP addresses. Peer identities and login URLs are dropped.
+- A credential-free HTTPS GET request to `https://mcp.delnavazan.com/healthz` with curl
+  config disabled, no proxy, no redirects, certificate verification and short
+  connection/total timeouts. Only the HTTP status is retained. 2xx is healthy,
+  3xx/4xx reachable (including authentication gates), and 5xx unhealthy. This does
+  not prove origin, Cloudflare configuration or tunnel health.
+
+Every child runs without a shell, with closed input, discarded stderr, a minimal
+fixed environment and no inherited credentials or CLI configuration. Each probe
+has a 2.5-second deadline and a 64 KiB output cap enforced while reading; failure,
+excess output or denied access becomes unavailable. Executable paths and arguments
+cannot be supplied through HTTP. Samples contain selected numbers, enums and
+validated addresses rather than raw probe output. Browser rendering uses
+`textContent`; existing server rendering continues to HTML-escape task data.
+
+Run with existing host permissions only. The Docker probe uses one exact
+non-interactive sudo argv tuple; no other sudo command is permitted. Do not change
+sudoers, groups, Docker socket access, service permissions or credentials for this
+dashboard; denied access is an expected unavailable result. There are no host/service/container
+control endpoints or configuration writes. Deployment and infrastructure assets
+are unchanged.
+
+Validation (repository root):
+
+```sh
+PYTHONPATH=.:tests TMPDIR=/tmp python3 -m unittest test_dashboard.DashboardTests test_dashboard_system
+node --test tests/test_dashboard_polling.js tests/test_dashboard_system.js
+```
+
+The broader `test_dashboard.OMCPClientTests` includes real Unix-socket integration
+tests and requires an environment that permits local socket binding.
