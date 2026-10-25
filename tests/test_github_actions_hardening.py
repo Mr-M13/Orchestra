@@ -352,7 +352,7 @@ class HttpHardeningTests(unittest.TestCase):
         responses = iter((
             {"name": "main", "protected": True, "commit": {"sha": TASK_SHA}},
             {"name": "orchestra-workers", "protection_rules": [{"type": "required_reviewers", "prevent_self_review": True, "reviewers": [{"type": "User"}]}], "deployment_branch_policy": {"protected_branches": True}},
-            {},
+            {"workflow_run_id": 999, "run_url": "https://api.github.com/repos/owner/repo/actions/runs/999"},
             {"workflow_runs": [exact]},
         ))
         def opener(request, **_kwargs):

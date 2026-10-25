@@ -472,7 +472,7 @@ class GitHubActionsClient:
             raise ValueError("GitHub dispatch payload does not match identity")
         self._verify_protected_ref(identity.source_sha)
         self._verify_secret_environment()
-        result = self._request("POST", self._workflow_path + "/dispatches", {
+        _ = self._request("POST", self._workflow_path + "/dispatches", {
             "ref": self.ref,
             "return_run_details": True,
             "inputs": {
@@ -489,15 +489,6 @@ class GitHubActionsClient:
                 "payload": encoded,
             },
         })
-        run_id = result.get("workflow_run_id") if isinstance(result, dict) else None
-        expected_url = (
-            f"{self.api_url}/repos/{self.repository}/actions/runs/{run_id}"
-            if isinstance(run_id, int) and not isinstance(run_id, bool) else None
-        )
-        if (isinstance(run_id, int) and not isinstance(run_id, bool) and run_id > 0
-                and result.get("run_url") == expected_url):
-            return self.status(run_id, identity)
-
         query = urllib.parse.urlencode({
             "event": "workflow_dispatch", "branch": self.ref, "per_page": 100,
         })

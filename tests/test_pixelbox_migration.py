@@ -274,7 +274,7 @@ class GitHubActionsClientTests(unittest.TestCase):
                     "run_url": "https://api.github.com/repos/owner/repo/actions/runs/7",
                     "html_url": "https://github.com/owner/repo/actions/runs/7",
                 }).encode(),
-                json.dumps({
+                json.dumps({"workflow_runs": [{
                     "id": 7, "display_title": self.identity.run_name,
                     "event": "workflow_dispatch", "head_sha": WORKFLOW_SHA,
                     "head_branch": "main", "created_at": "2026-10-20T00:00:01Z",
@@ -282,7 +282,7 @@ class GitHubActionsClientTests(unittest.TestCase):
                     "run_attempt": 1, "actor": {"login": "orchestra-bot"},
                     "triggering_actor": {"login": "orchestra-bot"},
                     "status": "queued", "html_url": "https://example/run",
-                }).encode(),
+                }]}).encode(),
             ]),
             dispatch_actor="orchestra-bot",
         )
