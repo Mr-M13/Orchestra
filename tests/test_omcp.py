@@ -755,7 +755,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(spec["credential_file"], str(credential))
         self.assertNotIn("never-log-this", (self.state / "audit.jsonl").read_text())
 
-    def test_deepseek_remains_pending_when_global_approvals_are_disabled(self):
+    def test_deepseek_runs_without_human_approval_when_global_approvals_are_disabled(self):
         credential = Path(self.temp.name) / "deepseek.key"
         credential.write_text("not-printed")
         credential.chmod(0o600)
@@ -768,12 +768,14 @@ class ControllerTests(unittest.TestCase):
             task_approval_mode="disabled"), popen=self.popen,
             workspace_preparer=lambda *_: self.root,
             id_factory=lambda: "11111111-1111-1111-1111-111111111111")
-        task = self.controller.submit_task("direct-approval", "Review", "Do not edit", "deepseek")
-        self.assertEqual(task["status"], "approval_required")
-        self.assertEqual(task["approval"]["status"], "pending")
-        self.assertEqual(self.popen.call_count, 0)
+        task = self.controller.submit_task(
+            "direct-approval", "Review", "Do not edit", "deepseek",
+            consequence_class="routine_development",
+        )
+        self.assertNotEqual(task["status"], "approval_required")
+        self.assertEqual(task["approval"]["status"], "not_required")
 
-    def test_omitted_consequence_class_requires_explicit_approval(self):
+    def test_omitted_consequence_class_is_rejected_without_human_approval(self):
         self.controller.close()
         self.controller = TaskController(
             Config(
@@ -785,9 +787,8 @@ class ControllerTests(unittest.TestCase):
             popen=self.popen, workspace_preparer=lambda *_: self.root,
             id_factory=lambda: "11111111-1111-1111-1111-111111111111",
         )
-        task = self.controller.submit_task("unclassified-default", "Review", "Do not edit", "ina")
-        self.assertEqual(task["consequence_class"], "unclassified")
-        self.assertEqual(task["status"], "approval_required")
+        with self.assertRaisesRegex(ValueError, "rejected without human approval"):
+            self.controller.submit_task("unclassified-default", "Review", "Do not edit", "ina")
         self.assertEqual(self.popen.call_count, 0)
 
     def test_protected_and_unclassified_work_still_requires_explicit_approval(self):
@@ -825,12 +826,8 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(len(self.controller.list_approvals()["approvals"]), 4)
         self.popen.assert_not_called()
 
-    def test_disabled_approval_policy_keeps_protected_and_unclassified_work_pending(self):
+    def test_disabled_approval_policy_rejects_non_routine_work_without_waiting(self):
         self.controller.close()
-        ids = iter([
-            "11111111-1111-1111-1111-111111111111",
-            "22222222-2222-2222-2222-222222222222",
-        ])
         self.controller = TaskController(
             Config(
                 "owner/repo", self.root, self.state, "origin/main",
@@ -839,26 +836,21 @@ class ControllerTests(unittest.TestCase):
                 task_approval_mode="disabled",
             ),
             popen=self.popen, workspace_preparer=lambda *_: self.root,
-            id_factory=lambda: next(ids),
         )
 
-        first = self.controller.submit_task(
-            "automatic-security", "Security work", "Perform bounded security work", "ina",
-            True, "default", "security_change",
-        )
-        self.assertEqual(first["status"], "approval_required")
-        self.assertEqual(first["authorization"], {"mode": "explicit"})
-        self.assertEqual(first["approval"]["status"], "pending")
-        self.assertEqual(self.controller.list_approvals()["approvals"][0]["task_id"], first["task_id"])
-
-        second = self.controller.submit_task(
-            "automatic-unclassified", "Unclassified work", "Perform bounded work", "ina",
-            False, "default", "unclassified",
-        )
-        self.assertEqual(second["status"], "approval_required")
-        self.assertEqual(self.popen.call_count, 0)
+        for request_id, consequence_class in (
+            ("automatic-security", "security_change"),
+            ("automatic-unclassified", "unclassified"),
+        ):
+            with self.assertRaisesRegex(ValueError, "rejected without human approval"):
+                self.controller.submit_task(
+                    request_id, "Consequential work", "Perform bounded work", "ina",
+                    True, "default", consequence_class,
+                )
+        self.assertEqual(self.controller.list_approvals()["approvals"], [])
+        self.popen.assert_not_called()
         audit = (self.state / "audit.jsonl").read_text()
-        self.assertIn('"authorization_mode":"explicit"', audit)
+        self.assertIn("autonomous_mode_requires_routine_development", audit)
 
     def test_disabled_approval_policy_runs_routine_coding_without_manual_approval(self):
         self.controller.close()
@@ -1352,7 +1344,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(failed["reservation"]["status"], "released")
         self.popen.assert_not_called()
 
-    def test_host_operation_still_requires_approval_when_task_gate_is_disabled(self):
+    def test_host_operation_is_rejected_without_human_approval_when_task_gate_is_disabled(self):
         target = "1" * 40
         harness = "2" * 40
         self.controller.config = Config(
@@ -1366,21 +1358,17 @@ class ControllerTests(unittest.TestCase):
             },
             task_approval_mode="disabled",
         )
-        with patch.object(self.controller, "_resolve_local_commit", side_effect=lambda _p, value: value):
-            submitted = self.controller.submit_host_operation(
+        with self.assertRaisesRegex(ValueError, "host operations are unavailable"):
+            self.controller.submit_host_operation(
                 "host-request-disabled", "delnavazan-mariadb", target,
             )
 
-        self.assertEqual(submitted["status"], "approval_required")
-        self.assertEqual(self.controller.list_approvals()["approvals"][0]["task_id"],
-                         submitted["task_id"])
-        self.popen.assert_not_called()
-
-        task = self.controller.state["tasks"][submitted["task_id"]]
-        task["approval"]["expires_at"] = "2000-01-01T00:00:00+00:00"
         self.assertEqual(self.controller.list_approvals()["approvals"], [])
-        self.assertEqual(task["status"], "rejected")
-        self.assertEqual(task["approval"]["status"], "expired")
+        self.popen.assert_not_called()
+        self.assertIn(
+            "host_operations_unavailable_in_autonomous_mode",
+            (self.state / "audit.jsonl").read_text(),
+        )
 
 
     def test_parallel_claims_use_distinct_lanes_and_release_reservations(self):
@@ -3101,6 +3089,14 @@ class ServerTests(unittest.TestCase):
              patch.dict(os.environ, env, clear=True):
             with self.assertRaisesRegex(PermissionError, "does not match"):
                 server_main(["--config", "/unused/config.json"])
+
+    def test_disabled_mode_does_not_start_local_approval_server(self):
+        self.controller.config.task_approval_mode = "disabled"
+        with patch("omcp.server.LocalApprovalServer") as approval_server:
+            local_approval, ticker = self.server._start_auxiliary()
+            self.server._stop_auxiliary(local_approval, ticker)
+        self.assertIsNone(local_approval)
+        approval_server.assert_not_called()
 
     def test_unknown_method_uses_json_rpc_error(self):
         session = self.server.new_session()
