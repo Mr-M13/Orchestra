@@ -81,13 +81,15 @@ for expected in \
   "ProtectHome=yes" \
   "PrivateNetwork=no" \
   "PartOf=orchestra-omcp.service" \
-  "IPAddressDeny=any" \
   "IPAddressAllow=127.0.0.1/32" \
   "SocketBindDeny=any" \
   "SocketBindAllow=ipv4:tcp:8090"; do
   "$GREP" -qx "$expected" <<<"$UNIT_SHOW" \
     || { echo "gateway unit property mismatch: $expected" >&2; exit 1; }
 done
+IP_DENY="$("$SYSTEMCTL" show orchestra-mcp-http.service -p IPAddressDeny --value)"
+[[ "$IP_DENY" == "any" || "$IP_DENY" == "0.0.0.0/0 ::/0" || "$IP_DENY" == "::/0 0.0.0.0/0" ]] \
+  || { echo "gateway unit property mismatch: IPAddressDeny must deny all IPv4 and IPv6 addresses" >&2; exit 1; }
 ADDRESS_FAMILIES="$("$SYSTEMCTL" show orchestra-mcp-http.service -p RestrictAddressFamilies --value)"
 [[ " $ADDRESS_FAMILIES " == *" AF_UNIX "* && " $ADDRESS_FAMILIES " == *" AF_INET "* ]] \
   || { echo "gateway unit property mismatch: RestrictAddressFamilies must contain AF_UNIX and AF_INET" >&2; exit 1; }
