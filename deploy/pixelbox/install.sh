@@ -3,6 +3,10 @@
 # read-only plan. No mode manages the tunnel or unrelated host services.
 set -euo pipefail
 
+# system account tools live in sbin directories on Debian; non-interactive SSH omits them.
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
+
 SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DEPLOY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=config-access.sh
