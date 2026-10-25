@@ -393,6 +393,10 @@ system_account_tool() {
       [[ -x "$candidate" ]] && break
     done
   fi
+  if [[ "$(type -t "$tool")" == "function" ]]; then
+    printf "%s\\n" "$tool"
+    return 0
+  fi
   [[ -n "$candidate" && -x "$candidate" ]] \
     || fail "$tool is required to create the HTTPS MCP identity"
   printf "%s\\n" "$candidate"
