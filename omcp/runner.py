@@ -327,12 +327,14 @@ def opencode_environment(runtime_dir: Path) -> dict[str, str]:
 
 
 def routine_command(executable: str, workspace: Path, result_path: Path,
-                    writable_paths: list[str], git_read_paths: list[str] | None = None,
+                    writable_paths: list[str], writable_files: list[str] | None = None,
+                    git_read_paths: list[str] | None = None,
                     read_only_paths: list[str] | None = None) -> list[str]:
     """Build the Codex worker command from the shared routine policy."""
     policy = RoutineConfinementPolicy(
         tuple(writable_paths),
         tuple(read_only_paths if read_only_paths is not None else (git_read_paths or ())),
+        writable_files=tuple(writable_files or ()),
     )
     return policy.worker_command(executable, workspace, result_path)
 
@@ -876,7 +878,9 @@ def run(spec_path: Path) -> int:
             else:
                 if (not isinstance(capabilities, dict) or capabilities.get("profile") != "routine_development_v1"
                         or capabilities.get("network") is not False or capabilities.get("external_credentials") is not False
-                        or capabilities.get("git_metadata") != "read_only" or not isinstance(capabilities.get("writable_paths"), list)):
+                        or capabilities.get("git_metadata") != "read_only"
+                        or not isinstance(capabilities.get("writable_paths"), list)
+                        or not isinstance(capabilities.get("writable_files", []), list)):
                     raise ValueError("invalid routine execution capabilities")
                 contract_tmp = workspace / worker_contract.CONTRACT_DIR
                 contract_tmp.mkdir(mode=0o700, exist_ok=True)
@@ -888,6 +892,7 @@ def run(spec_path: Path) -> int:
                     raise ValueError("invalid routine read paths")
                 command = routine_command(
                     executable, workspace, result, capabilities["writable_paths"],
+                    writable_files=capabilities.get("writable_files", []),
                     read_only_paths=read_only_paths,
                 )
                 environment = worker_environment(spec.get("codex_home")); environment["TMPDIR"] = str(routine_tmp)

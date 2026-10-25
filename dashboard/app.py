@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs
 
-from dashboard.omcp import LocalApprovalClient, OMCPClient, OMCPError
+from dashboard.omcp import OMCPClient, OMCPError
 from dashboard.system import SystemCollector
 
 
@@ -81,13 +81,12 @@ def state_badge(status: Any) -> str:
 
 
 class Dashboard:
-    """A WSGI app with explicit OMCP operations and fixed read-only host probes."""
+    """A WSGI app with explicit OMCP operations and fixed read-only projections."""
 
-    def __init__(self, client: Any, approval_client: Any | None = None,
-                 static_root: Path | None = None, system_collector: Any | None = None) -> None:
+    def __init__(self, client: Any, static_root: Path | None = None,
+                 system_collector: Any | None = None) -> None:
         self.system_collector = system_collector or SystemCollector()
         self.client = client
-        self.approval_client = approval_client
         self.static_root = static_root or Path(__file__).with_name("static")
         self.csrf_token = secrets.token_urlsafe(32)
 
@@ -95,7 +94,6 @@ class Dashboard:
         path = environ.get("PATH_INFO", "/")
         method = environ.get("REQUEST_METHOD", "GET")
         cancel_match = re.fullmatch(r"/tasks/(" + TASK_ID_RE.pattern + r")/cancel", path)
-        approval_match = re.fullmatch(r"/tasks/(" + TASK_ID_RE.pattern + r")/approval", path)
         task_match = re.fullmatch(r"/tasks/(" + TASK_ID_RE.pattern + r")", path)
         try:
             if path in STATIC_FILES and method == "GET":
@@ -113,10 +111,10 @@ class Dashboard:
                 return self._page(start_response, self.new_task())
             if path == "/new-task" and method == "POST":
                 return self.submit(environ, start_response)
+            if path == "/approvals" and method == "GET":
+                return self._page(start_response, self.approvals())
             if cancel_match and method == "POST":
                 return self.cancel(cancel_match.group(1), environ, start_response)
-            if approval_match and method == "POST":
-                return self.resolve_approval(approval_match.group(1), environ, start_response)
             if task_match and method == "GET":
                 return self._page(start_response, self.task_detail(task_match.group(1)))
             return self._page(start_response, self.layout("Not found", "<p>That page does not exist.</p>"), HTTPStatus.NOT_FOUND)
@@ -197,7 +195,7 @@ class Dashboard:
             f'<article class="worker"><h3>{esc(worker.get("worker"))}</h3>{state_badge("busy" if worker.get("current_task_id") else "available" if worker.get("available") else "unavailable")}<p>{esc(current_by_worker.get(worker.get("worker"), {}).get("title", ""))}</p></article>'
             for worker in workers
         ) or "<p>No configured workers.</p>"
-        approvals_html = (f'<a class="approval" href="/tasks/{esc(pending[0].get("task_id"))}">{len(pending)} task{"s" if len(pending) != 1 else ""} waiting for approval</a>' if pending else "")
+        approvals_html = (f'<a class="approval" href="/approvals">{len(pending)} task{"s" if len(pending) != 1 else ""} waiting for approval</a>' if pending else "")
         generated_at = snapshot.get("generated_at") if isinstance(snapshot.get("generated_at"), str) else ""
         queued_detail = (
             f'{int(counts.get("ready", 0))} ready · '
@@ -209,13 +207,15 @@ class Dashboard:
 
     def system_panel(self) -> str:
         labels = [
-            ("load", "CPU / load"), ("memory", "Memory"), ("disk", "Root disk"),
-            ("uptime", "Uptime"), ("temperature", "CPU temperature"),
-            ("services", "Service health"), ("docker", "Docker / Nextcloud"),
-            ("public", "Cloudflare public health"), ("tailscale", "Tailscale"),
+            ("pixelbox", "PixelBox system"), ("photo", "Photo pipeline"),
+            ("photo-timers", "Photo timers"), ("photo-recent", "Recent photo events"),
+            ("mbox", "Mbox storage"), ("nextcloud", "Nextcloud"),
+            ("pixelbox-services", "PixelBox services"),
+            ("orchestra-services", "Orchestra services"),
+            ("public", "Cloudflare public health"),
         ]
-        cards = "".join(f'<article class="panel"><h3>{esc(label)}</h3><p id="system-{esc(key)}">Unavailable — awaiting collection</p></article>' for key, label in labels)
-        return f'''<section id="system-overview" aria-labelledby="system-heading"><h2 id="system-heading">System overview · read only</h2><p id="system-updated" role="status" aria-live="polite">Loading system overview…</p><button class="button secondary" id="refresh-system" type="button">Refresh overview</button><div class="system-grid">{cards}</div><p>Nextcloud counts describe container state, not application health. Public HTTP reachability does not verify the origin or tunnel.</p></section>'''
+        cards = "".join(f'<article class="panel"><h3>{esc(label)}</h3><p class="system-value" id="system-{esc(key)}">Unavailable — awaiting collection</p></article>' for key, label in labels)
+        return f'''<section id="system-overview" aria-labelledby="system-heading"><h2 id="system-heading">System overview · read only</h2><p id="system-updated" role="status" aria-live="polite">Loading system overview…</p><button class="button secondary" id="refresh-system" type="button">Refresh overview</button><div class="system-grid">{cards}</div><p>PixelBox and photo/Mbox data come from the fixed loopback <code>GET /api/status</code> projection. No Docker, sudo, systemctl or legacy POST controls are used. Nextcloud container state is not application health; public HTTP reachability does not verify the origin or tunnel.</p></section>'''
 
     def task_section(self, key: str, heading: str, tasks: list[dict[str, Any]],
                      empty: str, expanded: bool, detail: str = "") -> str:
@@ -263,17 +263,32 @@ class Dashboard:
             result = self.client.call("task_result", {"task_id": task_id})
         auth = task.get("authorization") if isinstance(task.get("authorization"), dict) else {}
         capabilities = task.get("execution_capabilities") if isinstance(task.get("execution_capabilities"), dict) else None
-        evidence = "<p>Security evidence unavailable</p>" if not capabilities else "<ul class=\"security\">" + "".join(f"<li>{'✓' if value is False or value == 'read_only' else '•'} {esc(label)}: {esc('denied' if value is False else value)}</li>" for label, value in (("Network", capabilities.get("network")), ("External credentials", capabilities.get("external_credentials")), ("Git metadata", capabilities.get("git_metadata")))) + "</ul>"
+        if not capabilities:
+            evidence = "<p>Security evidence unavailable</p>"
+        else:
+            writable_paths = capabilities.get("writable_paths") if isinstance(capabilities.get("writable_paths"), list) else []
+            writable_files = capabilities.get("writable_files") if isinstance(capabilities.get("writable_files"), list) else []
+            evidence = "<ul class=\"security\">" + "".join(
+                f"<li>{'✓' if value is False or value == 'read_only' else '•'} {esc(label)}: {esc('denied' if value is False else value)}</li>"
+                for label, value in (
+                    ("Network", capabilities.get("network")),
+                    ("External credentials", capabilities.get("external_credentials")),
+                    ("Git metadata", capabilities.get("git_metadata")),
+                )
+            ) + "".join(
+                f"<li>• {esc(label)}: {esc(', '.join(str(value) for value in values) or 'none')}</li>"
+                for label, values in (
+                    ("Writable directories", writable_paths),
+                    ("Writable files", writable_files),
+                )
+            ) + "</ul>"
         fields = [("Project", task.get("repository_profile", task.get("repository"))), ("Worker", task.get("worker")), ("State", task.get("status")), ("Consequence class", task.get("consequence_class")), ("Authorisation", auth.get("mode")), ("Standing-authorisation ID", auth.get("authorization_id")), ("Created", timestamp(task.get("created_at"))), ("Started", timestamp(task.get("started_at"))), ("Completed", timestamp(task.get("finished_at")))]
         details = "".join(f"<dt>{esc(name)}</dt><dd>{value if name in {'Created', 'Started', 'Completed'} else esc(value or '—')}</dd>" for name, value in fields)
         output = "" if result is None else f'<section><h2>Final result</h2><pre>{esc(result.get("result") or task.get("failure") or "No result supplied.")}</pre></section>'
         cancel = "" if task.get("status") in TERMINAL else f'<form method="post" action="/tasks/{esc(task_id)}/cancel"><input type="hidden" name="csrf" value="{esc(self.csrf_token)}"><input type="hidden" name="reason" value="Cancelled from dashboard"><button class="danger">Cancel task</button></form>'
         approval_controls = ""
         if task.get("status") == "approval_required":
-            if self.approval_client is None:
-                approval_controls = "<section><h2>Approval</h2><p>Approval is available only from the configured local approval interface.</p></section>"
-            else:
-                approval_controls = f'<section class="panel"><h2>Approval required</h2><form method="post" action="/tasks/{esc(task_id)}/approval"><input type="hidden" name="csrf" value="{esc(self.csrf_token)}"><label>Reason<input name="reason" maxlength="1000" required></label><button name="decision" value="approve" type="submit">Approve</button><button class="danger" name="decision" value="reject" type="submit">Reject</button></form></section>'
+            approval_controls = '''<section class="panel"><h2>Approval required</h2><p>This public dashboard does not accept approval decisions. Review the complete instructions, risk and requested authority in the owner-only local approval portal on the PixelBox host at <code>http://127.0.0.1:8767</code>, opened through an authenticated SSH tunnel. The portal requires its owner-only bootstrap token and applies session expiry, CSRF, audit, reason and self-approval checks.</p><p><a href="/approvals">Pending approvals and local access instructions</a></p></section>'''
         return self.layout(str(task.get("title", "Task")), f'<a class="back" href="/">← Dashboard</a><section class="panel"><h1>{esc(task.get("title"))}</h1>{state_badge(task.get("status"))}<dl>{details}</dl>{cancel}</section>{approval_controls}<section><h2>Security</h2>{evidence}</section>{output}')
 
     def new_task(self, error: str = "") -> str:
@@ -321,34 +336,27 @@ class Dashboard:
         start_response("303 See Other", [("Location", f"/tasks/{task_id}"), ("Cache-Control", "no-store")])
         return [b""]
 
-    def resolve_approval(self, task_id: str, environ: dict[str, Any], start_response: Callable[..., Any]) -> list[bytes]:
-        if self.approval_client is None:
-            return self._page(start_response, self.layout("Unavailable", "<p>Approval is unavailable.</p>"), HTTPStatus.NOT_FOUND)
-        form = self._form(environ)
-        if not secrets.compare_digest(form.get("csrf", ""), self.csrf_token):
-            return self._page(start_response, self.layout("Request rejected", "<p>Invalid form request.</p>"), HTTPStatus.FORBIDDEN)
-        decision, reason = form.get("decision", ""), form.get("reason", "").strip()
-        if decision not in {"approve", "reject"} or not reason or len(reason) > 1_000:
-            return self._page(start_response, self.layout("Request rejected", "<p>Enter an approval reason.</p>"), HTTPStatus.BAD_REQUEST)
-        self.approval_client.resolve(task_id, decision, reason)
-        start_response("303 See Other", [("Location", f"/tasks/{task_id}"), ("Cache-Control", "no-store")])
-        return [b""]
+    def approvals(self) -> str:
+        result = self.client.call("list_approvals")
+        approvals = self._items(result.get("approvals"))
+        rows = "".join(
+            f'<article class="task-row"><div class="task-main"><div class="task-heading"><a class="task-title" href="/tasks/{esc(item.get("task_id"))}">{esc(item.get("title") or "Untitled task")}</a><code class="task-id">{esc(short_id(item.get("task_id")))}</code></div><div class="task-meta"><span>Worker <strong>{esc(item.get("worker"))}</strong></span><span>Requested {timestamp(item.get("created_at"))}</span><span class="queue-state queue-approval">Awaiting local decision</span></div></div><div class="task-side">{state_badge(item.get("status"))}<a class="task-details" href="/tasks/{esc(item.get("task_id"))}">Details</a></div></article>'
+            for item in approvals
+        ) or '<div class="panel empty">No protected tasks are awaiting approval.</div>'
+        return self.layout("Owner approvals", f'''<a class="back" href="/">← Dashboard</a><section class="panel"><h1>Owner approval interface</h1><p><strong>No approval controls are available in this public dashboard.</strong> Approval decisions use the separate, owner-authenticated local portal, which binds only to loopback on PixelBox and calls OMCP's existing owner-only Unix approval socket with a local capability token.</p><p>From an owner-controlled machine, open an authenticated SSH tunnel to PixelBox:</p><pre>ssh -N -L 8767:127.0.0.1:8767 hamed@&lt;pixelbox-tailscale-host&gt;</pre><p>Then open <code>http://127.0.0.1:8767/bootstrap/&lt;owner-only-token&gt;/task/&lt;task-id&gt;</code>. Read the token directly from the owner-only state file on PixelBox; do not send it through chat, logs or the public dashboard. The portal displays the complete instructions, risk summary, requested authority, expiry and worker, and requires a reason plus a CSRF-protected decision.</p></section><section><h2>Pending approvals (read only)</h2><div class="task-list">{rows}</div></section>''')
 
 
 def main() -> None:
     from wsgiref.simple_server import make_server
     socket_path = os.environ.get("ORCHESTRA_OMCP_SOCKET", "/run/user/1000/orchestra/omcp.sock")
-    approval_state_dir = os.environ.get("ORCHESTRA_DASHBOARD_APPROVAL_STATE_DIR")
-    approver_identity = os.environ.get("ORCHESTRA_DASHBOARD_APPROVER_IDENTITY")
     host = os.environ.get("ORCHESTRA_DASHBOARD_HOST", "127.0.0.1")
     port = int(os.environ.get("ORCHESTRA_DASHBOARD_PORT", "8081"))
     if host not in {"127.0.0.1", "::1", "localhost"}:
         raise SystemExit("dashboard must bind to loopback; use the approved private access layer")
-    if bool(approval_state_dir) != bool(approver_identity):
-        raise SystemExit("dashboard approval requires both state directory and approver identity")
-    approval_client = (LocalApprovalClient(approval_state_dir, approver_identity)
-                       if approval_state_dir else None)
-    with make_server(host, port, Dashboard(OMCPClient(socket_path), approval_client)) as server:
+    # Approval decisions are intentionally not accepted by this public
+    # dashboard.  The separate owner-only local approval portal is the only
+    # interface that can call OMCP's local approval socket.
+    with make_server(host, port, Dashboard(OMCPClient(socket_path))) as server:
         server.serve_forever()
 
 

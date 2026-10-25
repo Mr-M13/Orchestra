@@ -1,0 +1,28 @@
+{
+  "repository_profiles": {
+    "orchestra-dashboard": {
+      "repository": "Mr-M13/Orchestra",
+      "project_root": "/home/hamed/orchestra-migration/checkout",
+      "base_ref": "origin/main"
+    }
+  },
+  "standing_authorizations": [
+    {
+      "id": "ina-orchestra-dashboard-v1",
+      "consequence_class": "routine_development",
+      "repository_profiles": [
+        "orchestra-dashboard"
+      ],
+      "workers": [
+        "ina"
+      ],
+      "writable_paths": [],
+      "writable_files": [
+        "dashboard/app.py",
+        "dashboard/system.py",
+        "dashboard/static/system.js",
+        "dashboard/README.md"
+      ]
+    }
+  ]
+}

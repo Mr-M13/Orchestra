@@ -12,8 +12,11 @@ starts the tunnel or touches unrelated host services.
 - `tunnel.env.example` — tunnel runtime key placeholder.
 - `mcp-http.env.example` — owner-managed bearer-token template for the optional
   loopback HTTPS MCP gateway.
-- `systemd/` — coordinator, tunnel, health, optional loopback HTTP gateway and
-  health-timer units.
+- `omcp.dashboard-development.example.json` — policy-only
+  `orchestra-dashboard` profile plus exact `dashboard/*` file grant for Ina; it
+  is not merged automatically and requires separate owner approval.
+- `systemd/` — coordinator, tunnel, health, optional loopback HTTP gateway,
+  loopback unified dashboard and owner-only approval portal units.
 - `install.sh` — exports an exact 40-character Git SHA into
   `/opt/orchestra/releases/<sha>`, validates it, and atomically updates the
   `/opt/orchestra/current` symlink only during a separately approved
@@ -48,6 +51,13 @@ tools (`setfacl`, `getfacl`). Portable staging on another platform is limited to
 pre-HTTPS releases. Rolling back to a pre-HTTPS release disables and removes the
 gateway unit; the identity, ACL, and token remain dormant, so a security
 rollback should include token rotation and owner-approved cleanup.
+
+The unified dashboard unit binds `127.0.0.1:8082` and has no approval authority.
+The owner approval portal unit binds `127.0.0.1:8767`, requires a pre-existing
+`0600` `approval-portal.token`, mounts the state directory read-only, and calls
+the existing owner-only approval socket. `install.sh` copies both unit files but
+does not enable or restart them; that remains a separate owner-approved action.
+Neither service is exposed through Cloudflare or Tailscale Serve.
 
 Portable source and staging tests on another platform do not prove PixelBox or
 Linux ARM64 readiness. Only `verify.sh --live --sha <sha>` on PixelBox can

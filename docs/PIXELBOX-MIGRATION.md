@@ -89,8 +89,21 @@ path and set `OMCP_OPENCODE_CLI` in `/etc/orchestra/omcp.env`. The path is
 resolved and compared before each launch.
 
 Do not install the macOS approval notification LaunchAgents on PixelBox. The
-local approval command and the existing Linux-compatible approval portal are
-available; remote approval is not enabled by this migration.
+Linux-compatible owner approval portal is `omcp.approval_portal`, installed by
+`orchestra-approval-portal.service` on `127.0.0.1:8767`. It requires a
+pre-existing owner-only token in the state directory and calls the existing
+`approval.sock` capability; the state directory is mounted read-only by the unit.
+Access it only through an authenticated SSH tunnel from the owner's workstation:
+
+```sh
+ssh -N -L 8767:127.0.0.1:8767 hamed@100.70.11.93
+```
+
+Then open the bootstrap URL using the token read locally from the owner-only
+token file. Do not print the token, expose port 8767 through Cloudflare or
+Tailscale Serve, or add a web approval RPC. Remote approval mode is not enabled
+by this migration. The public dashboard is read-only for approvals and never
+trusts forwarded identity headers.
 
 ## 3. Directory layout
 
@@ -273,6 +286,57 @@ production settings:
 - no standing authorization for GitHub Actions workers;
 - `repository_profiles` binds each allowlisted checkout and base ref.
 
+### Dashboard-development file grant
+
+A narrow dashboard-development fragment is staged as
+`deploy/pixelbox/omcp.dashboard-development.example.json`. It is not part of
+`omcp.example.json` and the installer does not merge it into an existing owner
+configuration. Add it only after explicit owner approval, preserving the
+existing `ina-orchestra-routine-tests-v1` tests-only grant for unrelated work.
+
+The fragment adds a policy-only repository profile
+`orchestra-dashboard` with the same checkout and base ref, plus a separate
+grant. Use that profile for dashboard-development tasks; use `orchestra` for
+the existing tests-only work. Two grants may not overlap on consequence,
+repository profile and worker, so configuration loading fails closed instead of
+silently choosing by insertion order:
+
+```json
+{
+  "repository_profiles": {
+    "orchestra-dashboard": {
+      "repository": "Mr-M13/Orchestra",
+      "project_root": "/home/hamed/orchestra-migration/checkout",
+      "base_ref": "origin/main"
+    }
+  },
+  "standing_authorizations": [
+    {
+      "id": "ina-orchestra-dashboard-v1",
+      "consequence_class": "routine_development",
+      "repository_profiles": ["orchestra-dashboard"],
+      "workers": ["ina"],
+      "writable_paths": [],
+      "writable_files": [
+        "dashboard/app.py",
+        "dashboard/system.py",
+        "dashboard/static/system.js",
+        "dashboard/README.md"
+      ]
+    }
+  ]
+}
+```
+
+`writable_files` grants exact regular files relative to the task worktree; it
+does not grant a directory or the rest of the repository. The coordinator
+creates only the missing parent directories, rejects absolute/traversal,
+symlink, Git-metadata and non-regular targets, and still adds the private
+task-local `.orchestra-tmp` directory as writable for
+`orchestra-completion.json`. Both the real Codex worker and the trusted security
+probe derive their rules from the same policy. A task matching this grant still
+has `network: false`, no external credentials and read-only Git metadata.
+
 ### Local Codex worker boundary
 
 On Linux, the `systemd-user` launcher starts each non-DeepSeek local worker in
@@ -429,6 +493,8 @@ Units live in `deploy/pixelbox/systemd/`:
 | `orchestra-tunnel.service` | dedicated authenticated tunnel plus a stateless stdio proxy |
 | `orchestra-health.service` | one-shot sanitized health report |
 | `orchestra-health.timer` | runs health every two minutes |
+| `orchestra-dashboard.service` | loopback unified dashboard on `127.0.0.1:8082`; read-only system projection and no approval authority |
+| `orchestra-approval-portal.service` | owner-only approval portal on `127.0.0.1:8767`; no public ingress and no approval RPC |
 
 Preview the exact current commit without changing anything:
 

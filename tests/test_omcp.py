@@ -491,6 +491,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(submitted["approval"]["status"], "standing_authorized")
         self.assertEqual(submitted["execution_capabilities"], {
             "profile": "routine_development_v1", "writable_paths": ["src", "tests"],
+            "writable_files": [],
             "network": False, "external_credentials": False, "git_metadata": "read_only",
         })
         self.assertEqual(self.controller.list_approvals()["approvals"], [])
@@ -503,6 +504,215 @@ class ControllerTests(unittest.TestCase):
         audit = (self.state / "audit.jsonl").read_text()
         self.assertIn('"authorization_mode":"standing"', audit)
         self.assertNotIn("Change local code and run tests", audit)
+
+    def test_exact_file_grant_creates_parents_and_preserves_completion_write(self):
+        self.controller.close()
+        self.controller = TaskController(
+            Config(
+                "owner/repo", self.root, self.state, "origin/main",
+                {"ina": Worker("ina", ("codex",))},
+                Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+                standing_authorizations=(StandingAuthorization(
+                    "ina-orchestra-dashboard-v1", "routine_development",
+                    frozenset({"default"}), frozenset({"ina"}), (),
+                    (
+                        "dashboard/app.py", "dashboard/system.py",
+                        "dashboard/static/system.js", "dashboard/README.md",
+                    ),
+                ),),
+            ),
+            popen=self.popen, workspace_preparer=lambda *_: self.root,
+            id_factory=lambda: "11111111-1111-1111-1111-111111111111",
+        )
+
+        submitted = self.controller.submit_task(
+            "dashboard-files", "Update dashboard", "Edit the reviewed dashboard files",
+            "ina", True, "default", "routine_development",
+        )
+
+        self.assertEqual(submitted["status"], "running")
+        self.assertEqual(submitted["execution_capabilities"]["writable_paths"], [])
+        self.assertEqual(submitted["execution_capabilities"]["writable_files"], [
+            "dashboard/app.py", "dashboard/system.py",
+            "dashboard/static/system.js", "dashboard/README.md",
+        ])
+        self.assertTrue((self.root / "dashboard").is_dir())
+        self.assertTrue((self.root / "dashboard/static").is_dir())
+        self.assertFalse((self.root / "dashboard/app.py").exists())
+        self.assertFalse((self.root / "unrelated").exists())
+        task = self.controller.state["tasks"][submitted["task_id"]]
+        self.assertEqual(task["routine_writable_paths"], [])
+        self.assertEqual(task["routine_writable_files"], [
+            "dashboard/app.py", "dashboard/system.py",
+            "dashboard/static/system.js", "dashboard/README.md",
+        ])
+        spec = json.loads(
+            (self.state / "tasks" / submitted["task_id"] / "runner.json").read_text()
+        )
+        self.assertEqual(spec["execution_capabilities"]["writable_files"], task["routine_writable_files"])
+        audit = (self.state / "audit.jsonl").read_text()
+        self.assertIn("ina-orchestra-dashboard-v1", audit)
+        self.assertNotIn("Edit the reviewed dashboard files", audit)
+
+    def test_file_grants_are_strictly_validated(self):
+        # Configuration loading performs the authoritative path validation.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            codex = Path(directory) / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            config_path = Path(directory) / "omcp.json"
+            raw = {
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(Path(directory) / "state"),
+                "workers": {"ina": {"command": [str(codex)]}},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+                "standing_authorizations": [{
+                    "id": "ina-orchestra-dashboard-v1",
+                    "consequence_class": "routine_development",
+                    "repository_profiles": ["default"],
+                    "workers": ["ina"],
+                    "writable_paths": [],
+                    "writable_files": ["dashboard/system.py"],
+                }],
+            }
+            config_path.write_text(json.dumps(raw))
+            os.chmod(config_path, 0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                loaded = Config.load(config_path)
+            self.assertEqual(loaded.standing_authorizations[0].writable_files, ("dashboard/system.py",))
+            for bad in (
+                ["../outside.py"], ["/etc/passwd"], [".git/config"],
+                ["dashboard/../outside.py"], ["dashboard/system.py", "dashboard/system.py"],
+            ):
+                raw["standing_authorizations"][0]["writable_files"] = bad
+                config_path.write_text(json.dumps(raw))
+                with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                    with self.assertRaisesRegex(ValueError, "writable_files"):
+                        Config.load(config_path)
+
+    def test_standing_authorizations_must_not_overlap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            archive = Path(directory) / "archive"
+            archive.mkdir()
+            codex = Path(directory) / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            config_path = Path(directory) / "omcp.json"
+            raw = {
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(Path(directory) / "state"),
+                "workers": {"ina": {"command": [str(codex)]}},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+                "repository_profiles": {
+                    "orchestra": {
+                        "repository": "owner/repo", "project_root": str(root),
+                        "base_ref": "origin/main",
+                    },
+                    "orchestra-dashboard": {
+                        "repository": "owner/repo", "project_root": str(root),
+                        "base_ref": "origin/main",
+                    },
+                },
+                "default_profile": "orchestra",
+                "standing_authorizations": [
+                    {
+                        "id": "tests", "consequence_class": "routine_development",
+                        "repository_profiles": ["orchestra"], "workers": ["ina"],
+                        "writable_paths": ["tests"],
+                    },
+                    {
+                        "id": "dashboard", "consequence_class": "routine_development",
+                        "repository_profiles": ["orchestra-dashboard"],
+                        "workers": ["ina"], "writable_paths": [],
+                        "writable_files": ["dashboard/system.py"],
+                    },
+                ],
+            }
+            config_path.write_text(json.dumps(raw))
+            os.chmod(config_path, 0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                loaded = Config.load(config_path)
+            self.assertEqual(
+                {grant.authorization_id for grant in loaded.standing_authorizations},
+                {"tests", "dashboard"},
+            )
+            raw["standing_authorizations"][1]["repository_profiles"] = ["orchestra"]
+            config_path.write_text(json.dumps(raw))
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                with self.assertRaisesRegex(ValueError, "overlap"):
+                    Config.load(config_path)
+
+    def test_dashboard_profile_grant_is_selected_without_touching_tests_grant(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            codex = Path(directory) / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            config_path = Path(directory) / "omcp.json"
+            raw = {
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(Path(directory) / "state"),
+                "workers": {"ina": {"command": [str(codex)]}},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+                "repository_profiles": {
+                    "orchestra": {
+                        "repository": "owner/repo", "project_root": str(root),
+                        "base_ref": "origin/main",
+                    },
+                    "orchestra-dashboard": {
+                        "repository": "owner/repo", "project_root": str(root),
+                        "base_ref": "origin/main",
+                    },
+                },
+                "default_profile": "orchestra",
+                "standing_authorizations": [
+                    {
+                        "id": "tests", "consequence_class": "routine_development",
+                        "repository_profiles": ["orchestra"], "workers": ["ina"],
+                        "writable_paths": ["tests"],
+                    },
+                    {
+                        "id": "dashboard", "consequence_class": "routine_development",
+                        "repository_profiles": ["orchestra-dashboard"],
+                        "workers": ["ina"], "writable_paths": [],
+                        "writable_files": ["dashboard/system.py"],
+                    },
+                ],
+            }
+            config_path.write_text(json.dumps(raw))
+            os.chmod(config_path, 0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                config = Config.load(config_path)
+            controller = TaskController(
+                config, popen=self.popen, workspace_preparer=lambda *_: self.root,
+                id_factory=lambda: "11111111-1111-1111-1111-111111111111",
+            )
+            tests_task = controller.submit_task(
+                "tests-task", "Tests only", "Edit tests", "ina", True, "orchestra",
+                "routine_development",
+            )
+            self.assertEqual(tests_task["authorization"]["authorization_id"], "tests")
+            self.assertEqual(tests_task["execution_capabilities"]["writable_paths"], ["tests"])
+            dashboard_task = controller.submit_task(
+                "dashboard-task", "Dashboard only", "Edit dashboard", "ina", True,
+                "orchestra-dashboard", "routine_development",
+            )
+            self.assertEqual(
+                dashboard_task["authorization"]["authorization_id"], "dashboard",
+            )
+            self.assertEqual(
+                dashboard_task["execution_capabilities"]["writable_files"],
+                ["dashboard/system.py"],
+            )
+            self.assertEqual(
+                dashboard_task["execution_capabilities"]["writable_paths"], [],
+            )
+            controller.close()
 
     def test_deepseek_worker_preserves_approval_idempotency_and_emits_no_credential_value(self):
         credential = Path(self.temp.name) / "deepseek.key"
@@ -2646,6 +2856,41 @@ class RunnerTests(unittest.TestCase):
             self.assertIn('".orchestra-tmp"="write"', " ".join(command))
             self.assertFalse((root / ".orchestra-tmp").exists())
             self.assertEqual(execute.call_args.kwargs["env"]["TMPDIR"], str(root / ".orchestra-tmp"))
+
+    def test_standing_runner_supports_exact_file_grants_and_completion_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt = root / "prompt"
+            prompt.write_text("task")
+            spec = root / "spec.json"
+            spec.write_text(json.dumps({
+                "command": ["codex"], "workspace": str(root),
+                "prompt_path": str(prompt), "log_path": str(root / "log"),
+                "result_path": str(root / "result"),
+                "completion_path": str(root / "completion"), "codex_home": None,
+                "git_read_paths": [],
+                "execution_capabilities": {
+                    "profile": "routine_development_v1", "writable_paths": [],
+                    "writable_files": ["dashboard/system.py", "dashboard/app.py"],
+                    "network": False, "external_credentials": False,
+                    "git_metadata": "read_only",
+                },
+            }))
+            with patch.dict(os.environ, codex_fixture(root), clear=True), \
+                    patch("omcp.runner.subprocess.run",
+                          side_effect=codex_success_side_effect(root / "result")) as execute:
+                self.assertEqual(run_worker(spec), 0)
+            command = execute.call_args.args[0]
+            self.assertIn(
+                'permissions.orchestra-routine.filesystem.:workspace_roots={'
+                '"."="read",".orchestra-tmp"="write",'
+                '"dashboard/system.py"="write","dashboard/app.py"="write"}',
+                command,
+            )
+            self.assertIn('".orchestra-tmp"="write"', " ".join(command))
+            self.assertNotIn('"."="write"', " ".join(command))
+            self.assertEqual(execute.call_args.kwargs["env"]["TMPDIR"], str(root / ".orchestra-tmp"))
+
     def test_runner_rejects_configured_cli_flags_before_execution(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

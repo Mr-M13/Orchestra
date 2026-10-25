@@ -23,7 +23,8 @@ from omcp.platform import (
     describe_sandbox, host_platform, sandbox_command,
 )
 from omcp.routine_paths import (
-    UnsafeWritablePath, materialize_writable_paths, normalize_writable_path,
+    UnsafeWritablePath, materialize_writable_files, materialize_writable_paths,
+    normalize_writable_file, normalize_writable_path,
 )
 
 
@@ -286,6 +287,7 @@ class StandingAuthorization:
     repository_profiles: frozenset[str]
     workers: frozenset[str]
     writable_paths: tuple[str, ...] = ()
+    writable_files: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -621,6 +623,7 @@ class Config:
             profile_ids = authorization_raw.get("repository_profiles")
             worker_names = authorization_raw.get("workers")
             writable_paths = authorization_raw.get("writable_paths")
+            writable_files = authorization_raw.get("writable_files", [])
             if (not isinstance(profile_ids, list) or not profile_ids
                     or not all(isinstance(value, str) for value in profile_ids)):
                 raise ValueError("standing authorization repository_profiles must be a non-empty list")
@@ -638,6 +641,11 @@ class Config:
                 for value in writable_paths
             ):
                 raise ValueError("standing authorization writable_paths must be a list")
+            if not isinstance(writable_files, list) or not all(
+                isinstance(value, str) and value and value == value.strip()
+                for value in writable_files
+            ):
+                raise ValueError("standing authorization writable_files must be a list")
             normalized_paths: list[str] = []
             for value in writable_paths:
                 try:
@@ -649,10 +657,37 @@ class Config:
                 if normalized in normalized_paths:
                     raise ValueError("standing authorization writable_paths contains duplicates")
                 normalized_paths.append(normalized)
+            normalized_files: list[str] = []
+            for value in writable_files:
+                try:
+                    normalized = normalize_writable_file(value)
+                except UnsafeWritablePath:
+                    raise ValueError(
+                        "standing authorization writable_files must be safe relative files"
+                    ) from None
+                if normalized in normalized_files:
+                    raise ValueError("standing authorization writable_files contains duplicates")
+                normalized_files.append(normalized)
+            if set(normalized_paths) & set(normalized_files):
+                raise ValueError(
+                    "standing authorization may not duplicate a path as a file"
+                )
             standing_authorizations.append(StandingAuthorization(
                 authorization_id, consequence_class,
-                frozenset(profile_ids), frozenset(worker_names), tuple(normalized_paths),
+                frozenset(profile_ids), frozenset(worker_names),
+                tuple(normalized_paths), tuple(normalized_files),
             ))
+        # A task is matched to exactly one grant by consequence, profile and
+        # worker.  Reject ambiguous owner configuration rather than letting
+        # insertion order silently choose the narrower or broader authority.
+        for index, first in enumerate(standing_authorizations):
+            for second in standing_authorizations[index + 1:]:
+                if (first.consequence_class == second.consequence_class
+                        and first.repository_profiles & second.repository_profiles
+                        and first.workers & second.workers):
+                    raise ValueError(
+                        "standing authorizations overlap on consequence, profile and worker"
+                    )
         operations_raw = raw.get("host_operations", {})
         if not isinstance(operations_raw, dict):
             raise ValueError("host_operations must be an object")
@@ -1126,6 +1161,7 @@ class TaskController:
             task["execution_capabilities"] = {
                 "profile": "routine_development_v1",
                 "writable_paths": list(standing_authorization.writable_paths),
+                "writable_files": list(standing_authorization.writable_files),
                 "network": False,
                 "external_credentials": False,
                 "git_metadata": "read_only",
@@ -1151,7 +1187,8 @@ class TaskController:
                 "status": "pending", "requested_at": now, "expires_at": expires_at,
             }
         access = ("read" if standing_authorization
-                  and not standing_authorization.writable_paths else "write")
+                  and not standing_authorization.writable_paths
+                  and not standing_authorization.writable_files else "write")
         task["resource_requirements"] = {
             "worker": worker, "repository": profile.repository.lower(), "access": access,
         }
@@ -1484,6 +1521,8 @@ class TaskController:
             "repository": task.get("repository", profile.repository),
             "base_ref": task.get("base_ref", profile.base_ref),
             "consequence_class": task.get("consequence_class", "unclassified"),
+            "authorization": task.get("authorization", {}),
+            "execution_capabilities": task.get("execution_capabilities"),
             "title": task["title"], "instructions": task["instructions"],
             "kind": task.get("kind", "worker_task"),
             "operation_id": task.get("operation_id"),
@@ -1508,6 +1547,8 @@ class TaskController:
             "repository": task.get("repository", profile.repository),
             "base_ref": task.get("base_ref", profile.base_ref),
             "consequence_class": task.get("consequence_class", "unclassified"),
+            "authorization": task.get("authorization", {}),
+            "execution_capabilities": task.get("execution_capabilities"),
             "instructions": task["instructions"],
         }
 
@@ -1747,6 +1788,7 @@ class TaskController:
                             Path(workspace), self.config.state_dir, task["task_id"],
                             tuple(task.get("routine_writable_paths", ())),
                             tuple(task.get("routine_read_only_paths", ())),
+                            writable_files=tuple(task.get("routine_writable_files", ())),
                             read_write_paths=tuple(
                                 task.get("routine_read_write_paths", ())
                             ),
@@ -1906,11 +1948,14 @@ class TaskController:
             )
             execution_capabilities = task.get("execution_capabilities")
             writable_paths: list[str] = []
+            writable_files: list[str] = []
             if execution_capabilities is not None:
                 writable_paths = execution_capabilities.get("writable_paths")
-                if not isinstance(writable_paths, list):
+                writable_files = execution_capabilities.get("writable_files", [])
+                if not isinstance(writable_paths, list) or not isinstance(writable_files, list):
                     raise RuntimeError("standing task is missing its writable paths")
                 materialize_writable_paths(workspace, writable_paths)
+                materialize_writable_files(workspace, writable_files)
             probe_root: Path | None = None
             if worker.adapter == "codex" and execution_capabilities is not None:
                 probe_root, _, _ = trusted_probe.prepare_probe_root(
@@ -2018,6 +2063,7 @@ class TaskController:
                     worker.adapter == "codex" and execution_capabilities is not None
                 ),
                 "routine_writable_paths": writable_paths,
+                "routine_writable_files": writable_files,
                 "routine_read_only_paths": read_only_paths,
                 "routine_read_write_paths": [
                     str(workspace), *[str(path) for path in git_metadata_paths],

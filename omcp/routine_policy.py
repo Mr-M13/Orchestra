@@ -29,6 +29,7 @@ class RoutineConfinementPolicy:
 
     writable_paths: tuple[str, ...]
     read_only_paths: tuple[str, ...] = ()
+    writable_files: tuple[str, ...] = ()
     network_enabled: bool = False
     deny_orchestra_config: bool = True
     deny_tmpdir: bool = True
@@ -36,10 +37,14 @@ class RoutineConfinementPolicy:
     profile_name: str = PROFILE_NAME
 
     def __post_init__(self) -> None:
-        from omcp.routine_paths import normalize_writable_path
+        from omcp.routine_paths import normalize_writable_file, normalize_writable_path
 
         normalized = tuple(normalize_writable_path(value) for value in self.writable_paths)
+        normalized_files = tuple(normalize_writable_file(value) for value in self.writable_files)
+        if set(normalized) & set(normalized_files):
+            raise ValueError("a writable file cannot duplicate a writable directory")
         object.__setattr__(self, "writable_paths", normalized)
+        object.__setattr__(self, "writable_files", normalized_files)
         object.__setattr__(
             self, "read_only_paths",
             tuple(_safe_read_path(value) for value in self.read_only_paths),
@@ -51,6 +56,7 @@ class RoutineConfinementPolicy:
         rules = ','.join([
             '"."="read"', '".orchestra-tmp"="write"',
             *(f'"{value}"="write"' for value in self.writable_paths),
+            *(f'"{value}"="write"' for value in self.writable_files),
         ])
         args = [
             "-c", f'default_permissions="{self.profile_name}"',

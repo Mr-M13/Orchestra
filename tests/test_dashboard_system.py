@@ -2,176 +2,288 @@ from __future__ import annotations
 
 import io
 import json
-import subprocess
-import sys
+import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
+from dashboard import system
 from dashboard.app import Dashboard
 from dashboard.omcp import OMCPError
-from dashboard import system
 
 
-class SystemTests(unittest.TestCase):
-    def request(self, app, path='/api/system', method='GET'):
-        responses = []
-        body = b''.join(app({'PATH_INFO': path, 'REQUEST_METHOD': method, 'wsgi.input': io.BytesIO()}, lambda status, headers: responses.append((status, dict(headers)))))
-        return responses[0], body.decode()
+TASK_ID = "11111111-1111-1111-1111-111111111111"
 
-    def test_exact_allowlist(self):
-        for argv in [('/bin/sh', '-c', 'id'), ('/usr/bin/systemctl', 'restart', 'docker'),
-                     system.COMMANDS['docker'] + ('--no-trunc',), ('/usr/bin/curl', 'https://other.test'),
-                     ('/usr/bin/sudo', '-n', '/usr/bin/id'),
-                     system.COMMANDS['docker'][2:],  # no unprivileged fallback
-                     tuple(arg for arg in system.COMMANDS['docker'] if arg != '-n'),
-                     tuple('stop' if arg == 'ls' else arg for arg in system.COMMANDS['docker']),
-                     tuple('{{json .}}' if arg == '{{.State}}\t{{.Image}}' else arg for arg in system.COMMANDS['docker']),
-                     tuple('HEAD' if arg == 'GET' else arg for arg in system.COMMANDS['public']),
-                     system.COMMANDS['public'][:-1] + ('https://mcp.delnavazan.com/',),
-                     system.COMMANDS['public'] + ('--location',)]:
-            with self.subTest(argv=argv), mock.patch.object(subprocess, 'Popen') as popen:
-                with self.assertRaises(ValueError):
-                    system.run_command(argv)
-                popen.assert_not_called()
-        self.assertEqual(len(system.ALLOWED_COMMANDS), 4)
-        self.assertIn('-q', system.COMMANDS['public'])
-        self.assertNotIn('--location', system.COMMANDS['public'])
 
-    def test_fixed_probe_argv(self):
-        expected = {
-            'docker': ('/usr/bin/sudo', '-n', '/usr/bin/docker', 'container', 'ls', '--all', '--format', '{{.State}}\t{{.Image}}'),
-            'public': ('/usr/bin/curl', '-q', '--silent', '--request', 'GET', '--output', '/dev/null', '--write-out', '%{http_code}', '--max-time', '2', '--connect-timeout', '1', '--noproxy', '*', '--proto', '=https', 'https://mcp.delnavazan.com/healthz'),
-        }
-        for name, argv in expected.items():
-            with self.subTest(probe=name):
-                self.assertEqual(system.COMMANDS[name], argv)
-                self.assertEqual(self.helper("print('200', end='')", argv=argv), '200')
-        self.assertEqual([argv for argv in system.ALLOWED_COMMANDS if argv[0] == '/usr/bin/sudo'], [expected['docker']])
+def status_payload() -> dict:
+    return {
+        "health": "Needs attention",
+        "system": {
+            "uptime": "6h 8m", "load": "0.36 / 0.51 / 0.48",
+            "memory": "771 MB used of 3794 MB", "temperature": 41.9,
+            "storage": {"online": True, "percent": 6, "text": "411 GB free of 458 GB"},
+            "tailscale": True, "dashboardUrl": "http://secret-tailscale:8080/",
+        },
+        "services": {
+            "dashboard": True, "notifications": True, "receiver": True,
+            "pixel worker": True, "verifier": True, "cleanup": True,
+            "photos evidence": True, "Nextcloud Docker": True,
+            "unknown service": False,
+        },
+        "orchestra": {
+            "dashboard": True,
+            "services": {
+                "Dashboard V1": True, "GitHub dispatch": True,
+                "Health timer": True, "OMCP coordinator": True,
+                "Secure MCP tunnel": True, "unknown orchestra": False,
+            },
+        },
+        "pixel": {
+            "connected": False, "waiting": 0, "queued": 2, "verifying": 0,
+            "backedUp": 114, "dbAvailable": True,
+            "storagePercent": 6, "storageText": "411 GB free of 458 GB",
+            "timers": {
+                "pixelbox-v2-receiver.timer": True,
+                "pixelbox-v2-pixelworker.timer": True,
+                "pixelbox-v2-verifier.timer": True,
+                "pixelbox-v2-cleanup.timer": True,
+                "pixelbox-photos-evidence.timer": True,
+                "unknown.timer": False,
+            },
+            "recent": [
+                {"original_name": "PRIVATE-CANARY.jpg", "status": "BACKED_UP",
+                 "event_at": "2026-10-17 04:37:14"},
+            ],
+        },
+        "mbox": {
+            "hdd": "Online", "nextcloud": "Running",
+            "nextcloudUrl": "https://secret-tailscale.ts.net",
+            "storage": {"online": True, "percent": 0, "text": "1734 GB free of 1833 GB"},
+        },
+    }
 
-    def helper(self, code, timeout=0.5, argv=None):
-        original = subprocess.Popen
-        spawned = []
+
+class StatusServer:
+    def __init__(self, responses, delay=0.0):
+        self.responses = list(responses)
+        self.requests = []
+        self.delay = delay
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return
+
+            def do_GET(self):
+                outer.requests.append((self.command, self.path, dict(self.headers)))
+                if outer.delay:
+                    time.sleep(outer.delay)
+                status, body, headers = outer.responses.pop(0)
+                data = body if isinstance(body, bytes) else body.encode()
+                self.send_response(status)
+                for key, value in headers.items():
+                    self.send_header(key, value)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.port = self.server.server_port
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+
+class SystemCollectorTests(unittest.TestCase):
+    def public(self, code=200):
+        return lambda: system._public_projection("mcp.delnavazan.com", code)
+
+    def test_uses_only_the_exact_loopback_get_projection(self):
+        server = StatusServer([(200, json.dumps(status_payload()), {"Content-Type": "application/json"})])
+        self.addCleanup(server.close)
+        collector = system.SystemCollector(
+            status_port=server.port, public_fetcher=self.public(403),
+        )
+        result = collector.snapshot()
+        self.assertEqual(server.requests[0][0], "GET")
+        self.assertEqual(server.requests[0][1], "/api/status")
+        self.assertEqual(result["state"], "available")
+        self.assertEqual(result["pixelbox"]["system"]["uptime"], "6h 8m")
+        self.assertEqual(result["pixelbox"]["system"]["temperature_c"], 41.9)
+        self.assertEqual(result["pixelbox"]["system"]["tailscale"], "up")
+        self.assertEqual(result["pixelbox"]["photo"]["backed_up"], 114)
+        self.assertEqual(result["pixelbox"]["photo"]["queued"], 2)
+        self.assertEqual(result["pixelbox"]["photo"]["recent"], [{
+            "status": "BACKED_UP", "event_at": "2026-10-17 04:37:14",
+        }])
+        self.assertEqual(result["mbox"]["hdd"], "Online")
+        self.assertEqual(result["mbox"]["nextcloud"], "Running")
+        self.assertEqual(result["mbox"]["storage"]["text"], "1734 GB free of 1833 GB")
+        self.assertEqual(result["nextcloud"], {"state": "Running", "docker": "up"})
+        self.assertEqual(result["pixelbox"]["services"]["Nextcloud Docker"], "up")
+        self.assertEqual(result["orchestra_services"]["OMCP coordinator"], "up")
+        self.assertEqual(result["public"], {
+            "host": "mcp.delnavazan.com", "state": "reachable", "http_status": 403,
+        })
+        serialized = json.dumps(result, sort_keys=True)
+        for forbidden in (
+            "dashboardUrl", "nextcloudUrl", "secret-tailscale", "unknown service",
+            "unknown orchestra", "unknown.timer", "PRIVATE-CANARY", "original_name",
+        ):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_redirect_and_non_200_are_not_followed(self):
+        for code in (302, 401, 500):
+            with self.subTest(code=code):
+                server = StatusServer([(code, "not accepted", {"Location": "http://unapproved.test/"})])
+                self.addCleanup(server.close)
+                collector = system.SystemCollector(
+                    status_port=server.port, public_fetcher=self.public(200),
+                )
+                result = collector.snapshot()
+                self.assertEqual(result["state"], "unavailable")
+                self.assertEqual(len(server.requests), 1)
+                self.assertEqual(result["pixelbox"]["system"]["uptime"], "Unavailable")
+                self.assertEqual(result["public"]["state"], "healthy")
+
+    def test_oversized_malformed_and_unavailable_status_fail_closed(self):
+        cases = [
+            (200, "X" * 128, {"Content-Type": "application/json"}, 64),
+            (200, "X" * 128, {"Content-Type": "application/json"}, 128),
+            (200, "{broken", {"Content-Type": "application/json"}, 131072),
+            (200, "[]", {"Content-Type": "application/json"}, 131072),
+        ]
+        for code, body, headers, maximum in cases:
+            with self.subTest(body=body[:12]):
+                server = StatusServer([(code, body, headers)])
+                self.addCleanup(server.close)
+                collector = system.SystemCollector(
+                    status_port=server.port, max_status_bytes=maximum,
+                    public_fetcher=self.public(200),
+                )
+                result = collector.snapshot()
+                self.assertEqual(result["state"], "unavailable")
+                self.assertEqual(result["source"], "pixelbox-api")
+        collector = system.SystemCollector(
+            status_fetcher=mock.Mock(side_effect=OSError("SECRET")),
+            public_fetcher=mock.Mock(side_effect=OSError("SECRET")),
+        )
+        result = collector.snapshot()
+        self.assertEqual(result["state"], "unavailable")
+        self.assertEqual(result["public"]["state"], "unavailable")
+        self.assertNotIn("SECRET", json.dumps(result))
+
+    def test_total_deadline_bounds_a_stalled_legacy_endpoint(self):
+        server = StatusServer(
+            [(200, json.dumps(status_payload()), {"Content-Type": "application/json"})],
+            delay=0.3,
+        )
+        self.addCleanup(server.close)
+        collector = system.SystemCollector(
+            status_port=server.port, timeout=0.05,
+            public_fetcher=self.public(200),
+        )
+        started = time.monotonic()
+        result = collector.snapshot()
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(result["state"], "unavailable")
+        self.assertEqual(result["public"]["state"], "healthy")
+
+    def test_tls_context_keeps_verification_enabled(self):
+        context = system._tls_context()
+        self.assertTrue(context.get_ca_certs())
+        self.assertTrue(context.check_hostname)
+        self.assertEqual(context.verify_mode, system.ssl.CERT_REQUIRED)
+
+    def test_cache_is_bounded_and_returns_an_independent_copy(self):
         calls = []
-        def launch(argv, **kwargs):
-            calls.append((argv, kwargs))
-            child = original((sys.executable, '-c', code), **kwargs)
-            spawned.append(child)
-            return child
-        with mock.patch.object(system.subprocess, 'Popen', side_effect=launch), mock.patch.object(system, 'TIMEOUT', timeout):
-            result = system.run_command(argv or system.COMMANDS['docker'])
-        self.assertIsNotNone(spawned[0].poll())
-        self.assertEqual(calls[0][0], argv or system.COMMANDS['docker'])
-        self.assertFalse(calls[0][1]['shell'])
-        self.assertEqual(calls[0][1]['env'], {'PATH': '/usr/bin:/bin', 'LANG': 'C', 'LC_ALL': 'C', 'HOME': '/nonexistent'})
-        self.assertEqual(calls[0][1]['stderr'], subprocess.DEVNULL)
-        return result
+        collector = system.SystemCollector(
+            status_fetcher=lambda: calls.append(1) or status_payload(),
+            public_fetcher=self.public(200),
+        )
+        first = collector.snapshot()
+        first["pixelbox"]["system"]["uptime"] = "tampered"
+        second = collector.snapshot()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(second["pixelbox"]["system"]["uptime"], "6h 8m")
+        collector._collected -= system.CACHE_SECONDS
+        collector.snapshot()
+        self.assertEqual(len(calls), 2)
 
-    def test_success_and_nonzero_discard_errors(self):
-        self.assertEqual(self.helper("print('running\\tnextcloud:latest')"), 'running\tnextcloud:latest\n')
-        self.assertIsNone(self.helper("import sys; print('TOKEN=secret'); sys.exit(1)"))
-
-    def test_timeout_reaps_process(self):
-        start = time.monotonic()
-        self.assertIsNone(self.helper('import time; time.sleep(10)', timeout=0.08))
-        self.assertLess(time.monotonic() - start, 2)
-
-    def test_output_limit_during_read(self):
-        self.assertIsNone(self.helper("import sys; sys.stdout.write('X' * 2000000); sys.stdout.flush()"))
-        self.assertEqual(len(self.helper("import sys; sys.stdout.write('X' * 65536)")), system.MAX_OUTPUT)
-
-    def test_missing_and_denied(self):
-        for error in [FileNotFoundError('secret'), PermissionError('secret')]:
-            with mock.patch.object(system.subprocess, 'Popen', side_effect=error):
-                self.assertIsNone(system.run_command(system.COMMANDS['docker']))
-
-    def test_projection_redacts_secrets(self):
-        secret = 'CANARY_SECRET_123'
-        services = system.service_states('Id=docker.service\nLoadState=loaded\nActiveState=active\nEnvironment=TOKEN=' + secret)
-        self.assertEqual(services['docker'], 'active')
-        self.assertEqual(system.service_states('Id=docker.service\nLoadState=not-found\nActiveState=inactive')['docker'], 'unavailable')
-        tailscale = system.tailscale_summary(json.dumps({'BackendState': 'Running', 'TailscaleIPs': ['100.64.0.1', 'fd7a:115c:a1e0::1'], 'Peer': {secret: secret}, 'AuthURL': secret}))
-        docker = system.docker_summary('running\tnextcloud:latest\nexited\tprivate/' + secret + ':latest\n')
-        self.assertEqual(docker['nextcloud_running'], 1)
-        self.assertNotIn(secret, json.dumps([services, tailscale, docker, system.public_summary(secret)]))
-        self.assertEqual(system.tailscale_summary('{broken')['state'], 'unavailable')
-        self.assertEqual(system.tailscale_summary(json.dumps({'BackendState': secret, 'TailscaleIPs': [secret]}))['addresses'], [])
-        self.assertEqual(system.docker_summary('TOKEN=' + secret)['state'], 'unavailable')
-        self.assertEqual(system.public_summary('403')['state'], 'reachable')
-        self.assertEqual(system.public_summary('503')['state'], 'unhealthy')
-        self.assertEqual(system.public_summary('200')['state'], 'healthy')
-
-    def test_missing_host_metrics_and_file_bounds(self):
-        with mock.patch.object(system.os, 'getloadavg', side_effect=OSError), mock.patch.object(system, 'read_metric', side_effect=OSError), mock.patch.object(system.shutil, 'disk_usage', side_effect=OSError):
-            self.assertTrue(all(value is None for value in system.host_metrics().values()))
-        with mock.patch('builtins.open', mock.mock_open(read_data=b'X' * 8193)) as source:
-            with self.assertRaises(ValueError):
-                system.read_metric('/proc/uptime')
-            source().read.assert_called_once_with(8193)
-
-    def test_host_metric_projection(self):
-        files = {
-            "/proc/meminfo": "MemTotal: 2048 kB\nMemAvailable: 1024 kB\nSecret: NEVER_DISPLAY\n",
-            "/proc/uptime": "3600.12 99",
-            "/sys/class/thermal/thermal_zone0/type": "x86_pkg_temp\n",
-            "/sys/class/thermal/thermal_zone0/temp": "42500\n",
-        }
-        with mock.patch.object(system, 'read_metric', side_effect=lambda path: files[path]), mock.patch.object(system.os, 'getloadavg', return_value=(1, 2, 3)), mock.patch.object(system.os, 'cpu_count', return_value=4), mock.patch.object(system.shutil, 'disk_usage', return_value=mock.Mock(total=4096, used=1024)):
-            metrics = system.host_metrics()
-        self.assertEqual(metrics['memory'], {'total_bytes': 2097152, 'used_bytes': 1048576})
-        self.assertEqual(metrics['temperature_c'], 42.5)
-        self.assertEqual(metrics['uptime_seconds'], 3600.12)
-        self.assertEqual(metrics['cpu_count'], 4)
-        self.assertNotIn('NEVER_DISPLAY', json.dumps(metrics))
-
-    def test_cache_and_unavailable_sections(self):
-        collector = system.SystemCollector()
-        with mock.patch.object(system, 'run_command', return_value=None) as run, mock.patch.object(system, 'host_metrics', return_value={}):
-            one = collector.snapshot()
-            one['services']['docker'] = 'tampered'
-            two = collector.snapshot()
-            self.assertEqual(run.call_count, 4)
-            self.assertEqual(two['services']['docker'], 'unavailable')
-            self.assertEqual(two['docker']['state'], 'unavailable')
-            collector._collected -= system.CACHE_SECONDS
-            collector.snapshot()
-            self.assertEqual(run.call_count, 8)
+    def test_public_health_classification_does_not_retain_a_body(self):
+        self.assertEqual(system._public_projection("host", 200)["state"], "healthy")
+        self.assertEqual(system._public_projection("host", 403)["state"], "reachable")
+        self.assertEqual(system._public_projection("host", 503)["state"], "unhealthy")
+        self.assertEqual(system._public_projection("host", 0)["state"], "unavailable")
+        self.assertEqual(system._public_projection("host", 200)["host"], "host")
 
     def test_endpoint_security_and_methods(self):
         collector = mock.Mock()
-        collector.snapshot.return_value = {'services': {'docker': 'unavailable'}}
+        collector.snapshot.return_value = {"state": "available", "pixelbox": {}}
         client = mock.Mock()
         app = Dashboard(client, system_collector=collector)
-        (status, headers), body = self.request(app)
-        self.assertEqual(status, '200 OK')
+        responses = []
+        body = b"".join(app(
+            {"PATH_INFO": "/api/system", "REQUEST_METHOD": "GET", "wsgi.input": io.BytesIO()},
+            lambda status, headers: responses.append((status, dict(headers))),
+        ))
+        status, headers = responses[0]
+        self.assertEqual(status, "200 OK")
         self.assertEqual(json.loads(body), collector.snapshot.return_value)
-        self.assertEqual(headers['Cache-Control'], 'no-store')
-        self.assertEqual(headers['Content-Security-Policy'], "default-src 'none'")
-        self.assertEqual(headers['X-Content-Type-Options'], 'nosniff')
-        self.assertEqual(headers['X-Frame-Options'], 'DENY')
-        self.assertEqual(headers['Referrer-Policy'], 'no-referrer')
-        for method in ['POST', 'PUT', 'DELETE', 'HEAD']:
-            (status, headers), _ = self.request(app, method=method)
-            self.assertEqual(status, '405 Method Not Allowed')
-            self.assertEqual(headers['Allow'], 'GET')
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(headers["Content-Security-Policy"], "default-src 'none'")
+        self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(headers["X-Frame-Options"], "DENY")
+        self.assertEqual(headers["Referrer-Policy"], "no-referrer")
+        for method in ("POST", "PUT", "DELETE", "HEAD"):
+            responses = []
+            app(
+                {"PATH_INFO": "/api/system", "REQUEST_METHOD": method, "wsgi.input": io.BytesIO()},
+                lambda status, headers: responses.append((status, dict(headers))),
+            )
+            self.assertEqual(responses[0][0], "405 Method Not Allowed")
+            self.assertEqual(responses[0][1]["Allow"], "GET")
         collector.snapshot.assert_called_once()
         client.call.assert_not_called()
 
-    def test_rendering_survives_omcp_offline(self):
+    def test_rendered_panel_uses_the_new_unified_projection_and_no_approval_controls(self):
+        app = Dashboard(mock.Mock(), system_collector=mock.Mock())
+        panel = app.system_panel()
+        for key in (
+            "pixelbox", "photo", "photo-timers", "photo-recent", "mbox",
+            "nextcloud", "pixelbox-services", "orchestra-services", "public",
+        ):
+            self.assertIn(f'id="system-{key}"', panel)
+        self.assertIn("fixed loopback", panel)
+        self.assertNotIn("Approve", panel)
+
+    def test_omcp_offline_still_renders_system_panel_and_hides_exception_text(self):
         client = mock.Mock()
-        client.call.side_effect = OMCPError('TOKEN=secret')
+        client.call.side_effect = OMCPError("TOKEN=secret")
         app = Dashboard(client)
-        (status, _), page = self.request(app, '/')
-        self.assertEqual(status, '503 Service Unavailable')
-        self.assertIn('system-overview', page)
-        self.assertIn('PixelBox', page)
-        self.assertIn('Orchestra is offline', page)
-        self.assertNotIn('TOKEN=secret', page)
-        self.assertIn('system-load', page)
-        self.assertNotIn('restart', page.lower())
-        from dashboard.app import esc
-        self.assertEqual(esc('<script>"'), '&lt;script&gt;&quot;')
+        responses = []
+        page = b"".join(app(
+            {"PATH_INFO": "/", "REQUEST_METHOD": "GET", "wsgi.input": io.BytesIO()},
+            lambda status, headers: responses.append((status, dict(headers))),
+        )).decode()
+        self.assertEqual(responses[0][0], "503 Service Unavailable")
+        self.assertIn("system-overview", page)
+        self.assertIn("Orchestra is offline", page)
+        self.assertNotIn("TOKEN=secret", page)
+
+    def test_no_privileged_or_shell_probe_surface_remains(self):
+        with open(system.__file__, encoding="utf-8") as source_file:
+            source = source_file.read()
+        self.assertNotIn("import subprocess", source)
+        self.assertNotIn("/usr/bin/sudo", source)
+        self.assertNotIn("container ls", source)
+        self.assertFalse(hasattr(system, "COMMANDS"))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

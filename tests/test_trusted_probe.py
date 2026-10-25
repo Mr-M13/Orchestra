@@ -63,6 +63,7 @@ class TrustedProbeCommandTests(unittest.TestCase):
                 patch("omcp.trusted_probe.subprocess.run", side_effect=fake_run):
             checks = trusted_probe.run_trusted_security_probe(
                 self.workspace, self.state, self.task_id, ("platform",), (),
+                writable_files=("dashboard/system.py",),
             )
         self.assertEqual(set(checks), set(worker_contract.REQUIRED_SECURITY_CHECKS))
         command = calls[0][0]
@@ -78,6 +79,12 @@ class TrustedProbeCommandTests(unittest.TestCase):
         self.assertIn("--property=ReadWritePaths=" + str(self.workspace), command)
         self.assertIn("permissions.orchestra-routine.network.enabled=false", command)
         self.assertIn("permissions.orchestra-routine.filesystem./etc/orchestra=\"deny\"", command)
+        self.assertIn(
+            'permissions.orchestra-routine.filesystem.:workspace_roots={'
+            '"."="read",".orchestra-tmp"="write","platform"="write",'
+            '"dashboard/system.py"="write"}',
+            command,
+        )
         self.assertIn("--report", command)
         self.assertIn("-", command)
         self.assertFalse((self.workspace / ".orchestra-tmp").exists())
@@ -112,6 +119,7 @@ class TrustedProbeCommandTests(unittest.TestCase):
     def test_worker_and_probe_share_the_same_policy_arguments(self):
         policy = RoutineConfinementPolicy(
             ("platform", "theme"), ("/tmp/owner-checkout",),
+            writable_files=("dashboard/system.py",),
             network_enabled=False, deny_orchestra_config=True,
         )
         worker = policy.worker_command("/usr/bin/codex", self.workspace, self.base / "result")
@@ -151,6 +159,64 @@ class TrustedProbeCommandTests(unittest.TestCase):
             self.assertIn(token, strong_probe)
             self.assertNotIn(token, weak_worker)
             self.assertNotIn(token, weak_probe)
+
+
+@unittest.skipUnless(
+    os.environ.get("ORCHESTRA_FILE_GRANT_SANDBOX") == "1"
+    and sys.platform == "darwin"
+    and shutil.which("codex"),
+    "opt-in macOS Codex file-grant sandbox integration test",
+)
+class FileGrantSandboxIntegrationTests(unittest.TestCase):
+    def test_exact_file_and_completion_are_writable_but_peers_are_denied(self):
+        with tempfile.TemporaryDirectory(prefix="orchestra-file-grant-") as directory:
+            workspace = Path(directory) / "work"
+            workspace.mkdir()
+            (workspace / "dashboard").mkdir()
+            (workspace / "dashboard/system.py").write_text("original\n")
+            (workspace / "tests").mkdir()
+            (workspace / ".git").mkdir()
+            (workspace / ".orchestra-tmp").mkdir()
+            probe = workspace / "probe.sh"
+            probe.write_text(r"""
+attempt() {
+  name="$1"; path="$2"; data="$3"
+  if printf '%s\n' "$data" > "$path" 2>/dev/null; then printf '%s allowed\n' "$name"; else printf '%s denied\n' "$name"; fi
+}
+cd "$1"
+attempt exact_file dashboard/system.py changed
+attempt sibling_file dashboard/other.py denied
+attempt tests tests/escape.txt denied
+attempt completion .orchestra-tmp/orchestra-completion.json '{"status":"success"}'
+attempt outside /tmp/orchestra-file-grant-outside.txt denied
+attempt git .git/config denied
+""")
+            policy = RoutineConfinementPolicy(
+                (), writable_files=("dashboard/system.py",),
+            )
+            codex = shutil.which("codex")
+            self.assertIsNotNone(codex)
+            completed = subprocess.run(
+                policy.probe_command(
+                    codex, workspace,
+                    ["/bin/sh", str(probe), str(workspace)],
+                ),
+                cwd=workspace, capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            lines = set(completed.stdout.splitlines())
+            self.assertEqual(lines, {
+                "exact_file allowed", "sibling_file denied", "tests denied",
+                "completion allowed", "outside denied", "git denied",
+            })
+            self.assertEqual(
+                (workspace / "dashboard/system.py").read_text(), "changed\n",
+            )
+            self.assertTrue(
+                (workspace / ".orchestra-tmp/orchestra-completion.json").is_file(),
+            )
+            self.assertFalse((workspace / "dashboard/other.py").exists())
+            self.assertFalse((workspace / "tests/escape.txt").exists())
 
 
 @unittest.skipUnless(
