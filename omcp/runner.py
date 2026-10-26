@@ -541,13 +541,16 @@ class PinnedProviderGateway:
     MAX_REQUEST_BYTES = 4 * 1024 * 1024
     MAX_RESPONSE_BYTES = 16 * 1024 * 1024
     MAX_REQUESTS = 64
+    API_PATH = "/v1/chat/completions"
+    GATEWAY_SUFFIX = "/v1"
 
     def __init__(self, provider: str, model: str, endpoint_host: str,
                  credential_file: Path, seconds: int) -> None:
         if (provider not in OPENCODE_PROVIDER_ENDPOINTS
                 or OPENCODE_PROVIDER_ENDPOINTS[provider] != endpoint_host
-                or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.:-]+", model)
-                or not model.startswith(provider + "/")
+                or not (model == DEEPSEEK_MODEL
+                        or (re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.:-]+", model)
+                            and model.startswith(provider + "/")))
                 or not 60 <= seconds <= 7200):
             raise ValueError("invalid pinned provider gateway")
         owner_only_credential(credential_file)
@@ -555,13 +558,14 @@ class PinnedProviderGateway:
         if not api_key or len(api_key) > 8192:
             raise ValueError("credential_file is invalid")
         self.provider = provider
-        self.model_id = model.rsplit("/", 1)[1]
+        self.model_id = model.rsplit("/", 1)[-1]
         self.endpoint_host = endpoint_host
         self._api_key = api_key
         self._timeout = min(seconds, 300)
         self._token = secrets.token_urlsafe(32)
         self._request_count = 0
         self._request_lock = threading.Lock()
+        self.failure_status: int | None = None
         self._server: http.server.ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self.url: str | None = None
@@ -578,7 +582,7 @@ class PinnedProviderGateway:
         # OpenCode may open a fresh loopback connection for its next model turn.
         handler.close_connection = True
         expected_host = f"127.0.0.1:{self._server.server_port}" if self._server else ""
-        expected_path = f"/{self._token}/v1/chat/completions"
+        expected_path = f"/{self._token}{self.API_PATH}"
 
         def header_values(name: str) -> list[str]:
             get_all = getattr(handler.headers, "get_all", None)
@@ -619,8 +623,7 @@ class PinnedProviderGateway:
         except (UnicodeDecodeError, json.JSONDecodeError):
             self._reject(handler, 400)
             return
-        if (not isinstance(payload, dict) or payload.get("model") != self.model_id
-                or not isinstance(payload.get("messages"), list)):
+        if not self._valid_payload(payload):
             self._reject(handler, 400)
             return
         upstream_body = json.dumps(payload, separators=(",", ":")).encode()
@@ -631,14 +634,14 @@ class PinnedProviderGateway:
                 self.endpoint_host, 443, timeout=self._timeout,
                 context=ssl.create_default_context(),
             )
-            connection.request("POST", "/v1/chat/completions", upstream_body, {
+            connection.request("POST", self.API_PATH, upstream_body, {
                 "Authorization": "Bearer " + self._api_key,
                 "Content-Type": "application/json",
                 "Accept": "text/event-stream, application/json",
             })
             response = connection.getresponse()
-            if not 200 <= response.status <= 599:
-                raise ProviderRequestError()
+            if not 200 <= response.status < 300:
+                self.failure_status = response.status
             content_type = response.getheader("Content-Type", "application/json")
             if not (content_type.lower().startswith("application/json")
                     or content_type.lower().startswith("text/event-stream")):
@@ -666,6 +669,25 @@ class PinnedProviderGateway:
         finally:
             if connection is not None:
                 connection.close()
+
+    def _valid_payload(self, payload: object) -> bool:
+        return bool(
+            isinstance(payload, dict)
+            and payload.get("model") == self.model_id
+            and isinstance(payload.get("messages"), list)
+        )
+
+    def provider_failure_category(self) -> str | None:
+        status = self.failure_status
+        if status in {401, 403}:
+            return "authentication"
+        if status == 402:
+            return "credit_exhausted"
+        if status == 429:
+            return "rate_limit"
+        if status is not None and 500 <= status <= 599:
+            return "transient_provider"
+        return None
 
     @staticmethod
     def _reject(handler: http.server.BaseHTTPRequestHandler, status: int) -> None:
@@ -707,7 +729,7 @@ class PinnedProviderGateway:
 
         self._server = GatewayServer(("127.0.0.1", 0), GatewayHandler)
         port = self._server.server_port
-        self.url = f"http://127.0.0.1:{port}/{self._token}/v1"
+        self.url = f"http://127.0.0.1:{port}/{self._token}{self.GATEWAY_SUFFIX}"
         self._thread = threading.Thread(
             target=self._server.serve_forever, name="omcp-provider-gateway", daemon=True,
         )
@@ -725,6 +747,20 @@ class PinnedProviderGateway:
         if thread is not None:
             thread.join(timeout=2)
         self._api_key = ""
+
+
+class PinnedResponsesGateway(PinnedProviderGateway):
+    """Pinned Responses API gateway for the DeepSeek/Codex runtime."""
+
+    API_PATH = "/responses"
+    GATEWAY_SUFFIX = ""
+
+    def _valid_payload(self, payload: object) -> bool:
+        return bool(
+            isinstance(payload, dict)
+            and payload.get("model") == self.model_id
+            and isinstance(payload.get("input"), (str, list))
+        )
 
 
 def _classify_opencode_logs(runtime_dir: Path, collector: OpenCodeDiagnosticCollector) -> None:
@@ -891,6 +927,45 @@ def sanitize_provider_text(value: object, maximum: int) -> str:
     return value.encode("utf-8")[:maximum].decode("utf-8", "ignore")
 
 
+def codex_provider_args(base_url: str, model: str) -> list[str]:
+    """Pin a Codex worker to the DeepSeek Responses API through our gateway."""
+    if not re.fullmatch(r"http://127\.0\.0\.1:\d{1,5}/[A-Za-z0-9_-]{32,}/?", base_url):
+        raise ValueError("invalid Codex provider gateway URL")
+    if model != DEEPSEEK_MODEL:
+        raise ValueError("unsupported Codex provider model")
+    values = {
+        "model_provider": '"deepseek"',
+        "model": f'"{model}"',
+        "model_providers.deepseek.name": '"DeepSeek"',
+        "model_providers.deepseek.base_url": f'"{base_url}"',
+        "model_providers.deepseek.env_key": '"DEEPSEEK_API_KEY"',
+        "model_providers.deepseek.wire_api": '"responses"',
+        "model_providers.deepseek.requires_openai_auth": "false",
+        "shell_environment_policy.inherit": '"none"',
+        "agents.enabled": "false",
+        "features.multi_agent": "false",
+        "features.browser_use": "false",
+        "features.computer_use": "false",
+        "features.apps": "false",
+        "features.plugins": "false",
+        "features.skill_search": "false",
+        "features.skill_mcp_dependency_install": "false",
+        "features.image_generation": "false",
+        "features.in_app_browser": "false",
+        "features.in_app_chat": "false",
+        "features.goals": "false",
+        "features.view_image": "false",
+        "features.exec_permission_approvals": "false",
+        "features.default_mode_request_user_input": "false",
+        "tools.experimental_request_user_input.enabled": "false",
+        "web_search": '"disabled"',
+    }
+    args: list[str] = []
+    for key, value in values.items():
+        args.extend(["-c", f"{key}={value}"])
+    return args
+
+
 def run_deepseek(spec: dict[str, Any], prompt_path: Path, result_path: Path,
                  seconds: int, maximum: int) -> int:
     connection: http.client.HTTPSConnection | None = None
@@ -1004,6 +1079,15 @@ def run(spec_path: Path) -> int:
                 task_temp_tmp = workspace / TASK_TEMP_DIR
                 task_temp_tmp.mkdir(mode=0o700, exist_ok=True)
                 environment["TMPDIR"] = str(task_temp_tmp)
+                if spec.get("provider") == DEEPSEEK_PROVIDER:
+                    credential = Path(str(spec.get("credential_file", "")))
+                    gateway = PinnedResponsesGateway(
+                        DEEPSEEK_PROVIDER, spec.get("model"), "api.deepseek.com",
+                        credential, seconds,
+                    )
+                    gateway_url = gateway.start()
+                    command = [command[0], *codex_provider_args(gateway_url, spec.get("model")), *command[1:]]
+                    environment["DEEPSEEK_API_KEY"] = "omcp-local-gateway"
             else:
                 if (not isinstance(capabilities, dict) or capabilities.get("profile") != "routine_development_v1"
                         or capabilities.get("network") is not False or capabilities.get("external_credentials") is not False
@@ -1036,6 +1120,15 @@ def run(spec_path: Path) -> int:
                     ],
                 )
                 environment = worker_environment(spec.get("codex_home")); environment["TMPDIR"] = str(task_temp_tmp)
+                if spec.get("provider") == DEEPSEEK_PROVIDER:
+                    credential = Path(str(spec.get("credential_file", "")))
+                    gateway = PinnedResponsesGateway(
+                        DEEPSEEK_PROVIDER, spec.get("model"), "api.deepseek.com",
+                        credential, seconds,
+                    )
+                    gateway_url = gateway.start()
+                    command = [command[0], *codex_provider_args(gateway_url, spec.get("model")), *command[1:]]
+                    environment["DEEPSEEK_API_KEY"] = "omcp-local-gateway"
             if (contract_probe_command is not None
                     and spec.get("contract_probe") is True):
                 try:
@@ -1170,6 +1263,35 @@ def run(spec_path: Path) -> int:
             codex_credit_exhaustion(codex_events, log, exit_code)
             if adapter == "codex" and not sandbox_failure else None
         )
+        provider_failure = (
+            gateway.provider_failure_category()
+            if adapter == "codex" and isinstance(gateway, PinnedProviderGateway)
+            else None
+        )
+        if provider_failure == "credit_exhausted":
+            error_type = "CreditExhausted"
+            worker_diagnostic = {
+                "category": "credit_exhausted", "stage": "provider",
+                "provider": "deepseek",
+            }
+            completion_contract = None
+            completion_contract_error = None
+            if not required_result_present(result):
+                write_failure_result(
+                    result, "DeepSeek account balance is insufficient; no coding result was produced.\n",
+                )
+        elif provider_failure in {"authentication", "rate_limit", "transient_provider"}:
+            error_type = {
+                "authentication": "ProviderAuthenticationFailed",
+                "rate_limit": "ProviderRateLimited",
+                "transient_provider": "ProviderTransientFailure",
+            }[provider_failure]
+            worker_diagnostic = {
+                "category": provider_failure, "stage": "provider",
+                "provider": "deepseek",
+            }
+        if provider_failure is not None and exit_code == 0:
+            exit_code = 1
         if credit_failure is not None:
             error_type = "CreditExhausted"
             worker_diagnostic = credit_failure
