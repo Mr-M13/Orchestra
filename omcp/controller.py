@@ -442,6 +442,8 @@ class Config:
     repository_parallelism: str = "serialized"
     max_worker_seconds: int = 1_800
     max_parallel_tasks: int = 1
+    deepseek_max_parallel_tasks: int = 2
+    deepseek_guard_cleared_after: str | None = None
     startup_lease_seconds: int = 30
     heartbeat_seconds: int = 15
     sandbox_backend: str = "auto"
@@ -523,16 +525,35 @@ class Config:
                 raise ValueError("worker poll_seconds must be between 2 and 300")
             if worker.adapter == "codex":
                 if any(value is not None for value in (
-                    worker.provider, worker.model, worker.credential_file,
                     worker.github_repository, worker.workflow, worker.workflow_ref,
                     worker.agent, worker.workflow_sha, worker.github_service_uid,
                     worker.github_dispatch_socket,
                 )):
-                    raise ValueError("Codex workers may not configure a provider or credential file")
+                    raise ValueError("Codex workers may not configure remote fields")
                 canonical = canonical_codex_executable(worker.command[0])
-                workers[worker.name] = Worker(
-                    worker.name, (canonical,), worker.codex_home, "codex",
-                )
+                if (worker.provider is not None or worker.model is not None
+                        or worker.credential_file is not None):
+                    if (worker.provider != DEEPSEEK_PROVIDER
+                            or worker.model != DEEPSEEK_MODEL):
+                        raise ValueError(
+                            "DeepSeek Codex workers require the fixed DeepSeek provider and model"
+                        )
+                    if not isinstance(worker.credential_file, str) or not worker.credential_file:
+                        raise ValueError("DeepSeek Codex workers require a credential_file")
+                    credential_file = Path(worker.credential_file).expanduser().resolve(strict=True)
+                    credential_stat = credential_file.stat()
+                    if (not credential_file.is_file() or credential_stat.st_mode & 0o077
+                            or credential_stat.st_uid != os.geteuid()):
+                        raise ValueError("credential_file must be an owner-only regular file")
+                    workers[worker.name] = Worker(
+                        worker.name, (canonical,), worker.codex_home, "codex",
+                        DEEPSEEK_PROVIDER, DEEPSEEK_MODEL, str(credential_file),
+                        "api.deepseek.com",
+                    )
+                else:
+                    workers[worker.name] = Worker(
+                        worker.name, (canonical,), worker.codex_home, "codex",
+                    )
                 continue
             if worker.adapter == "github_actions":
                 if worker.codex_home is not None:
@@ -673,6 +694,19 @@ class Config:
             raise ValueError("max_parallel_tasks must be an integer")
         if not 1 <= max_parallel_tasks <= 64:
             raise ValueError("max_parallel_tasks must be between 1 and 64")
+        deepseek_max_parallel = raw.get("deepseek_max_parallel_tasks", 2)
+        if (not isinstance(deepseek_max_parallel, int)
+                or isinstance(deepseek_max_parallel, bool)
+                or not 1 <= deepseek_max_parallel <= 64):
+            raise ValueError("deepseek_max_parallel_tasks must be between 1 and 64")
+        guard_cleared = raw.get("deepseek_guard_cleared_after")
+        if guard_cleared is not None:
+            if not isinstance(guard_cleared, str):
+                raise ValueError("deepseek_guard_cleared_after must be an ISO timestamp")
+            try:
+                datetime.fromisoformat(guard_cleared.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValueError("deepseek_guard_cleared_after must be an ISO timestamp") from exc
         startup_lease_seconds = raw.get("startup_lease_seconds", 30)
         if not isinstance(startup_lease_seconds, int) or isinstance(startup_lease_seconds, bool):
             raise ValueError("startup_lease_seconds must be an integer")
@@ -890,6 +924,8 @@ class Config:
             repository_parallelism=repository_parallelism,
             max_worker_seconds=max_worker_seconds,
             max_parallel_tasks=max_parallel_tasks,
+            deepseek_max_parallel_tasks=deepseek_max_parallel,
+            deepseek_guard_cleared_after=guard_cleared,
             startup_lease_seconds=startup_lease_seconds,
             heartbeat_seconds=heartbeat_seconds,
             sandbox_backend=requested_sandbox,
@@ -1723,6 +1759,44 @@ class TaskController:
             "_worker": last.get("worker"),
         }
 
+    def _deepseek_guard(self) -> dict[str, Any] | None:
+        """Return the shared DeepSeek account block, if any lane proves one."""
+        provider_workers = [
+            name for name, worker in self.config.workers.items()
+            if worker.provider == DEEPSEEK_PROVIDER
+        ]
+        if not provider_workers:
+            return None
+        cleared = self.config.deepseek_guard_cleared_after
+        latest: tuple[str, dict[str, Any]] | None = None
+        for name in provider_workers:
+            last = self._last_terminal_attempt(name)
+            if last is None:
+                continue
+            finished = last.get("finished_at") or ""
+            if cleared is not None and isinstance(finished, str) and finished <= cleared:
+                continue
+            if latest is None or finished > latest[0]:
+                latest = (finished, last)
+        if latest is None:
+            return None
+        category = latest[1].get("failure_category")
+        if category in {"credit_exhausted", "authentication"}:
+            return {
+                "reason": category,
+                "task_id": latest[1].get("task_id"),
+                "finished_at": latest[1].get("finished_at"),
+            }
+        return None
+
+    def _provider_active_count(self, provider: str) -> int:
+        return sum(
+            task.get("status") in ACTIVE
+            and self.config.workers.get(task.get("worker")) is not None
+            and self.config.workers[task["worker"]].provider == provider
+            for task in self.state["tasks"].values()
+        )
+
     def _worker_health(self, worker_name: str) -> dict[str, Any]:
         worker = self.config.workers[worker_name]
         last = self._last_terminal_attempt(worker_name)
@@ -1747,6 +1821,14 @@ class TaskController:
             self._credit_next_action(worker_name)
             if category == "credit_exhausted" else None
         )
+        guard = self._deepseek_guard() if worker.provider == DEEPSEEK_PROVIDER else None
+        if guard is not None:
+            proven = False
+            reason = "deepseek_account_blocked"
+            next_action = (
+                "Resolve the shared DeepSeek account failure, then clear the "
+                "deepseek_guard_cleared_after marker after owner approval."
+            )
         public_last = None if last is None else {
             key: value for key, value in last.items() if not key.startswith("_")
         }
@@ -1773,7 +1855,19 @@ class TaskController:
             current = active_by_worker.get(name)
             next_task = next((task for task in queued if task["worker"] == name), None)
             reason: str | None = None
-            if current is not None:
+            worker_config = self.config.workers[name]
+            guard = (
+                self._deepseek_guard()
+                if worker_config.provider == DEEPSEEK_PROVIDER else None
+            )
+            if guard is not None:
+                reason = "deepseek_account_blocked"
+            elif (worker_config.provider == DEEPSEEK_PROVIDER
+                  and self._provider_active_count(DEEPSEEK_PROVIDER)
+                  >= self.config.deepseek_max_parallel_tasks
+                  and current is None):
+                reason = "deepseek_concurrency_limit"
+            elif current is not None:
                 reason = "worker_busy"
             elif not capacity_available:
                 reason = "execution_limit_reached"
@@ -2172,6 +2266,14 @@ class TaskController:
             # separated by worker and by the unique workspace/branch guard.
             if held and isolated and access == "write" and "write" not in held:
                 continue
+            worker = self.config.workers.get(task.get("worker"))
+            if worker is not None and worker.provider == DEEPSEEK_PROVIDER:
+                guard = self._deepseek_guard()
+                if guard is not None:
+                    continue
+                if (self._provider_active_count(DEEPSEEK_PROVIDER)
+                        >= self.config.deepseek_max_parallel_tasks):
+                    continue
             return task
         return None
 

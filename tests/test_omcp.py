@@ -27,8 +27,9 @@ from omcp.docker_gate import gated_command
 from omcp.host_runner import run as run_host_operation
 from omcp.local_control import LocalApprovalServer, approval_request
 from omcp.runner import (
-    OpenCodeDiagnosticCollector, PinnedProviderGateway, WorkerSandboxStartupError,
-    codex_credit_exhaustion, merge_opencode_runtime_diagnostic,
+    OpenCodeDiagnosticCollector, PinnedProviderGateway, PinnedResponsesGateway,
+    WorkerSandboxStartupError, codex_credit_exhaustion, codex_provider_args,
+    merge_opencode_runtime_diagnostic,
     opencode_commands, opencode_environment, opencode_policy,
     probe_codex_sandbox, run as run_worker, run_opencode_process,
     worker_log_has_sandbox_startup_failure,
@@ -2110,6 +2111,37 @@ class ControllerTests(unittest.TestCase):
 
 
 
+class DeepSeekGuardTests(unittest.TestCase):
+    def _controller(self, tasks, cleared=None):
+        controller = object.__new__(TaskController)
+        controller.config = type("Config", (), {
+            "workers": {
+                "deepseek-code-1": Worker("deepseek-code-1", ("/codex",), adapter="codex", provider="deepseek", model="deepseek-flash"),
+                "deepseek-code-2": Worker("deepseek-code-2", ("/codex",), adapter="codex", provider="deepseek", model="deepseek-flash"),
+            },
+            "deepseek_guard_cleared_after": cleared,
+        })()
+        controller.state = {"tasks": tasks}
+        return controller
+
+    def test_credit_or_auth_failure_blocks_both_deepseek_lanes_until_later_success(self):
+        old = "2026-10-26T07:00:00+00:00"
+        new = "2026-10-26T08:00:00+00:00"
+        tasks = {
+            "a": {"task_id": "a", "worker": "deepseek-code-1", "status": "failed",
+                  "finished_at": old, "failure": {"category": "credit_exhausted"}},
+        }
+        controller = self._controller(tasks)
+        self.assertEqual(controller._deepseek_guard()["reason"], "credit_exhausted")
+        tasks["b"] = {"task_id": "b", "worker": "deepseek-code-2", "status": "succeeded",
+                      "finished_at": new}
+        self.assertIsNone(controller._deepseek_guard())
+        tasks["b"]["status"] = "failed"
+        tasks["b"]["failure"] = {"category": "authentication"}
+        self.assertEqual(controller._deepseek_guard()["reason"], "authentication")
+        controller.config.deepseek_guard_cleared_after = "2026-10-26T08:30:00+00:00"
+        self.assertIsNone(controller._deepseek_guard())
+
 class ConfigTests(unittest.TestCase):
     def test_profiles_define_independent_git_preparation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2308,6 +2340,88 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.workers["deepseek"].adapter, "deepseek")
             self.assertEqual(config.workers["deepseek"].provider, "deepseek")
             self.assertEqual(config.workers["deepseek"].credential_file, str(credential.resolve()))
+
+    def test_config_loads_deepseek_codex_coding_workers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"; root.mkdir()
+            codex = Path(directory) / "codex"; codex.write_text("#!/bin/sh\nexit 0\n"); codex.chmod(0o700)
+            credential = Path(directory) / "deepseek.key"; credential.write_text("not-printed"); credential.chmod(0o600)
+            config_path = Path(directory) / "omcp.json"
+            config_path.write_text(json.dumps({
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(Path(directory) / "state"),
+                "workers": {
+                    "deepseek-code-1": {
+                        "adapter": "codex", "command": ["codex"],
+                        "codex_home": str(Path(directory) / "home1"),
+                        "provider": "deepseek", "model": "deepseek-flash",
+                        "credential_file": str(credential),
+                    },
+                },
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+            }))
+            config_path.chmod(0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                config = Config.load(config_path)
+            worker = config.workers["deepseek-code-1"]
+            self.assertEqual(worker.adapter, "codex")
+            self.assertEqual(worker.provider, "deepseek")
+            self.assertEqual(worker.model, "deepseek-flash")
+            self.assertEqual(worker.credential_file, str(credential.resolve()))
+            self.assertEqual(worker.endpoint_host, "api.deepseek.com")
+
+    def test_config_rejects_deepseek_codex_worker_with_wrong_provider_or_credential_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"; root.mkdir()
+            codex = Path(directory) / "codex"; codex.write_text("#!/bin/sh\nexit 0\n"); codex.chmod(0o700)
+            credential = Path(directory) / "deepseek.key"; credential.write_text("not-printed"); credential.chmod(0o644)
+            config_path = Path(directory) / "omcp.json"
+            raw = {
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(Path(directory) / "state"),
+                "workers": {"deepseek-code-1": {
+                    "adapter": "codex", "command": ["codex"],
+                    "provider": "deepseek", "model": "deepseek-flash",
+                    "credential_file": str(credential),
+                }},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+            }
+            config_path.write_text(json.dumps(raw)); config_path.chmod(0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                with self.assertRaisesRegex(ValueError, "owner-only regular file"):
+                    Config.load(config_path)
+            credential.chmod(0o600)
+            raw["workers"]["deepseek-code-1"]["provider"] = "openai"
+            config_path.write_text(json.dumps(raw)); config_path.chmod(0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                with self.assertRaisesRegex(ValueError, "fixed DeepSeek provider"):
+                    Config.load(config_path)
+
+    def test_codex_provider_args_pin_responses_gateway_and_restrict_tools(self):
+        gateway = "http://127.0.0.1:49152/abcdefghijklmnopqrstuvwxyzABCDEFG_123456/"
+        args = codex_provider_args(gateway, "deepseek-flash")
+        text = " ".join(args)
+        self.assertIn('model_provider="deepseek"', text)
+        self.assertIn('wire_api="responses"', text)
+        self.assertIn('base_url="' + gateway + '"', text)
+        self.assertIn("features.multi_agent=false", text)
+        self.assertIn("features.browser_use=false", text)
+        self.assertIn("tools.experimental_request_user_input.enabled=false", text)
+        self.assertIn('shell_environment_policy.inherit="none"', text)
+        self.assertNotIn("sk-", text)
+
+    def test_responses_gateway_accepts_only_responses_shape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            credential = Path(directory) / "key"; credential.write_text("test"); credential.chmod(0o600)
+            gateway = PinnedResponsesGateway("deepseek", "deepseek-flash", "api.deepseek.com", credential, 60)
+        self.assertTrue(gateway._valid_payload({"model": "deepseek-flash", "input": "hi"}))
+        self.assertFalse(gateway._valid_payload({"model": "deepseek-flash", "messages": []}))
+        gateway.failure_status = 402
+        self.assertEqual(gateway.provider_failure_category(), "credit_exhausted")
+        gateway.failure_status = 401
+        self.assertEqual(gateway.provider_failure_category(), "authentication")
+        gateway.failure_status = 429
+        self.assertEqual(gateway.provider_failure_category(), "rate_limit")
 
     def test_config_rejects_unapproved_opencode_provider_command_and_credential_mode(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3439,6 +3553,42 @@ class RunnerTests(unittest.TestCase):
             "category": "contract_path_denied", "stage": "completion",
         })
         self.assertIn("completion-contract path", result_text)
+
+    def test_runner_codex_deepseek_provider_uses_local_gateway_and_synthetic_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt = root / "prompt"; prompt.write_text("task")
+            credential = root / "key"; credential.write_text("real-key-not-seen"); credential.chmod(0o600)
+            spec = root / "spec.json"
+            spec.write_text(json.dumps({
+                "adapter": "codex", "command": ["codex"], "codex_home": None,
+                "provider": "deepseek", "model": "deepseek-flash",
+                "credential_file": str(credential), "endpoint_host": "api.deepseek.com",
+                "sandbox_startup_probe": False, "require_completion_contract": True,
+                "max_worker_seconds": 60, "max_response_bytes": 1024,
+                "workspace": str(root), "prompt_path": str(prompt),
+                "log_path": str(root / "log"), "result_path": str(root / "result"),
+                "completion_path": str(root / "completion"),
+            }))
+            gateway = Mock()
+            gateway.start.return_value = "http://127.0.0.1:49152/abcdefghijklmnopqrstuvwxyzABCDEFG_123456/"
+            gateway.provider_failure_category.return_value = None
+            def execute(command, **kwargs):
+                (root / ".orchestra-contract").mkdir(exist_ok=True)
+                (root / ".orchestra-contract" / "orchestra-completion.json").write_text('{"status":"success"}\n')
+                (root / "result").write_text("done\n")
+                return subprocess.CompletedProcess(command, 0)
+            with patch("omcp.runner.canonical_codex_executable", return_value="/codex"), \
+                    patch("omcp.runner.PinnedResponsesGateway", return_value=gateway) as gateway_cls, \
+                    patch("omcp.runner.subprocess.run", side_effect=execute) as run:
+                self.assertEqual(run_worker(spec), 0)
+            command = run.call_args.args[0]
+            self.assertIn('model_provider="deepseek"', " ".join(command))
+            self.assertIn('wire_api="responses"', " ".join(command))
+            self.assertEqual(run.call_args.kwargs["env"]["DEEPSEEK_API_KEY"], "omcp-local-gateway")
+            self.assertNotIn("real-key-not-seen", json.dumps(run.call_args.kwargs["env"]))
+            gateway.start.assert_called_once()
+            gateway.close.assert_called_once()
 
     def test_runner_missing_contract_fails_even_when_result_exists(self):
         with tempfile.TemporaryDirectory() as directory:

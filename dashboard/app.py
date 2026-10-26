@@ -204,6 +204,10 @@ class Dashboard:
                 return "response-only"
             if info.get("role") == "remote_unproven":
                 return "unproven"
+            if (worker.get("adapter") in {"codex", "opencode"}
+                    and worker.get("proven_healthy") is not True
+                    and worker.get("last_attempt") is None):
+                return "unproven"
             if worker.get("current_task_id") or worker.get("idle") is False:
                 return "busy"
             last_attempt = worker.get("last_attempt")
