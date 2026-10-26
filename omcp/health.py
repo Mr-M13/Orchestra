@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from omcp.controller import Config
+from omcp.controller import Config, failure_category
 from omcp.platform import describe_sandbox, host_platform
 
 
@@ -98,6 +98,7 @@ def _task_health(config: Any, state: dict[str, Any]) -> tuple[dict[str, Any], li
     stale_cutoff = now.timestamp() - max(300, 10 * config.heartbeat_seconds)
     tasks = state.get("tasks", {})
     failed = interrupted = startup_failures = actions_failures = stale_accepted = 0
+    failure_categories: dict[str, int] = {}
     for task in tasks.values():
         status = task.get("status")
         failure = task.get("failure")
@@ -112,6 +113,9 @@ def _task_health(config: Any, state: dict[str, Any]) -> tuple[dict[str, Any], li
             failed += 1
         if status == "interrupted" and recent:
             interrupted += 1
+        if recent and status in {"failed", "interrupted", "cancelled"}:
+            category = failure_category(task)
+            failure_categories[category] = failure_categories.get(category, 0) + 1
         if recent and failure_type in {
             "runner_startup_failed", "runner_disappeared", "runner_exited_without_completion",
             "startup_lease_expired", "SandboxStartupError",
@@ -137,6 +141,8 @@ def _task_health(config: Any, state: dict[str, Any]) -> tuple[dict[str, Any], li
         warnings.append("runner_startup_failures")
     if actions_failures:
         warnings.append("failed_actions_dispatch")
+    if failure_categories.get("credit_exhausted"):
+        warnings.append("credit_exhausted_tasks")
     if stale_accepted:
         warnings.append("stale_accepted_tasks")
     return {
@@ -144,6 +150,8 @@ def _task_health(config: Any, state: dict[str, Any]) -> tuple[dict[str, Any], li
         "recent_interrupted": interrupted,
         "recent_startup_failures": startup_failures,
         "recent_actions_failures": actions_failures,
+        "recent_credit_exhausted": failure_categories.get("credit_exhausted", 0),
+        "failure_categories": failure_categories,
         "stale_accepted": stale_accepted,
         "window_seconds": 86_400,
     }, warnings

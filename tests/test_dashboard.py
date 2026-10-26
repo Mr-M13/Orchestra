@@ -77,7 +77,29 @@ class FakeOMCP:
         if tool == "bridge_status":
             return {"status": "ok", "repository_profiles": ["Delnavazan"]}
         if tool == "worker_availability":
-            return {"workers": [{"worker": "Ina", "available": False, "current_task_id": TASK_ID}]}
+            return {"workers": [
+                {
+                    "worker": "Ina", "available": True, "current_task_id": None,
+                    "idle": True, "runnable": True, "reason": "no_queued_task",
+                    "proven_healthy": False,
+                    "health_reason": "last_attempt_credit_exhausted",
+                    "last_attempt": {
+                        "task_id": RECENT_ID, "status": "failed", "exit_code": 1,
+                        "failure_category": "credit_exhausted", "finished_at": NOW,
+                    },
+                    "next_action": "Add credits to Ina's workspace, then run a separately authorised small verification task.",
+                },
+                {
+                    "worker": "codex", "available": True, "current_task_id": None,
+                    "idle": True, "runnable": True, "reason": "no_queued_task",
+                    "proven_healthy": True, "health_reason": "verified_success",
+                    "last_attempt": {
+                        "task_id": TASK_ID, "status": "succeeded", "exit_code": 0,
+                        "failure_category": None, "finished_at": NOW,
+                    },
+                    "next_action": None,
+                },
+            ]}
         if tool == "task_snapshot":
             return self.snapshot
         if tool == "list_tasks":
@@ -116,6 +138,29 @@ class DashboardTests(unittest.TestCase):
         self.assertIn('name="viewport"', body)
         self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", body)
         self.assertNotIn("<script>alert(1)</script>", body)
+
+    def test_worker_rows_show_credit_exhaustion_without_hiding_codex_success(self):
+        _, body = request(Dashboard(FakeOMCP()))
+        self.assertIn("last attempt blocked: workspace credits exhausted", body)
+        self.assertIn("state-unavailable", body)
+        codex_start = body.index("<h3>codex</h3>")
+        codex_row = body[codex_start:body.index("</article>", codex_start)]
+        self.assertIn("state-available", codex_row)
+
+    def test_task_detail_renders_credit_failure_and_next_action(self):
+        client = FakeOMCP()
+        client.task.update({
+            "status": "failed", "exit_code": 1,
+            "failure": {
+                "type": "CreditExhausted", "category": "credit_exhausted",
+                "stage": "provider", "provider": "openai",
+                "next_action": "Add credits to Ina's workspace, then run a separately authorised small verification task.",
+            },
+        })
+        _, body = request(Dashboard(client), "/tasks/" + TASK_ID)
+        self.assertIn("Failure", body)
+        self.assertIn("credit_exhausted", body)
+        self.assertIn("Add credits to Ina", body)
 
     def test_home_renders_three_sections_in_order_with_independent_state(self):
         _, body = request(Dashboard(FakeOMCP()))

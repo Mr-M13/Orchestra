@@ -195,11 +195,27 @@ class Dashboard:
         def worker_state(worker: dict[str, Any]) -> str:
             if worker.get("current_task_id") or worker.get("idle") is False:
                 return "busy"
+            last_attempt = worker.get("last_attempt")
+            last_category = (
+                last_attempt.get("failure_category")
+                if isinstance(last_attempt, dict) else None
+            )
+            if last_category == "credit_exhausted":
+                return "unavailable"
+            if worker.get("proven_healthy") is True:
+                return "available"
             if worker.get("runnable") or worker.get("reason") == "no_queued_task":
                 return "available"
             return "unavailable"
 
         def worker_reason(worker: dict[str, Any]) -> str:
+            last_attempt = worker.get("last_attempt")
+            last_category = (
+                last_attempt.get("failure_category")
+                if isinstance(last_attempt, dict) else None
+            )
+            if last_category == "credit_exhausted":
+                return " · last attempt blocked: workspace credits exhausted"
             reason = worker.get("reason")
             if reason in (None, "no_queued_task", "worker_busy"):
                 return ""
@@ -298,12 +314,30 @@ class Dashboard:
             ) + "</ul>"
         fields = [("Project", task.get("repository_profile", task.get("repository"))), ("Worker", task.get("worker")), ("State", task.get("status")), ("Consequence class", task.get("consequence_class")), ("Authorisation", auth.get("mode")), ("Standing-authorisation ID", auth.get("authorization_id")), ("Created", timestamp(task.get("created_at"))), ("Started", timestamp(task.get("started_at"))), ("Completed", timestamp(task.get("finished_at")))]
         details = "".join(f"<dt>{esc(name)}</dt><dd>{value if name in {'Created', 'Started', 'Completed'} else esc(value or '—')}</dd>" for name, value in fields)
-        output = "" if result is None else f'<section><h2>Final result</h2><pre>{esc(result.get("result") or task.get("failure") or "No result supplied.")}</pre></section>'
+        failure = task.get("failure") if isinstance(task.get("failure"), dict) else None
+        failure_html = ""
+        if failure:
+            category = failure.get("category") or failure.get("type")
+            stage = failure.get("stage")
+            next_action = failure.get("next_action")
+            failure_html = (
+                '<section class="panel"><h2>Failure</h2>'
+                f'<p><strong>{esc(category or "unknown")}</strong></p>'
+                f'<dl><dt>Stage</dt><dd>{esc(stage or "—")}</dd>'
+                f'<dt>Exit code</dt><dd>{esc(task.get("exit_code") if task.get("exit_code") is not None else "—")}</dd></dl>'
+                + (f'<p><strong>Next action:</strong> {esc(next_action)}</p>' if next_action else "")
+                + '</section>'
+            )
+        result_text = result.get("result") if isinstance(result, dict) else None
+        output = (
+            f'<section><h2>Final result</h2><pre>{esc(result_text or "No result supplied.")}</pre></section>'
+            if result is not None and result_text else ""
+        )
         cancel = "" if task.get("status") in TERMINAL else f'<form method="post" action="/tasks/{esc(task_id)}/cancel"><input type="hidden" name="csrf" value="{esc(self.csrf_token)}"><input type="hidden" name="reason" value="Cancelled from dashboard"><button class="danger">Cancel task</button></form>'
         approval_controls = ""
         if task.get("status") == "approval_required":
             approval_controls = '''<section class="panel"><h2>Approval required</h2><p>This public dashboard does not accept approval decisions. Review the complete instructions, risk and requested authority in the owner-only local approval portal on the PixelBox host at <code>http://127.0.0.1:8767</code>, opened through an authenticated SSH tunnel. The portal requires its owner-only bootstrap token and applies session expiry, CSRF, audit, reason and self-approval checks.</p><p><a href="/approvals">Pending approvals and local access instructions</a></p></section>'''
-        return self.layout(str(task.get("title", "Task")), f'<a class="back" href="/">← Dashboard</a><section class="panel"><h1>{esc(task.get("title"))}</h1>{state_badge(task.get("status"))}<dl>{details}</dl>{cancel}</section>{approval_controls}<section><h2>Security</h2>{evidence}</section>{output}')
+        return self.layout(str(task.get("title", "Task")), f'<a class="back" href="/">← Dashboard</a><section class="panel"><h1>{esc(task.get("title"))}</h1>{state_badge(task.get("status"))}<dl>{details}</dl>{cancel}</section>{failure_html}{approval_controls}<section><h2>Security</h2>{evidence}</section>{output}')
 
     def new_task(self, error: str = "") -> str:
         status = self.client.call("bridge_status")

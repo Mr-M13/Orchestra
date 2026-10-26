@@ -238,6 +238,93 @@ SANDBOX_STARTUP_PREFIXES = (
     b"bwrap: Failed to unshare",
 )
 MAX_WORKER_LOG_SCAN_BYTES = 4 * 1024 * 1024
+MAX_CREDIT_SCAN_BYTES = 256 * 1024
+CREDIT_EXHAUSTED_CODES = {
+    "workspace_owner_credits_depleted",
+    "workspace_member_credits_depleted",
+}
+CREDIT_EXHAUSTED_TEXT = (
+    "your workspace is out of credits",
+    "you hit your spend cap",
+)
+CREDIT_ERROR_EVENT_TYPES = {
+    "error", "turn.failed", "turn_failed", "stream_error", "error.event",
+}
+CREDIT_EXHAUSTED_EXACT_LINES = (
+    "ERROR: Your workspace is out of credits. Add credits to continue.",
+    "ERROR: Your workspace is out of credits. Ask your workspace owner to refill in order to continue.",
+)
+
+
+def _read_tail(path: Path, limit: int = MAX_CREDIT_SCAN_BYTES) -> bytes:
+    try:
+        with path.open("rb") as source:
+            source.seek(0, os.SEEK_END)
+            size = source.tell()
+            source.seek(max(0, size - limit))
+            return source.read(limit)
+    except OSError:
+        return b""
+
+
+def _credit_text_matches(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    lowered = value.lower()
+    return any(marker in lowered for marker in CREDIT_EXHAUSTED_TEXT)
+
+
+def _credit_object_matches(value: object) -> bool:
+    if not isinstance(value, dict):
+        return _credit_text_matches(value)
+    for key in ("code", "type", "error_type"):
+        code = value.get(key)
+        if isinstance(code, str) and code.lower() in CREDIT_EXHAUSTED_CODES:
+            return True
+    for key in ("message", "detail", "reason", "type"):
+        if _credit_text_matches(value.get(key)):
+            return True
+    return False
+
+
+def codex_credit_exhaustion(
+    log_path: Path, stderr_path: Path | None, exit_code: int,
+) -> dict[str, Any] | None:
+    """Classify only a nonzero Codex exit with a trusted credit error.
+
+    Structured JSONL errors are preferred. A plain-text fallback is read only
+    from the separate stderr stream, never from the stdout log that contains the
+    task prompt, so a prompt cannot spoof this category.
+    """
+    if exit_code in {0, 124, 130, 143}:
+        return None
+    for line in _read_tail(log_path).splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(b"{"):
+            continue
+        try:
+            value = json.loads(stripped)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        event_type = value.get("type")
+        if event_type in CREDIT_ERROR_EVENT_TYPES or "error" in value:
+            if _credit_object_matches(value) or _credit_object_matches(value.get("error")):
+                return {
+                    "category": "credit_exhausted",
+                    "stage": "provider",
+                    "provider": "openai",
+                }
+    if stderr_path is not None:
+        for line in _read_tail(stderr_path).splitlines():
+            if line.strip().decode("utf-8", "replace") in CREDIT_EXHAUSTED_EXACT_LINES:
+                return {
+                    "category": "credit_exhausted",
+                    "stage": "provider",
+                    "provider": "openai",
+                }
+    return None
 
 
 def probe_codex_sandbox() -> None:
@@ -846,6 +933,7 @@ def run(spec_path: Path) -> int:
             or not isinstance(maximum, int) or isinstance(maximum, bool) or not 1024 <= maximum <= 1048576):
         raise ValueError("invalid worker bounds")
     runtime_dir = routine_tmp = contract_tmp = None
+    codex_events = log.parent / "worker-events.jsonl" if adapter == "codex" else None
     gateway: PinnedProviderGateway | None = None
     worker_diagnostic: dict[str, Any] | None = None
     completion_contract: str | None = None
@@ -884,7 +972,8 @@ def run(spec_path: Path) -> int:
                 environment = opencode_environment(runtime_dir)
                 environment["OPENCODE_PASSWORD"] = secrets.token_urlsafe(32)
             elif capabilities is None:
-                command = [executable, "--ask-for-approval", "never", "exec", "--sandbox", "workspace-write",
+                command = [executable, "--ask-for-approval", "never", "exec", "--json",
+                           "--sandbox", "workspace-write",
                            "--cd", str(workspace), "--output-last-message", str(result), "-"]
                 environment = worker_environment(spec.get("codex_home"))
                 contract_tmp = workspace / worker_contract.CONTRACT_DIR
@@ -934,9 +1023,23 @@ def run(spec_path: Path) -> int:
                             "Worker sandbox failed to start; the task did not run.\n",
                         )
                 else:
-                    with prompt.open("rb") as input_file, log.open("ab") as output:
-                        exit_code = subprocess.run(command, cwd=workspace, env=environment, stdin=input_file,
-                            stdout=output, stderr=subprocess.STDOUT, check=False, timeout=seconds).returncode
+                    assert codex_events is not None
+                    with prompt.open("rb") as input_file, \
+                            codex_events.open("ab") as output, log.open("ab") as error_output:
+                        exit_code = subprocess.run(
+                            command, cwd=workspace, env=environment, stdin=input_file,
+                            stdout=output, stderr=error_output, check=False,
+                            timeout=seconds,
+                        ).returncode
+            elif adapter == "codex":
+                assert codex_events is not None
+                with prompt.open("rb") as input_file, \
+                        codex_events.open("ab") as output, log.open("ab") as error_output:
+                    exit_code = subprocess.run(
+                        command, cwd=workspace, env=environment, stdin=input_file,
+                        stdout=output, stderr=error_output, check=False,
+                        timeout=seconds,
+                    ).returncode
             else:
                 with prompt.open("rb") as input_file, log.open("ab") as output:
                     exit_code = subprocess.run(command, cwd=workspace, env=environment, stdin=input_file,
@@ -975,7 +1078,7 @@ def run(spec_path: Path) -> int:
             elif not result.exists():
                 write_private_text(result, "OpenCode execution completed; provider output is intentionally not retained.\n"
                     if exit_code == 0 else f"OpenCode execution failed (exit {exit_code}); provider output is intentionally not retained.\n")
-        sandbox_failure = (
+        sandbox_failure = bool(
             adapter == "codex" and worker_log_has_sandbox_startup_failure(log)
         )
         if sandbox_failure:
@@ -986,7 +1089,24 @@ def run(spec_path: Path) -> int:
                 write_failure_result(
                     result, "Worker sandbox failed to start; the task did not run.\n",
                 )
-        if (not sandbox_failure and exit_code == 0 and require_contract
+        credit_failure = (
+            codex_credit_exhaustion(codex_events, log, exit_code)
+            if adapter == "codex" and not sandbox_failure else None
+        )
+        if credit_failure is not None:
+            error_type = "CreditExhausted"
+            worker_diagnostic = credit_failure
+            # Credit exhaustion is the root cause. The absent completion
+            # contract is a consequence and must not become the primary error.
+            completion_contract = None
+            completion_contract_error = None
+            if not required_result_present(result):
+                write_failure_result(
+                    result,
+                    "Workspace credits are exhausted; no coding result was produced.\n",
+                )
+        if (not sandbox_failure and credit_failure is None and exit_code == 0
+                and require_contract
                 and completion_contract != "success"):
             exit_code = 125
             error_type = (
@@ -1001,20 +1121,25 @@ def run(spec_path: Path) -> int:
             write_failure_result(
                 result, "Worker exited without the required result output.\n",
             )
-        elif exit_code != 0 and not required_result_present(result) and not sandbox_failure:
+        elif (exit_code != 0 and not required_result_present(result)
+              and not sandbox_failure and credit_failure is None):
             write_failure_result(
                 result, "Worker failed before producing a result; see task diagnostics.\n",
             )
         record: dict[str, Any] = {
             "exit_code": exit_code, "finished_at": utc_now(), "runner_error": error_type,
         }
-        if require_contract:
+        if require_contract and credit_failure is None:
             record["completion_contract"] = completion_contract or "missing"
             if completion_contract_error is not None:
                 record["completion_contract_error"] = completion_contract_error
         if worker_diagnostic is not None:
             record["worker_diagnostic"] = worker_diagnostic
         atomic_json(completion, record)
+        if codex_events is not None:
+            # The JSONL stream can contain the prompt and model text. It is
+            # only needed for bounded classification, so do not retain it.
+            codex_events.unlink(missing_ok=True)
     return exit_code
 
 

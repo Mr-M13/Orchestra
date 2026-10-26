@@ -91,7 +91,7 @@ class RoutineConfinementPolicy:
 
     def worker_command(self, executable: str, workspace: Path, result_path: Path) -> list[str]:
         return [
-            executable, "--ask-for-approval", "never", "exec",
+            executable, "--ask-for-approval", "never", "exec", "--json",
             "--ignore-user-config", "--ignore-rules", "--ephemeral",
             *self.config_args(),
             "--cd", str(workspace),
