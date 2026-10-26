@@ -59,6 +59,7 @@ class OMCPClient:
         self.socket_path = socket_path
         self.timeout = timeout
         self._request_number = 0
+        self._instance_id: str | None = None
 
     def call(self, tool: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         if tool not in self._TOOLS:
@@ -87,7 +88,19 @@ class OMCPClient:
         content = result.get("structuredContent")
         if not isinstance(content, dict):
             raise OMCPError("invalid response from Orchestra")
+        self._guard_instance(content)
         return content
+
+    def _guard_instance(self, content: dict[str, Any]) -> None:
+        instance_id = content.get("instance_id")
+        if instance_id is None:
+            return
+        if not isinstance(instance_id, str) or not instance_id:
+            raise OMCPError("invalid Orchestra instance identity")
+        if self._instance_id is None:
+            self._instance_id = instance_id
+        elif instance_id != self._instance_id:
+            raise OMCPError("Orchestra instance changed during the request")
 
     def _next_request_id(self) -> int:
         self._request_number += 1
