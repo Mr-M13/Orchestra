@@ -166,15 +166,94 @@ def _workflow_check(config: Config, dispatch_config: Path | None) -> dict[str, A
     return result
 
 
+def _state_summary(config: Config) -> dict[str, Any]:
+    try:
+        state = json.loads((config.state_dir / "state.json").read_text())
+    except (OSError, ValueError):
+        return {"tasks": {}, "active": 0}
+    tasks = state.get("tasks") if isinstance(state, dict) else None
+    if not isinstance(tasks, dict):
+        return {"tasks": {}, "active": 0}
+    active = sum(
+        task.get("status") in {"starting", "running", "cancel_requested"}
+        for task in tasks.values()
+    )
+    return {"tasks": tasks, "active": active}
+
+
+def _workspace_changes(config: Config, workspace: object) -> bool | None:
+    if not isinstance(workspace, str):
+        return None
+    path = Path(workspace)
+    try:
+        if not path.resolve().is_relative_to(config.state_dir.resolve()) or not path.is_dir():
+            return None
+        completed = subprocess.run(
+            ["git", "-C", str(path), "status", "--porcelain", "--untracked-files=normal"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, check=False, timeout=10,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return bool(completed.stdout.strip())
+
+
 def build_audit(config: Config, dispatch_config: Path | None = None) -> dict[str, Any]:
     workers: list[dict[str, Any]] = []
     warnings: list[str] = []
+    state = _state_summary(config)
+    capacity = state["active"] < config.max_parallel_tasks
     for name in sorted(config.workers):
         worker = config.workers[name]
         edits = worker.adapter in {"codex", "opencode", "github_actions"}
+        worker_tasks = [
+            task for task in state["tasks"].values() if task.get("worker") == name
+        ]
+        active_task = next(
+            (task for task in worker_tasks
+             if task.get("status") in {"starting", "running", "cancel_requested"}),
+            None,
+        )
+        terminal = sorted(
+            (task for task in worker_tasks
+             if task.get("status") in {"succeeded", "failed", "interrupted", "cancelled", "rejected"}),
+            key=lambda task: (
+                task.get("finished_at") or task.get("created_at") or "",
+                task.get("task_id") or "",
+            ),
+            reverse=True,
+        )
+        last = terminal[0] if terminal else None
+        changes = _workspace_changes(config, last.get("workspace")) if last else None
+        status = last.get("status") if last else None
+        failure = last.get("failure") if last else None
+        failure_type = failure.get("type") if isinstance(failure, dict) else None
+        proven = bool(
+            edits and last is not None and status == "succeeded"
+            and changes is True and failure_type is None
+        )
+        if not last:
+            health_reason = "no_terminal_task"
+        elif worker.adapter == "deepseek":
+            health_reason = "response_only"
+        elif status != "succeeded":
+            health_reason = f"last_task_{status}"
+        elif changes is not True:
+            health_reason = "no_verified_workspace_change"
+        else:
+            health_reason = "verified_coding_result"
         entry: dict[str, Any] = {
             "worker": name,
             "adapter": worker.adapter,
+            "configured": True,
+            "idle": active_task is None,
+            "capacity_available": capacity,
+            "runnable": active_task is None and capacity,
+            "proven_healthy": proven,
+            "health_reason": health_reason,
             "edits_repository": edits,
             "response_only": worker.adapter == "deepseek",
             "endpoint_host": worker.endpoint_host,
@@ -183,6 +262,14 @@ def build_audit(config: Config, dispatch_config: Path | None = None) -> dict[str
             ),
             "funding": "unverified",
             "credits": "unverified",
+            "last_task": None if last is None else {
+                "task_id": last.get("task_id"),
+                "status": status,
+                "failure_type": failure_type,
+                "exit_code": last.get("exit_code"),
+                "finished_at": last.get("finished_at"),
+                "workspace_changes": changes,
+            },
         }
         if worker.adapter == "github_actions":
             entry.update({
@@ -250,6 +337,11 @@ def main(argv: list[str] | None = None) -> int:
         for worker in report["workers"]:
             kind = "response-only" if worker["response_only"] else "coding"
             print(f"- {worker['worker']}: {worker['adapter']} ({kind})")
+            print(
+                f"  configured={worker['configured']} idle={worker['idle']} "
+                f"runnable={worker['runnable']} proven_healthy={worker['proven_healthy']} "
+                f"reason={worker['health_reason']}"
+            )
             print(f"  funding: {worker['funding']} (not inferred from availability)")
             if "executable" in worker:
                 version = worker["executable"].get("version", {})

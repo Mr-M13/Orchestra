@@ -23,7 +23,16 @@ credential contents. It reports:
 - GitHub dispatch-broker socket presence, owner match and world-access bit;
 - `workflow_sha` versus the local `origin/<workflow_ref>` commit;
 - observed host memory and a planning allowance after a 1 GiB reserve;
-- `funding: unverified` and `credits: unverified` for every worker.
+- `funding: unverified` and `credits: unverified` for every worker;
+- `configured`, `idle`, `runnable` and `proven_healthy` separately.
+
+`proven_healthy` is deliberately conservative. It is true only when the last
+terminal task succeeded, the adapter can edit a repository, and the task's own
+worktree still shows a real Git workspace change. A response-only DeepSeek
+success, a present binary, a valid credential, `available: true`, or a unit
+test cannot make it true. The entry also reports the last terminal task's
+status, failure type, exit code and whether a workspace change was observed,
+without task instructions or result text.
 
 ## Current lane assessment
 
@@ -32,8 +41,24 @@ The reviewed PixelBox configuration has two local Codex workers
 repository-editing adapter. They are the intended two-writer pair for the
 initial `repository_parallelism: isolated_worktrees` rollout.
 
+Recent Codex worker logs end with `ERROR: Your workspace is out of credits. Add
+credits to continue.` The lanes are configured and the executable reports
+`codex-cli 0.163.0`, but they are not proven healthy and must not be retried in
+a loop. Funding is an owner action; no paid acceptance was run.
+
 The direct DeepSeek adapter is response-only. It must not be counted as a
 coding writer or used for repository edits.
+
+The Mac OpenCode/DeepSeek lane previously failed with
+`OpenCodeExecutionFailed` and `category: unknown`. A credit-free synthetic
+gateway probe reproduced an opaque HTTP 500 before any provider request. The
+OpenCode server was walking from the task workdir toward the filesystem root
+during configuration discovery and the Seatbelt profile denied `lstat` on the
+worktree's ancestors (`EPERM: operation not permitted`). The separate OpenCode
+fix permits literal read traversal of those ancestors without granting sibling
+worktree contents and merges bounded runtime-log categories into the task
+diagnostic. A repeat synthetic-gateway probe completed with two local
+`/v1/chat/completions` requests and exit 0, with no provider contact.
 
 The GitHub Actions lane is configured but not healthy. Failed dispatch runs
 show the verification job succeeding and the `Execute approved task` job

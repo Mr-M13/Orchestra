@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -53,6 +54,55 @@ class WorkerAuditTests(unittest.TestCase):
         encoded = json.dumps(report)
         self.assertNotIn("secret-value-that-must-not-appear", encoded)
         self.assertNotIn("api-key", encoded.lower())
+
+    def test_audit_requires_a_real_workspace_change_for_proven_health(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "project"
+            root.mkdir()
+            state = base / "state"
+            workspace = state / "worktrees" / "default" / "task-1"
+            workspace.mkdir(parents=True)
+            subprocess.run(["git", "-C", str(workspace), "init", "-q"], check=True)
+            subprocess.run(
+                ["git", "-C", str(workspace), "config", "user.email", "audit@example.invalid"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(workspace), "config", "user.name", "Audit"],
+                check=True,
+            )
+            (workspace / "file.txt").write_text("base\n")
+            subprocess.run(["git", "-C", str(workspace), "add", "file.txt"], check=True)
+            subprocess.run(
+                ["git", "-C", str(workspace), "commit", "-q", "-m", "base"],
+                check=True,
+            )
+            (workspace / "file.txt").write_text("changed\n")
+            (state / "state.json").write_text(json.dumps({
+                "schema_version": 1, "requests": {}, "scheduler": {},
+                "tasks": {
+                    "11111111-1111-1111-1111-111111111111": {
+                        "task_id": "11111111-1111-1111-1111-111111111111",
+                        "worker": "codex", "status": "succeeded",
+                        "created_at": "2026-10-26T00:00:00+00:00",
+                        "finished_at": "2026-10-26T00:01:00+00:00",
+                        "workspace": str(workspace),
+                        "instructions": "never reported",
+                    },
+                },
+            }))
+            config = Config(
+                "owner/repo", root, state, "origin/main",
+                {"codex": Worker("codex", ("/bin/true",))},
+                Principal("chatgpt:test", frozenset({"status:read"}), "test"),
+            )
+            report = AUDIT.build_audit(config)
+        worker = report["workers"][0]
+        self.assertTrue(worker["proven_healthy"])
+        self.assertEqual(worker["health_reason"], "verified_coding_result")
+        self.assertTrue(worker["last_task"]["workspace_changes"])
+        self.assertNotIn("never reported", json.dumps(report))
 
     def test_audit_does_not_infer_credits_from_availability(self):
         with tempfile.TemporaryDirectory() as directory:
