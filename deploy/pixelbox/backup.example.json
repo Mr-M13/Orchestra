@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "repository": "local:/var/lib/orchestra-backup/repository",
+  "password_file": "/etc/orchestra/backup/restic-password",
+  "off_device": false,
+  "staging_dir": "/var/lib/orchestra-backup/staging",
+  "status_file": "/var/lib/orchestra-backup/status.json",
+  "lock_file": "/var/lib/orchestra-backup/backup.lock",
+  "cache_dir": "/var/lib/orchestra-backup/cache",
+  "environment_file": null,
+  "restic_binary": "restic",
+  "max_age_hours": 30,
+  "integrity_max_age_hours": 192,
+  "retention": {
+    "daily": 7,
+    "weekly": 4,
+    "monthly": 6
+  },
+  "prune": true,
+  "orchestra": {
+    "config_root": "/etc/orchestra",
+    "state_dir": "/home/hamed/orchestra-migration/state",
+    "releases": "/opt/orchestra/releases",
+    "systemd_root": "/etc/systemd/system",
+    "verifier": "/usr/local/lib/orchestra/http_gateway_verify.py",
+    "checkout": "/home/hamed/orchestra-migration/checkout"
+  },
+  "nextcloud": {
+    "compose_file": "/home/hamed/MboxNextcloud/compose.yaml",
+    "compose_dir": "/home/hamed/MboxNextcloud",
+    "app_container": "mboxnextcloud-app-1",
+    "db_container": "mboxnextcloud-db-1",
+    "database": "nextcloud",
+    "user": "nextcloud",
+    "html_dir": "/home/hamed/MboxNextcloud/html",
+    "data_dir": "/home/hamed/NextcloudData-SSD",
+    "extra_dirs": ["/mnt/mbox/FamilyFiles"]
+  }
+}

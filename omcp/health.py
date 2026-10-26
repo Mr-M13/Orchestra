@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from omcp.backup import backup_health
 from omcp.controller import Config, failure_category
 from omcp.platform import describe_sandbox, host_platform
 
@@ -188,7 +189,7 @@ def _backup_check(config: Any, backup_dir: str | None) -> tuple[dict[str, Any], 
 def collect_health(
     config_path: Path, tunnel_url: str | None = None,
     dashboard_url: str | None = None, mcp_url: str | None = None,
-    backup_dir: str | None = None,
+    backup_dir: str | None = None, backup_config: str | None = None,
 ) -> dict[str, Any]:
     """Return only safe metadata; never include instructions or credentials."""
     report: dict[str, Any] = {
@@ -323,9 +324,17 @@ def collect_health(
         report["warnings"].append("dispatch_broker_unavailable")
     checks["dashboard"] = _http_check(dashboard_url)
     checks["mcp_gateway"] = _http_check(mcp_url)
-    backup, backup_warnings = _backup_check(config, backup_dir)
-    checks["backup"] = backup
-    report["warnings"].extend(backup_warnings)
+    if backup_config:
+        checks["backup"] = backup_health(Path(backup_config))
+    else:
+        backup, backup_warnings = _backup_check(config, backup_dir)
+        checks["backup"] = backup
+        report["warnings"].extend(backup_warnings)
+    if checks["backup"].get("status") == "failed":
+        report["warnings"].append("backup_failed")
+    elif checks["backup"].get("status") == "unchecked" and backup_config:
+        if checks["backup"].get("reason") not in {"backup_config_not_configured"}:
+            report["warnings"].append("backup_unverified")
     try:
         usage = shutil.disk_usage(config.state_dir)
         checks["disk"] = {
@@ -372,12 +381,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dashboard-health-url")
     parser.add_argument("--mcp-health-url")
     parser.add_argument("--backup-dir")
+    parser.add_argument("--backup-config")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--allow-degraded", action="store_true")
     args = parser.parse_args(argv)
     report = collect_health(
         args.config, args.tunnel_health_url, args.dashboard_health_url,
-        args.mcp_health_url, args.backup_dir,
+        args.mcp_health_url, args.backup_dir, args.backup_config,
     )
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
