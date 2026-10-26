@@ -678,7 +678,7 @@ def _status_age(status: dict[str, Any]) -> float | None:
 
 def backup_health(config_path: Path | None, *, now: float | None = None) -> dict[str, Any]:
     """Read-only backup health; never runs restic or a timer check."""
-    if config_path is None:
+    if config_path is None or not Path(config_path).exists():
         return {
             "checked": False, "status": "unchecked",
             "reason": "backup_config_not_configured",
