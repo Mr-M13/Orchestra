@@ -568,8 +568,52 @@ preflight_activation() {
   fi
 }
 
+
+preflight_activation_config() {
+  local release_root="$1"
+  sudo env PYTHONPATH="$release_root" /usr/bin/python3 \
+    "$SOURCE_ROOT/deploy/pixelbox/config_preflight.py" \
+    --config "$CONFIG_ROOT/omcp.json" \
+    --config-root "$CONFIG_ROOT" \
+    --release-root "$release_root" \
+    --service-user "$SERVICE_USER" \
+    --expected-sha "$RELEASE_SHA" \
+    --free-min-bytes 536870912 \
+    || fail "activation preflight failed; no services were restarted"
+}
+
+backup_activation_config() {
+  local old_sha="$1" stamp
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  CONFIG_BACKUP_DIR="$STATE_ROOT.parent/backup/pre-activate-${RELEASE_SHA}-${stamp}"
+  install -d -m 0700 "$CONFIG_BACKUP_DIR" \
+    || fail "could not create the activation config backup directory"
+  sudo tar --acls --xattrs -C /etc -czf "$CONFIG_BACKUP_DIR/etc-orchestra.tar.gz" orchestra \
+    || fail "could not back up the owner configuration before activation"
+  sudo chmod 0600 "$CONFIG_BACKUP_DIR/etc-orchestra.tar.gz"
+  printf '%s\n' "$old_sha" > "$CONFIG_BACKUP_DIR/previous-release"
+  chmod 0600 "$CONFIG_BACKUP_DIR/previous-release"
+  CONFIG_BACKUP_ARCHIVE="$CONFIG_BACKUP_DIR/etc-orchestra.tar.gz"
+  echo "Activation config backup: $CONFIG_BACKUP_DIR"
+}
+
+restore_activation_config() {
+  [[ -n "$CONFIG_BACKUP_ARCHIVE" && -f "$CONFIG_BACKUP_ARCHIVE" ]] \
+    || fail "activation failed and no matching prior config backup is available"
+  sudo tar --acls --xattrs -C /etc -xzf "$CONFIG_BACKUP_ARCHIVE" \
+    || fail "activation failed and the prior configuration could not be restored"
+}
+
+service_active_if_installed() {
+  local unit="$1"
+  if systemctl list-unit-files --no-legend "$unit" 2>/dev/null | grep -q "^$unit"; then
+    sudo systemctl is-active --quiet "$unit"
+  fi
+}
+
 activate_release() {
   local release_root="$RELEASES_ROOT/$RELEASE_SHA" old_sha="" old_root=""
+  local CONFIG_BACKUP_DIR="" CONFIG_BACKUP_ARCHIVE=""
   old_sha="$(release_sha_from_link "$CURRENT_LINK" || true)"
   if [[ -n "$old_sha" ]]; then
     old_root="$RELEASES_ROOT/$old_sha"
@@ -577,6 +621,8 @@ activate_release() {
     fail "$CURRENT_LINK exists but is not a managed release symlink"
   fi
 
+  preflight_activation_config "$release_root"
+  backup_activation_config "$old_sha"
   install_units "$release_root"
   if release_has_gateway_unit "$release_root"; then
     prepare_mcp_identity
@@ -597,7 +643,10 @@ activate_release() {
       && { ! release_has_gateway_unit "$release_root" || { sudo systemctl enable orchestra-mcp-http.service && sudo systemctl restart orchestra-mcp-http.service && sudo systemctl is-active --quiet orchestra-mcp-http.service; }; } \
       && { ! release_has_gateway_unit "$release_root" || { wait_for_gateway_health && sudo systemctl is-active --quiet orchestra-mcp-http.service; }; } \
       && sudo systemctl is-active --quiet orchestra-omcp.service \
-      && sudo systemctl is-active --quiet orchestra-health.timer; then
+      && sudo systemctl is-active --quiet orchestra-health.timer \
+      && service_active_if_installed orchestra-dashboard.service \
+      && service_active_if_installed orchestra-tunnel.service \
+      && { ! release_has_gateway_unit "$release_root" || sudo "$release_root/deploy/pixelbox/verify_mcp_http.sh" >/dev/null; }; then
     if [[ -n "$old_sha" && "$old_sha" != "$RELEASE_SHA" ]]; then
       atomic_symlink "releases/$old_sha" "$PREVIOUS_LINK"
     fi
@@ -606,8 +655,9 @@ activate_release() {
     return
   fi
 
-  echo "Activation failed; restoring the prior release." >&2
+  echo "Activation failed; restoring the prior release and configuration." >&2
   if [[ -n "$old_sha" && -d "$old_root" ]]; then
+    restore_activation_config
     atomic_symlink "releases/$old_sha" "$CURRENT_LINK"
     install_units "$old_root"
     sudo systemctl daemon-reload
@@ -627,6 +677,7 @@ activate_release() {
     fi
     fail "activation failed; current was restored to $old_sha"
   fi
+  restore_activation_config
   sudo unlink "$CURRENT_LINK" 2>/dev/null || true
   sudo systemctl stop orchestra-mcp-http.service 2>/dev/null || true
   stop_gateway_or_fail

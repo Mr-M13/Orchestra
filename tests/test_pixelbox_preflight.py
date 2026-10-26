@@ -59,6 +59,10 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
             self.assertIn(unit, (DEPLOY / "install.sh").read_text())
         self.assertIn("--backup-config", verify_source)
         self.assertIn("--alerts-config", verify_source)
+        self.assertTrue((DEPLOY / "config_preflight.py").is_file())
+        install_source = install.read_text()
+        self.assertIn("preflight_activation_config", install_source)
+        self.assertIn("tar --acls --xattrs", install_source)
 
     def test_installer_cannot_start_services_before_readiness_preflight(self):
         source = (DEPLOY / "install.sh").read_text()
@@ -74,6 +78,12 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
         self.assertIn("orchestra-github-dispatch.service", source)
         self.assertIn("--apply requires a Linux ARM64 host", source)
         self.assertIn("units use this path", source)
+        preflight_pos = source.index('preflight_activation_config "$release_root"')
+        backup_pos = source.index('backup_activation_config "$old_sha"')
+        install_units_pos = source.index('install_units "$release_root"', preflight_pos)
+        self.assertLess(preflight_pos, backup_pos)
+        self.assertLess(backup_pos, install_units_pos)
+        self.assertIn("restore_activation_config", source)
 
     def test_installer_reapplies_broker_acl_after_config_directory_install(self):
         source = (DEPLOY / "install.sh").read_text()

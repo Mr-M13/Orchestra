@@ -31,6 +31,10 @@ starts the tunnel or touches unrelated host services.
   `/opt/orchestra/current` symlink only during a separately approved
   activation. A stored full-tree digest detects later release drift;
   `--rollback` selects any validated release still on disk.
+- `config_preflight.py` — fail-closed activation preflight for config syntax,
+  owner/group/mode, service-user readability, required release files, exact
+  release marker and free space. It runs before unit installation or service
+  restart.
 - `config-access.sh` — sourced by `install.sh` to restore the dedicated
   broker and HTTP-gateway traverse-only ACLs after every `install -d` on
   `/etc/orchestra`. It never grants read/list access or changes the owner, and
