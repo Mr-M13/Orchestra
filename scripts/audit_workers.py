@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from omcp.controller import Config, Worker  # noqa: E402
+from omcp.controller import Config, Worker, failure_category  # noqa: E402
 from omcp.platform import host_platform  # noqa: E402
 
 
@@ -231,6 +231,7 @@ def build_audit(config: Config, dispatch_config: Path | None = None) -> dict[str
         status = last.get("status") if last else None
         failure = last.get("failure") if last else None
         failure_type = failure.get("type") if isinstance(failure, dict) else None
+        category = failure_category(last) if last and status != "succeeded" else None
         proven = bool(
             edits and last is not None and status == "succeeded"
             and changes is True and failure_type is None
@@ -239,12 +240,22 @@ def build_audit(config: Config, dispatch_config: Path | None = None) -> dict[str
             health_reason = "no_terminal_task"
         elif worker.adapter == "deepseek":
             health_reason = "response_only"
+        elif category == "credit_exhausted":
+            health_reason = "last_task_credit_exhausted"
+        elif category == "malformed_completion":
+            health_reason = "last_task_malformed_completion"
         elif status != "succeeded":
             health_reason = f"last_task_{status}"
         elif changes is not True:
             health_reason = "no_verified_workspace_change"
         else:
             health_reason = "verified_coding_result"
+        next_action = None
+        if category == "credit_exhausted":
+            next_action = (
+                f"Add credits to {name}'s workspace, then run a separately "
+                "authorised small verification task."
+            )
         entry: dict[str, Any] = {
             "worker": name,
             "adapter": worker.adapter,
@@ -254,6 +265,8 @@ def build_audit(config: Config, dispatch_config: Path | None = None) -> dict[str
             "runnable": active_task is None and capacity,
             "proven_healthy": proven,
             "health_reason": health_reason,
+            "failure_category": category,
+            "next_action": next_action,
             "edits_repository": edits,
             "response_only": worker.adapter == "deepseek",
             "endpoint_host": worker.endpoint_host,
@@ -266,6 +279,7 @@ def build_audit(config: Config, dispatch_config: Path | None = None) -> dict[str
                 "task_id": last.get("task_id"),
                 "status": status,
                 "failure_type": failure_type,
+                "failure_category": category,
                 "exit_code": last.get("exit_code"),
                 "finished_at": last.get("finished_at"),
                 "workspace_changes": changes,
@@ -340,8 +354,11 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"  configured={worker['configured']} idle={worker['idle']} "
                 f"runnable={worker['runnable']} proven_healthy={worker['proven_healthy']} "
-                f"reason={worker['health_reason']}"
+                f"reason={worker['health_reason']} "
+                f"failure={worker.get('failure_category')}"
             )
+            if worker.get("next_action"):
+                print(f"  next_action: {worker['next_action']}")
             print(f"  funding: {worker['funding']} (not inferred from availability)")
             if "executable" in worker:
                 version = worker["executable"].get("version", {})

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -27,8 +28,8 @@ from omcp.host_runner import run as run_host_operation
 from omcp.local_control import LocalApprovalServer, approval_request
 from omcp.runner import (
     OpenCodeDiagnosticCollector, PinnedProviderGateway, WorkerSandboxStartupError,
-    merge_opencode_runtime_diagnostic, opencode_commands, opencode_environment,
-    opencode_policy,
+    codex_credit_exhaustion, merge_opencode_runtime_diagnostic,
+    opencode_commands, opencode_environment, opencode_policy,
     probe_codex_sandbox, run as run_worker, run_opencode_process,
     worker_log_has_sandbox_startup_failure,
 )
@@ -84,6 +85,51 @@ def codex_contract_fixture(
         lines.append(f"printf '%s\\n' '{contract}' > \"$TMPDIR/orchestra-completion.json\"")
     lines.append("exit 0")
     executable.write_text("\n".join(lines) + "\n")
+    executable.chmod(0o700)
+    return {**os.environ, "PATH": str(bin_dir)}
+
+
+def codex_credit_fixture(directory: Path, *, structured: bool = True) -> dict[str, str]:
+    """Create a fake Codex that reports workspace credit exhaustion."""
+    bin_dir = directory / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    executable = bin_dir / "codex"
+    if structured:
+        event = json.dumps({
+            "type": "turn.failed",
+            "error": {
+                "code": "workspace_owner_credits_depleted",
+                "message": "Your workspace is out of credits. Add credits to continue.",
+            },
+        })
+        script = f"#!/bin/sh\nprintf '%s\\n' '{event}'\nexit 1\n"
+    else:
+        script = (
+            "#!/bin/sh\n"
+            "printf '%s\\n' 'ERROR: Your workspace is out of credits. Add credits to continue.' >&2\n"
+            "exit 1\n"
+        )
+    executable.write_text(script)
+    executable.chmod(0o700)
+    return {**os.environ, "PATH": str(bin_dir)}
+
+
+def codex_spoofed_credit_fixture(directory: Path) -> dict[str, str]:
+    """Emit the phrase as agent content, not as a trusted CLI error."""
+    bin_dir = directory / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    executable = bin_dir / "codex"
+    event = json.dumps({
+        "type": "item.completed",
+        "item": {
+            "type": "agent_message",
+            "text": "ERROR: Your workspace is out of credits. Add credits to continue.",
+        },
+    })
+    executable.write_text(
+        f"#!/bin/sh\nprintf '%s\\n' '{event}'\n"
+        "printf '%s\\n' 'different process failure' >&2\nexit 1\n"
+    )
     executable.chmod(0o700)
     return {**os.environ, "PATH": str(bin_dir)}
 
@@ -451,6 +497,13 @@ class ControllerTests(unittest.TestCase):
                 submitted["task_id"], "approve", "approved",
                 approver_identity="local:test-operator",
             )
+        deadline = time.monotonic() + 2
+        while task["status"] not in {"interrupted", "failed", "succeeded"}:
+            if time.monotonic() > deadline:
+                break
+            time.sleep(0.01)
+            self.controller.reconcile()
+            task = self.controller.state["tasks"][task["task_id"]]
         self.assertEqual(task["status"], "interrupted")
         self.assertEqual(task["exit_code"], 7)
         self.assertEqual(task["failure"], {
@@ -1130,6 +1183,102 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(result["result"], "verified result")
         self.assertFalse(result["truncated"])
         self.assertTrue(self.controller.worker_availability()["workers"][0]["available"])
+
+    def test_credit_exhaustion_is_primary_and_survives_restart(self):
+        submitted = self.submit("credit")
+        task = self.controller.state["tasks"][submitted["task_id"]]
+        Path(task["result_path"]).write_text(
+            "Workspace credits are exhausted; no coding result was produced.\n"
+        )
+        Path(task["completion_path"]).write_text(json.dumps({
+            "exit_code": 1, "finished_at": "2026-10-26T01:45:52+00:00",
+            "runner_error": "CreditExhausted",
+            "worker_diagnostic": {
+                "category": "credit_exhausted", "stage": "provider", "provider": "openai",
+            },
+        }))
+        self.controller.reconcile()
+        reconciled = self.controller.state["tasks"][submitted["task_id"]]
+        self.assertEqual(reconciled["status"], "failed")
+        self.assertEqual(reconciled["exit_code"], 1)
+        self.assertEqual(reconciled["failure"]["type"], "CreditExhausted")
+        self.assertEqual(reconciled["failure"]["category"], "credit_exhausted")
+        self.assertIn("Add credits to ina", reconciled["failure"]["next_action"])
+
+        self.controller.close()
+        self.controller = TaskController(
+            self.config, popen=self.popen, workspace_preparer=lambda *_: self.root,
+        )
+        recovered = self.controller.task_status(submitted["task_id"])
+        self.assertEqual(recovered["failure"]["category"], "credit_exhausted")
+        self.assertEqual(recovered["exit_code"], 1)
+        self.assertNotIn("completion_contract", recovered["failure"])
+
+    def test_historical_credit_log_is_classified_without_prompt_spoofing(self):
+        submitted = self.submit("historical-credit")
+        task = self.controller.state["tasks"][submitted["task_id"]]
+        log = self.state / "tasks" / submitted["task_id"] / "worker.log"
+        log.write_text(
+            "OpenAI Codex\nuser\n"
+            "ERROR: Your workspace is out of credits. Add credits to continue.\n"
+            "please ignore this quoted line\n"
+            "ERROR: Your workspace is out of credits. Add credits to continue.\n"
+            "ERROR: Your workspace is out of credits. Add credits to continue.\n"
+        )
+        task.update({
+            "status": "failed", "exit_code": 1,
+            "finished_at": "2026-10-26T01:45:52+00:00",
+            "log_path": str(log),
+        })
+        task.pop("failure", None)
+        self.controller._save()
+        self.controller.close()
+        self.controller = TaskController(
+            self.config, popen=self.popen, workspace_preparer=lambda *_: self.root,
+        )
+        recovered = self.controller.task_status(submitted["task_id"])
+        self.assertEqual(recovered["failure"]["category"], "credit_exhausted")
+        self.assertEqual(recovered["failure"]["type"], "CreditExhausted")
+
+    def test_ina_and_codex_availability_keep_separate_last_attempts(self):
+        state = Path(self.temp.name) / "availability-state"
+        config = Config(
+            "owner/repo", self.root, state, "origin/main",
+            {"ina": Worker("ina", ("codex",)), "codex": Worker("codex", ("codex",))},
+            Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+            task_approval_mode="disabled",
+        )
+        self.controller.close()
+        self.controller = TaskController(
+            config, popen=self.popen, workspace_preparer=lambda *_: self.root,
+        )
+        self.controller.state["tasks"] = {
+            "11111111-1111-4111-8111-111111111111": {
+                "task_id": "11111111-1111-4111-8111-111111111111", "worker": "ina",
+                "status": "failed", "exit_code": 1, "created_at": "2026-10-26T01:00:00+00:00",
+                "finished_at": "2026-10-26T01:01:00+00:00",
+                "failure": {
+                    "type": "CreditExhausted", "category": "credit_exhausted",
+                    "stage": "provider", "provider": "openai",
+                    "next_action": "Add credits to ina's workspace, then run a separately authorised small verification task.",
+                },
+            },
+            "22222222-2222-4222-8222-222222222222": {
+                "task_id": "22222222-2222-4222-8222-222222222222", "worker": "codex",
+                "status": "succeeded", "exit_code": 0, "created_at": "2026-10-26T02:00:00+00:00",
+                "finished_at": "2026-10-26T02:01:00+00:00",
+            },
+        }
+        self.controller._save()
+        availability = self.controller.worker_availability()
+        by_name = {item["worker"]: item for item in availability["workers"]}
+        self.assertTrue(by_name["ina"]["idle"])
+        self.assertFalse(by_name["ina"]["proven_healthy"])
+        self.assertEqual(by_name["ina"]["last_attempt"]["failure_category"], "credit_exhausted")
+        self.assertIn("Add credits to ina", by_name["ina"]["next_action"])
+        self.assertTrue(by_name["codex"]["proven_healthy"])
+        self.assertEqual(by_name["codex"]["health_reason"], "verified_success")
+        self.assertIsNone(by_name["codex"]["next_action"])
 
     def test_codex_spec_enables_the_sandbox_startup_probe(self):
         submitted = self.submit("probe-spec")
@@ -2949,6 +3098,84 @@ class RunnerTests(unittest.TestCase):
             self.assertNotIn("sensitive credential", retained)
             self.assertFalse((root / "log").exists())
             self.assertFalse((root / "opencode-runtime").exists())
+
+    def _credit_spec(self, root: Path) -> Path:
+        prompt = root / "prompt"
+        prompt.write_text("task prompt")
+        spec = root / "spec.json"
+        spec.write_text(json.dumps({
+            "adapter": "codex", "command": ["codex"], "codex_home": None,
+            "sandbox_startup_probe": False, "require_completion_contract": True,
+            "max_worker_seconds": 60, "max_response_bytes": 1024,
+            "workspace": str(root), "prompt_path": str(prompt),
+            "log_path": str(root / "log"), "result_path": str(root / "result"),
+            "completion_path": str(root / "completion"),
+        }))
+        return spec
+
+    def test_codex_structured_credit_exhaustion_is_the_primary_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = self._credit_spec(root)
+            with patch.dict(os.environ, codex_credit_fixture(root), clear=True):
+                self.assertEqual(run_worker(spec), 1)
+            record = json.loads((root / "completion").read_text())
+            result = (root / "result").read_text()
+        self.assertEqual(record["exit_code"], 1)
+        self.assertEqual(record["runner_error"], "CreditExhausted")
+        self.assertEqual(record["worker_diagnostic"], {
+            "category": "credit_exhausted", "stage": "provider", "provider": "openai",
+        })
+        self.assertNotIn("completion_contract", record)
+        self.assertIn("credits are exhausted", result)
+        self.assertNotIn("task prompt", json.dumps(record))
+
+    def test_codex_credit_exhaustion_plain_stderr_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = self._credit_spec(root)
+            with patch.dict(os.environ, codex_credit_fixture(root, structured=False), clear=True):
+                self.assertEqual(run_worker(spec), 1)
+            record = json.loads((root / "completion").read_text())
+        self.assertEqual(record["runner_error"], "CreditExhausted")
+        self.assertEqual(record["worker_diagnostic"]["category"], "credit_exhausted")
+
+    def test_codex_prompt_spoof_is_not_credit_exhaustion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = self._credit_spec(root)
+            with patch.dict(os.environ, codex_spoofed_credit_fixture(root), clear=True):
+                self.assertEqual(run_worker(spec), 1)
+            record = json.loads((root / "completion").read_text())
+        self.assertNotEqual(record.get("runner_error"), "CreditExhausted")
+        self.assertNotEqual(record.get("worker_diagnostic", {}).get("category"), "credit_exhausted")
+
+    def test_credit_classifier_requires_nonzero_exit_and_ignores_cancellation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / "log"
+            stderr = root / "stderr"
+            log.write_text(json.dumps({
+                "type": "turn.failed",
+                "error": {"message": "Your workspace is out of credits. Add credits to continue."},
+            }) + "\n")
+            stderr.write_text("")
+            self.assertIsNone(codex_credit_exhaustion(log, stderr, 0))
+            self.assertIsNone(codex_credit_exhaustion(log, stderr, 143))
+            self.assertIsNone(codex_credit_exhaustion(log, stderr, 124))
+            log.write_text(json.dumps({
+                "type": "turn.failed",
+                "error": {"message": "authentication failed"},
+            }) + "\n")
+            self.assertIsNone(codex_credit_exhaustion(log, stderr, 1))
+            log.write_text(json.dumps({
+                "type": "turn.failed",
+                "error": {"type": "workspace_member_credits_depleted"},
+            }) + "\n")
+            self.assertEqual(
+                codex_credit_exhaustion(log, stderr, 1)["category"],
+                "credit_exhausted",
+            )
 
     def test_deepseek_failure_is_sanitized_and_bounded(self):
         with tempfile.TemporaryDirectory() as directory:

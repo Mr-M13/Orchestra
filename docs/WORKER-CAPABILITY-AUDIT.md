@@ -34,6 +34,13 @@ test cannot make it true. The entry also reports the last terminal task's
 status, failure type, exit code and whether a workspace change was observed,
 without task instructions or result text.
 
+Failure categories are reported separately for `credit_exhausted`,
+`authentication`, `rate_limit`, `transient_provider`, `cancelled` and
+`malformed_completion`. A credit-exhausted last attempt includes the exact next
+action: add credits to that worker's workspace, then run a separately
+authorised small verification task. The audit does not infer a current account
+balance; a later successful coding task clears the last-observed failure.
+
 ## Current lane assessment
 
 The reviewed PixelBox configuration has two local Codex workers

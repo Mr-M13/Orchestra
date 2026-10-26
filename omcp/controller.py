@@ -142,6 +142,59 @@ def safe_opencode_diagnostic(value: object) -> dict[str, Any] | None:
     return result
 
 
+WORKER_FAILURE_CATEGORIES = {
+    "credit_exhausted", "authentication", "rate_limit", "transient_provider",
+    "cancelled", "malformed_completion", "sandbox", "unknown",
+}
+WORKER_FAILURE_STAGES = {"provider", "startup", "process", "completion"}
+HISTORICAL_CREDIT_LINES = (
+    "ERROR: Your workspace is out of credits. Add credits to continue.",
+    "ERROR: Your workspace is out of credits. Ask your workspace owner to refill in order to continue.",
+)
+
+
+def safe_worker_diagnostic(value: object) -> dict[str, Any] | None:
+    """Accept only fixed, non-sensitive worker failure fields."""
+    if not isinstance(value, dict):
+        return None
+    category = value.get("category")
+    stage = value.get("stage")
+    provider = value.get("provider")
+    if category not in WORKER_FAILURE_CATEGORIES:
+        return None
+    if stage is not None and stage not in WORKER_FAILURE_STAGES:
+        return None
+    if provider is not None and provider not in {"openai", "deepseek"}:
+        return None
+    result: dict[str, Any] = {"category": category}
+    if stage is not None:
+        result["stage"] = stage
+    if provider is not None:
+        result["provider"] = provider
+    return result
+
+
+def failure_category(task: dict[str, Any]) -> str:
+    """Return a stable category without changing existing task status."""
+    failure = task.get("failure")
+    if isinstance(failure, dict):
+        category = failure.get("category")
+        if isinstance(category, str) and category in WORKER_FAILURE_CATEGORIES:
+            return category
+        failure_type = failure.get("type")
+        if failure_type == "CreditExhausted":
+            return "credit_exhausted"
+        if failure_type in {"TaskContractFailed", "TaskContractInvalid", "MissingWorkerResult"}:
+            return "malformed_completion"
+        if failure_type in {"WorkerTimeout", "RunnerTerminated"}:
+            return "transient_provider"
+        if failure_type == "SandboxStartupError":
+            return "sandbox"
+    if task.get("status") == "cancelled":
+        return "cancelled"
+    return "unknown"
+
+
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     data = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
@@ -920,6 +973,7 @@ class TaskController:
         self._children: dict[str, subprocess.Popen[Any]] = {}
         self.state = self._load()
         self._initialize_instance()
+        self._classify_historical_credit_failures()
         try:
             self._drain_legacy_github_runs()
         except Exception as exc:
@@ -1047,6 +1101,54 @@ class TaskController:
         if changed:
             self._save()
 
+    def _credit_next_action(self, worker_name: str) -> str:
+        return (
+            f"Add credits to {worker_name}'s workspace, then run a separately "
+            "authorised small verification task."
+        )
+
+    def _historical_credit_failure(self, task: dict[str, Any]) -> dict[str, Any] | None:
+        if task.get("status") not in {"failed", "interrupted"}:
+            return None
+        exit_code = task.get("exit_code")
+        if not isinstance(exit_code, int) or isinstance(exit_code, bool) or exit_code == 0:
+            return None
+        existing = task.get("failure")
+        if isinstance(existing, dict) and existing.get("category") == "credit_exhausted":
+            return None
+        log_path = task.get("log_path")
+        if not isinstance(log_path, str):
+            return None
+        try:
+            with Path(log_path).open("rb") as source:
+                source.seek(0, os.SEEK_END)
+                size = source.tell()
+                source.seek(max(0, size - 8192))
+                data = source.read(8192)
+        except OSError:
+            return None
+        lines = [line.strip().decode("utf-8", "replace") for line in data.splitlines()
+                 if line.strip()]
+        if len(lines) < 2 or any(line not in HISTORICAL_CREDIT_LINES for line in lines[-2:]):
+            return None
+        worker_name = str(task.get("worker") or "worker")
+        worker = self.config.workers.get(worker_name)
+        failure: dict[str, Any] = {
+            "type": "CreditExhausted", "category": "credit_exhausted",
+            "stage": "provider",
+            "next_action": self._credit_next_action(worker_name),
+        }
+        if worker is not None and worker.adapter == "codex":
+            failure["provider"] = "openai"
+        return failure
+
+    def _classify_historical_credit_failures(self) -> None:
+        """Correct old generic Codex credit failures without changing status."""
+        for task in self.state["tasks"].values():
+            failure = self._historical_credit_failure(task)
+            if failure is not None:
+                task["failure"] = failure
+
     def public_identity(self) -> dict[str, Any]:
         """Return non-sensitive routing identity, never a filesystem path."""
         identity = {
@@ -1170,6 +1272,7 @@ class TaskController:
         status = task.get("status")
         failure = task.get("failure")
         failure_type = failure.get("type") if isinstance(failure, dict) else None
+        category = failure_category(task)
         if status == "starting":
             return "Starting worker"
         if status == "running":
@@ -1183,8 +1286,12 @@ class TaskController:
         if status == "succeeded":
             return "Completed"
         if status == "failed":
+            if category == "credit_exhausted":
+                return "Blocked: workspace credits exhausted"
             return f"Failed: {failure_type}" if failure_type else "Failed"
         if status == "interrupted":
+            if category == "credit_exhausted":
+                return "Blocked: workspace credits exhausted"
             return f"Interrupted: {failure_type}" if failure_type else "Interrupted"
         if status == "cancelled":
             return "Cancelled"
@@ -1581,6 +1688,65 @@ class TaskController:
         self._audit("task.result", task_id, "allowed", {"truncated": truncated})
         return {**self._public(task), "result": output, "truncated": truncated}
 
+    def _last_terminal_attempt(self, worker_name: str) -> dict[str, Any] | None:
+        attempts = [
+            task for task in self.state["tasks"].values()
+            if task.get("worker") == worker_name and task.get("status") in TERMINAL
+        ]
+        if not attempts:
+            return None
+        last = max(
+            attempts,
+            key=lambda task: (
+                task.get("finished_at") or task.get("created_at") or "",
+                task.get("task_id") or "",
+            ),
+        )
+        failure = last.get("failure")
+        category = failure_category(last) if isinstance(failure, dict) else None
+        return {
+            "task_id": last.get("task_id"),
+            "status": last.get("status"),
+            "exit_code": last.get("exit_code"),
+            "failure_category": category,
+            "finished_at": last.get("finished_at"),
+            "_worker": last.get("worker"),
+        }
+
+    def _worker_health(self, worker_name: str) -> dict[str, Any]:
+        worker = self.config.workers[worker_name]
+        last = self._last_terminal_attempt(worker_name)
+        editing = worker.adapter in {"codex", "opencode", "github_actions"}
+        proven = bool(editing and last is not None and last["status"] == "succeeded")
+        category = last.get("failure_category") if last else None
+        if last is None:
+            reason = "no_terminal_attempt"
+        elif worker.adapter == "deepseek":
+            reason = "response_only"
+        elif proven:
+            reason = "verified_success"
+        elif category == "credit_exhausted":
+            reason = "last_attempt_credit_exhausted"
+        elif last["status"] == "cancelled":
+            reason = "last_attempt_cancelled"
+        elif last["status"] in {"failed", "interrupted"}:
+            reason = "last_attempt_failed"
+        else:
+            reason = f"last_attempt_{last['status']}"
+        next_action = (
+            self._credit_next_action(worker_name)
+            if category == "credit_exhausted" else None
+        )
+        public_last = None if last is None else {
+            key: value for key, value in last.items() if not key.startswith("_")
+        }
+        return {
+            "proven_healthy": proven,
+            "health_reason": reason,
+            "last_attempt": public_last,
+            "next_action": next_action,
+        }
+
     def worker_availability(self) -> dict[str, Any]:
         self._authorize("workers:read", "worker.availability")
         self._require_authoritative("worker.availability")
@@ -1608,6 +1774,7 @@ class TaskController:
                 if reason is None and self._task_identity_conflict(next_task):
                     reason = "duplicate_task_identity"
             runnable = reason is None
+            health = self._worker_health(name)
             workers.append({
                 "worker": name,
                 "adapter": self.config.workers[name].adapter,
@@ -1622,6 +1789,7 @@ class TaskController:
                 # that a repository or worker block makes unusable.
                 "runnable": runnable,
                 "reason": reason,
+                **health,
                 "current_task_id": current["task_id"] if current else None,
                 "next_task_id": next_task["task_id"] if next_task else None,
             })
@@ -2137,7 +2305,26 @@ class TaskController:
                     "status": "cancelled" if cancelled else ("succeeded" if exit_code == 0 else "failed"),
                     "exit_code": exit_code, "finished_at": result["finished_at"],
                 })
-                if runner_error:
+                structured = safe_worker_diagnostic(result.get("worker_diagnostic"))
+                if structured is not None and exit_code != 0:
+                    if structured["category"] == "credit_exhausted":
+                        task["failure"] = {
+                            "type": "CreditExhausted", **structured,
+                            "next_action": self._credit_next_action(
+                                str(task.get("worker") or "worker")
+                            ),
+                        }
+                    elif runner_error:
+                        task["failure"] = {"type": runner_error, **structured}
+                elif runner_error == "CreditExhausted":
+                    task["failure"] = {
+                        "type": "CreditExhausted", "category": "credit_exhausted",
+                        "stage": "provider",
+                        "next_action": self._credit_next_action(
+                            str(task.get("worker") or "worker")
+                        ),
+                    }
+                elif runner_error:
                     task["failure"] = {"type": runner_error}
                 diagnostic = (safe_opencode_diagnostic(result.get("worker_diagnostic"))
                               if worker is not None and worker.adapter == "opencode" else None)

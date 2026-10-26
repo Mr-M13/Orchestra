@@ -188,6 +188,25 @@ or:
 
 The coordinator marks the task `succeeded` only when the process exits zero, the mandatory result exists and is non-empty, and the structured status is exactly `success`. A zero process exit with a missing, invalid or failure contract is recorded as `failed` (`TaskContractFailed`, `TaskContractInvalid` or `MissingWorkerResult`). The PR #50 Bubblewrap-startup and missing-result protections remain in force.
 
+Codex output is requested as JSONL into a private task file. Only a bounded
+tail is inspected for failure classification, then the JSONL stream is deleted
+so the prompt and model output are not retained. A nonzero Codex exit with a trusted
+`turn.failed`/error event naming workspace credit depletion is recorded as
+`failure.type=CreditExhausted` and `failure.category=credit_exhausted`, while
+the real exit code and `failed` status remain unchanged. A plain-text fallback
+reads only the separate stderr stream and requires the exact CLI error line;
+prompt text and agent messages cannot create this category. When credit
+exhaustion is established, the absent completion contract is not reported as
+the primary failure. The public failure includes only the category, stage,
+provider and a fixed next action.
+
+`worker_availability` reports `configured`, `idle`, `runnable`, the last
+terminal attempt and `proven_healthy` separately. A later successful coding
+attempt clears the last-observed credit failure; it does not prove the current
+account balance or permanently disable the worker. The dashboard shows the
+last attempt as blocked by exhausted credits without marking other Codex
+workers unfunded.
+
 Standing routine tasks are also verified by a coordinator-controlled security probe. The probe implementation and report live under coordinator-owned state, outside every path writable by the Codex worker. The coordinator launches a separate transient systemd user service and runs `codex sandbox` with the same authoritative routine permission profile used by the real worker. Both paths consume the same `RoutineConfinementPolicy` definition; the probe does not construct an independent stricter sandbox. Codex does not execute, edit or replace the probe, and Codex cannot write the report location.
 
 The probe actually attempts to read `/etc/orchestra/omcp.json` and the Orchestra secret file, write outside the worktree, connect to an external destination, and modify Git metadata. It emits structured evidence with `attempted: true` and `allowed: false` for every required assertion; the coordinator writes the trusted report. A missing report, an unattempted assertion or any `allowed: true` result fails the task with `SecurityAssertionFailed`. The probe does not treat a natural-language claim of denial as evidence, and worker-created files under `.orchestra-tmp` cannot substitute for trusted evidence.

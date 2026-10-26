@@ -724,6 +724,16 @@ class HealthTests(unittest.TestCase):
                         "worker": "ina", "failure": {"type": "runner_startup_failed"},
                         "instructions": "private task content",
                     },
+                    "33333333-3333-3333-3333-333333333333": {
+                        "task_id": "33333333-3333-3333-3333-333333333333",
+                        "status": "failed", "created_at": now, "finished_at": now,
+                        "worker": "ina",
+                        "failure": {
+                            "type": "CreditExhausted", "category": "credit_exhausted",
+                            "stage": "provider",
+                        },
+                        "instructions": "private task content",
+                    },
                 },
             }))
             (state / "state.json").chmod(0o600)
@@ -748,9 +758,13 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(report["status"], "degraded")
         for warning in (
             "stale_accepted_tasks", "runner_startup_failures",
-            "failed_tasks_present",
+            "failed_tasks_present", "credit_exhausted_tasks",
         ):
             self.assertIn(warning, report["warnings"])
+        self.assertEqual(report["checks"]["tasks"]["recent_credit_exhausted"], 1)
+        self.assertEqual(
+            report["checks"]["tasks"]["failure_categories"]["credit_exhausted"], 1,
+        )
         self.assertNotIn("private task content", json.dumps(report))
 
     def test_health_backup_check_does_not_treat_unrelated_archives_as_healthy(self):

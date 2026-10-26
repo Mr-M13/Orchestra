@@ -104,6 +104,41 @@ class WorkerAuditTests(unittest.TestCase):
         self.assertTrue(worker["last_task"]["workspace_changes"])
         self.assertNotIn("never reported", json.dumps(report))
 
+    def test_audit_reports_credit_exhaustion_with_next_action(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "project"
+            root.mkdir()
+            state = base / "state"
+            state.mkdir()
+            (state / "state.json").write_text(json.dumps({
+                "schema_version": 1, "requests": {}, "scheduler": {},
+                "tasks": {
+                    "11111111-1111-4111-8111-111111111111": {
+                        "task_id": "11111111-1111-4111-8111-111111111111",
+                        "worker": "ina", "status": "failed", "exit_code": 1,
+                        "created_at": "2026-10-26T01:00:00+00:00",
+                        "finished_at": "2026-10-26T01:01:00+00:00",
+                        "failure": {
+                            "type": "CreditExhausted", "category": "credit_exhausted",
+                            "stage": "provider", "provider": "openai",
+                        },
+                    },
+                },
+            }))
+            config = Config(
+                "owner/repo", root, state, "origin/main",
+                {"ina": Worker("ina", ("/bin/true",))},
+                Principal("chatgpt:test", frozenset({"status:read"}), "test"),
+            )
+            report = AUDIT.build_audit(config)
+        worker = report["workers"][0]
+        self.assertEqual(worker["failure_category"], "credit_exhausted")
+        self.assertEqual(worker["health_reason"], "last_task_credit_exhausted")
+        self.assertFalse(worker["proven_healthy"])
+        self.assertIn("Add credits to ina", worker["next_action"])
+        self.assertEqual(worker["last_task"]["failure_category"], "credit_exhausted")
+
     def test_audit_does_not_infer_credits_from_availability(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
