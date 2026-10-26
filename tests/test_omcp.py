@@ -26,7 +26,8 @@ from omcp.host_runner import run as run_host_operation
 from omcp.local_control import LocalApprovalServer, approval_request
 from omcp.runner import (
     OpenCodeDiagnosticCollector, PinnedProviderGateway, WorkerSandboxStartupError,
-    opencode_commands, opencode_environment, opencode_policy,
+    merge_opencode_runtime_diagnostic, opencode_commands, opencode_environment,
+    opencode_policy,
     probe_codex_sandbox, run as run_worker, run_opencode_process,
     worker_log_has_sandbox_startup_failure,
 )
@@ -2286,6 +2287,14 @@ class RunnerTests(unittest.TestCase):
             self.assertIn('(allow network-outbound (remote tcp "localhost:49152"))', server_profile)
             self.assertIn('(allow network-outbound (remote tcp "localhost:49153"))', client_profile)
             self.assertNotIn("localhost:49152", client_profile)
+            self.assertIn(
+                f'(allow file-read* (literal "{workspace.parent.resolve()}"))',
+                server_profile,
+            )
+            self.assertNotIn(
+                f'(allow file-read* (subpath "{workspace.parent.resolve()}"))',
+                server_profile,
+            )
             self.assertIn("serve", server)
             self.assertIn("--server", client)
             self.assertNotIn("--standalone", client)
@@ -2516,6 +2525,22 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn(secret, serialized)
         self.assertNotIn(prompt, serialized)
         self.assertNotIn(model_output, serialized)
+
+    def test_opencode_runtime_log_upgrades_unknown_to_sandbox_denied(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "runtime"
+            log = runtime / "data" / "opencode" / "log" / "opencode.log"
+            log.parent.mkdir(parents=True)
+            log.write_text(
+                'cause="PlatformError: FileSystem.realPath /private/tmp/task"\n'
+                '[cause]: Error: EPERM: operation not permitted, lstat \'/private/tmp/task\'\n'
+                "secret-value-never-retained\n"
+            )
+            diagnostic = merge_opencode_runtime_diagnostic(
+                runtime, {"category": "unknown", "exit_cause": "process_exit"}, 1,
+            )
+        self.assertEqual(diagnostic["category"], "sandbox_denied")
+        self.assertNotIn("secret-value-never-retained", json.dumps(diagnostic))
 
     def test_opencode_process_discards_raw_stream_and_reports_http_status(self):
         with tempfile.TemporaryDirectory() as directory:

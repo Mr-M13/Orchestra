@@ -200,6 +200,24 @@ def _seatbelt_profile(policy: SandboxPolicy, executable: str) -> str:
                  for path in policy.read_files)
     rules.extend(f'(allow file-write* (subpath "{_seatbelt_quote(path)}"))'
                  for path in policy.write_paths)
+    # OpenCode resolves real paths and discovers configuration by walking from
+    # its workdir to the filesystem root. It needs metadata access to those
+    # ancestors, not permission to read their contents. Without this, a fresh
+    # task directory produces `EPERM lstat` and an opaque 500 before any
+    # provider request.
+    ancestors: set[Path] = set()
+    for path in (*policy.read_paths, *policy.write_paths):
+        ancestors.update(path.parents)
+    # /var and /tmp are symlinks into /private on macOS. OpenCode resolves the
+    # unresolved workdir path as well, so permit traversal of both spellings.
+    for ancestor in list(ancestors):
+        text = str(ancestor)
+        if text.startswith("/private/"):
+            ancestors.add(Path(text[len("/private"):]))
+    rules.extend(
+        f'(allow file-read* (literal "{_seatbelt_quote(path)}"))'
+        for path in sorted(ancestors, key=lambda item: str(item))
+    )
     if policy.network_hosts:
         rules.extend(
             f'(allow network-outbound (remote tcp "{_seatbelt_quote(host)}:443"))'
