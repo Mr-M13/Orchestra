@@ -3585,6 +3585,7 @@ class RunnerTests(unittest.TestCase):
             command = run.call_args.args[0]
             self.assertIn('model_provider="deepseek"', " ".join(command))
             self.assertIn('wire_api="responses"', " ".join(command))
+            self.assertLess(command.index("exec"), command.index("-c"))
             self.assertEqual(run.call_args.kwargs["env"]["DEEPSEEK_API_KEY"], "omcp-local-gateway")
             self.assertNotIn("real-key-not-seen", json.dumps(run.call_args.kwargs["env"]))
             gateway.start.assert_called_once()

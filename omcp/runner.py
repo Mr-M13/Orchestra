@@ -1086,7 +1086,8 @@ def run(spec_path: Path) -> int:
                         credential, seconds,
                     )
                     gateway_url = gateway.start()
-                    command = [command[0], *codex_provider_args(gateway_url, spec.get("model")), *command[1:]]
+                    insert_at = command.index("exec") + 1
+                    command = [*command[:insert_at], *codex_provider_args(gateway_url, spec.get("model")), *command[insert_at:]]
                     environment["DEEPSEEK_API_KEY"] = "omcp-local-gateway"
             else:
                 if (not isinstance(capabilities, dict) or capabilities.get("profile") != "routine_development_v1"
@@ -1127,7 +1128,8 @@ def run(spec_path: Path) -> int:
                         credential, seconds,
                     )
                     gateway_url = gateway.start()
-                    command = [command[0], *codex_provider_args(gateway_url, spec.get("model")), *command[1:]]
+                    insert_at = command.index("exec") + 1
+                    command = [*command[:insert_at], *codex_provider_args(gateway_url, spec.get("model")), *command[insert_at:]]
                     environment["DEEPSEEK_API_KEY"] = "omcp-local-gateway"
             if (contract_probe_command is not None
                     and spec.get("contract_probe") is True):
