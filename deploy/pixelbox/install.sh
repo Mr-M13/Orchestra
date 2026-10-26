@@ -585,7 +585,7 @@ preflight_activation_config() {
 backup_activation_config() {
   local old_sha="$1" stamp
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  CONFIG_BACKUP_DIR="$STATE_ROOT.parent/backup/pre-activate-${RELEASE_SHA}-${stamp}"
+  CONFIG_BACKUP_DIR="$(dirname "$STATE_ROOT")/backup/pre-activate-${RELEASE_SHA}-${stamp}"
   install -d -m 0700 "$CONFIG_BACKUP_DIR" \
     || fail "could not create the activation config backup directory"
   sudo tar --acls --xattrs -C /etc -czf "$CONFIG_BACKUP_DIR/etc-orchestra.tar.gz" orchestra \
