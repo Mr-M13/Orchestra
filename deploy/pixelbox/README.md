@@ -12,11 +12,17 @@ starts the tunnel or touches unrelated host services.
 - `tunnel.env.example` — tunnel runtime key placeholder.
 - `mcp-http.env.example` — owner-managed bearer-token template for the optional
   loopback HTTPS MCP gateway.
+- `backup.example.json` — restic repository/retention template. The default is
+  deliberately local-only (`off_device: false`); health reports it as
+  `unchecked` until the owner chooses an off-device destination and key
+  custody. See [docs/BACKUP-RECOVERY.md](../../docs/BACKUP-RECOVERY.md).
 - `omcp.dashboard-development.example.json` — policy-only
   `orchestra-dashboard` profile plus exact `dashboard/*` file grant for Ina; it
   is not merged automatically and requires separate owner approval.
-- `systemd/` — coordinator, tunnel, health, optional loopback HTTP gateway,
-  loopback unified dashboard and owner-only approval portal units.
+- `systemd/` — coordinator, tunnel, health, daily encrypted backup,
+  optional loopback HTTP gateway, loopback unified dashboard and owner-only
+  approval portal units. The backup units are installed but not enabled until
+  an owner-approved off-device repository exists.
 - `install.sh` — exports an exact 40-character Git SHA into
   `/opt/orchestra/releases/<sha>`, validates it, and atomically updates the
   `/opt/orchestra/current` symlink only during a separately approved

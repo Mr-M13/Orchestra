@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Orchestra encrypted backup daily
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=30m
+Persistent=true
+AccuracySec=1m
+Unit=orchestra-backup.service
+
+[Install]
+WantedBy=timers.target

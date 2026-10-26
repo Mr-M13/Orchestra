@@ -366,6 +366,7 @@ install_units() {
   fi
   for unit in orchestra-omcp.service orchestra-github-dispatch.service orchestra-tunnel.service \
               orchestra-health.service orchestra-health.timer \
+              orchestra-backup.service orchestra-backup.timer \
               orchestra-dashboard.service orchestra-approval-portal.service; do
     if sudo test -f "$release_root/deploy/pixelbox/systemd/$unit"; then
       sudo install -m 0644 "$release_root/deploy/pixelbox/systemd/$unit" \

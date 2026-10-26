@@ -767,6 +767,46 @@ class HealthTests(unittest.TestCase):
         )
         self.assertNotIn("private task content", json.dumps(report))
 
+    def test_health_uses_verified_backup_status_and_warns_on_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "project"
+            root.mkdir()
+            codex = base / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            state = base / "state"
+            state.mkdir(mode=0o700)
+            (state / "state.json").write_text(json.dumps({
+                "schema_version": 1, "tasks": {}, "requests": {},
+                "scheduler": {"last_repository": None},
+            }))
+            (state / "state.json").chmod(0o600)
+            (state / "audit.jsonl").write_text("")
+            (state / "audit.jsonl").chmod(0o600)
+            (state / "heartbeat.json").write_text(json.dumps({
+                "pid": os.getpid(),
+                "last_tick": datetime.now(timezone.utc).isoformat(),
+                "active_tasks": 0, "execution_limit": 2,
+            }))
+            config_path = base / "omcp.json"
+            config_path.write_text(json.dumps({
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(state), "workers": {"ina": {"command": ["codex"]}},
+                "principal": {"identity": "chatgpt:test", "permissions": ["status:read"]},
+            }))
+            config_path.chmod(0o600)
+            with patch("omcp.health.backup_health", return_value={
+                    "checked": True, "status": "failed", "reason": "backup_overdue",
+                    "operator_action": "Run the backup."}) as backup_check, \
+                    patch("omcp.controller.shutil.which", return_value=str(codex)), \
+                    patch("omcp.platform.sandbox_executable", return_value="/usr/bin/bwrap"), \
+                    patch("omcp.platform.host_platform", return_value="linux"):
+                report = collect_health(config_path, backup_config="/temporary/backup.json")
+            backup_check.assert_called_once_with(Path("/temporary/backup.json"))
+        self.assertEqual(report["checks"]["backup"]["status"], "failed")
+        self.assertIn("backup_failed", report["warnings"])
+
     def test_health_backup_check_does_not_treat_unrelated_archives_as_healthy(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

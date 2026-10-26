@@ -168,6 +168,8 @@ if [[ -r "$CONFIG" ]]; then
   fi
   health_file="$(umask 077 && mktemp "${TMPDIR:-/tmp}/orchestra-health.XXXXXX")"
   health_args=(--config "$CONFIG" --json --allow-degraded)
+  backup_config="${ORCHESTRA_BACKUP_CONFIG:-/etc/orchestra/backup.json}"
+  [[ -n "$backup_config" ]] && health_args+=(--backup-config "$backup_config")
   [[ -n "${ORCHESTRA_TUNNEL_HEALTH_URL:-}" ]] \
     && health_args+=(--tunnel-health-url "$ORCHESTRA_TUNNEL_HEALTH_URL")
   [[ -n "${ORCHESTRA_DASHBOARD_HEALTH_URL:-}" ]] \

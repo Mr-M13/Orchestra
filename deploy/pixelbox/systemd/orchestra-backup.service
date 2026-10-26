@@ -1,0 +1,36 @@
+[Unit]
+Description=Orchestra encrypted backup (Orchestra and Nextcloud)
+Documentation=file:/opt/orchestra/current/docs/BACKUP-RECOVERY.md
+After=docker.service orchestra-omcp.service
+Requires=docker.service
+ConditionPathExists=/etc/orchestra/backup.json
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/orchestra/current
+Environment=PYTHONPATH=/opt/orchestra/current
+ExecStartPre=/usr/bin/test -r /etc/orchestra/backup.json
+ExecStartPre=/usr/bin/test -r /etc/orchestra/backup/restic-password
+ExecStart=/usr/bin/python3 -m omcp.backup --config /etc/orchestra/backup.json run
+TimeoutStartSec=3h
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/orchestra-backup
+ReadOnlyPaths=/etc/orchestra
+ReadOnlyPaths=/home/hamed/orchestra-migration
+ReadOnlyPaths=/opt/orchestra
+ReadOnlyPaths=/home/hamed/MboxNextcloud
+ReadOnlyPaths=/home/hamed/NextcloudData-SSD
+ReadOnlyPaths=/mnt/mbox
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target
