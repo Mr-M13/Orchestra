@@ -106,7 +106,7 @@ class ProbeExecutionTests(unittest.TestCase):
         self.workspace = self.base / "repo"
         self.workspace.mkdir()
         subprocess.run(["git", "init", "-q", str(self.workspace)], check=True)
-        (self.workspace / ".orchestra-tmp").mkdir()
+        (self.workspace / ".orchestra-contract").mkdir()
         self.config = self.base / "omcp.json"
         self.secret = self.base / "secret"
         self.config.write_text('{"secret":true}\n')
@@ -116,7 +116,7 @@ class ProbeExecutionTests(unittest.TestCase):
         self.outside = self.base / "outside"
         self.outside.mkdir()
         self.outside.chmod(0o500)
-        self.report = self.workspace / ".orchestra-tmp/security.json"
+        self.report = self.workspace / ".orchestra-contract/security.json"
         self.addCleanup(self._restore_permissions)
 
     def _restore_permissions(self):

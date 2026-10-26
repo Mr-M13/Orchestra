@@ -81,13 +81,13 @@ class TrustedProbeCommandTests(unittest.TestCase):
         self.assertIn("permissions.orchestra-routine.filesystem./etc/orchestra=\"deny\"", command)
         self.assertIn(
             'permissions.orchestra-routine.filesystem.:workspace_roots={'
-            '"."="read",".orchestra-tmp"="write","platform"="write",'
+            '"."="read",".orchestra-contract"="write","platform"="write",'
             '"dashboard/system.py"="write"}',
             command,
         )
         self.assertIn("--report", command)
         self.assertIn("-", command)
-        self.assertFalse((self.workspace / ".orchestra-tmp").exists())
+        self.assertFalse((self.workspace / ".orchestra-contract").exists())
         self.assertTrue((probe_root / "orchestra-security-probe.py").is_file())
         self.assertTrue((probe_root / "orchestra-security-probe.json").is_file())
 
@@ -176,7 +176,7 @@ class FileGrantSandboxIntegrationTests(unittest.TestCase):
             (workspace / "dashboard/system.py").write_text("original\n")
             (workspace / "tests").mkdir()
             (workspace / ".git").mkdir()
-            (workspace / ".orchestra-tmp").mkdir()
+            (workspace / ".orchestra-contract").mkdir()
             probe = workspace / "probe.sh"
             probe.write_text(r"""
 attempt() {
@@ -187,7 +187,7 @@ cd "$1"
 attempt exact_file dashboard/system.py changed
 attempt sibling_file dashboard/other.py denied
 attempt tests tests/escape.txt denied
-attempt completion .orchestra-tmp/orchestra-completion.json '{"status":"success"}'
+attempt completion .orchestra-contract/orchestra-completion.json '{"status":"success"}'
 attempt outside /tmp/orchestra-file-grant-outside.txt denied
 attempt git .git/config denied
 """)
@@ -213,7 +213,7 @@ attempt git .git/config denied
                 (workspace / "dashboard/system.py").read_text(), "changed\n",
             )
             self.assertTrue(
-                (workspace / ".orchestra-tmp/orchestra-completion.json").is_file(),
+                (workspace / ".orchestra-contract/orchestra-completion.json").is_file(),
             )
             self.assertFalse((workspace / "dashboard/other.py").exists())
             self.assertFalse((workspace / "tests/escape.txt").exists())

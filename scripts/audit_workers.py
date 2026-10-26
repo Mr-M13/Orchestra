@@ -244,6 +244,8 @@ def build_audit(config: Config, dispatch_config: Path | None = None) -> dict[str
             health_reason = "last_task_credit_exhausted"
         elif category == "malformed_completion":
             health_reason = "last_task_malformed_completion"
+        elif category == "contract_path_denied":
+            health_reason = "last_task_contract_path_denied"
         elif status != "succeeded":
             health_reason = f"last_task_{status}"
         elif changes is not True:
@@ -255,6 +257,11 @@ def build_audit(config: Config, dispatch_config: Path | None = None) -> dict[str
             next_action = (
                 f"Add credits to {name}'s workspace, then run a separately "
                 "authorised small verification task."
+            )
+        elif category == "contract_path_denied":
+            next_action = (
+                "Repair the shared routine policy so the task-local "
+                ".orchestra-contract path is writable; the task did not run."
             )
         entry: dict[str, Any] = {
             "worker": name,

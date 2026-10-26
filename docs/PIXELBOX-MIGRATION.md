@@ -160,7 +160,7 @@ absolute paths, `..`, `.git`, `.codex`, non-directory components and symlink
 components are rejected. The coordinator does not make the source checkout
 writable or create paths outside the task worktree.
 
-Every local Codex task must emit a structured `.orchestra-tmp/completion.json`
+Every local Codex task must emit a structured `.orchestra-contract/orchestra-completion.json`
 contract; natural-language output is not used to decide success. Standing
 routine tasks are also verified by a coordinator-controlled security probe.
 The probe and its report live under coordinator state, outside worker-writable
@@ -333,10 +333,13 @@ silently choosing by insertion order:
 does not grant a directory or the rest of the repository. The coordinator
 creates only the missing parent directories, rejects absolute/traversal,
 symlink, Git-metadata and non-regular targets, and still adds the private
-task-local `.orchestra-tmp` directory as writable for
-`orchestra-completion.json`. Both the real Codex worker and the trusted security
-probe derive their rules from the same policy. A task matching this grant still
-has `network: false`, no external credentials and read-only Git metadata.
+task-local `.orchestra-contract` directory as writable for
+`orchestra-completion.json`. The general `TMPDIR` remains
+`workspace/.orchestra-tmp` and remains denied by the routine policy; the
+contract directory is separate so the two rules do not conflict. Both the real
+Codex worker and the trusted security probe derive their rules from the same
+policy. A task matching this grant still has `network: false`, no external
+credentials and read-only Git metadata.
 
 ### Local worker boundary
 

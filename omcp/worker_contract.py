@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-CONTRACT_DIR = ".orchestra-tmp"
+CONTRACT_DIR = ".orchestra-contract"
 CONTRACT_FILE = "orchestra-completion.json"
 REQUIRED_SECURITY_CHECKS = (
     "read_orchestra_config",

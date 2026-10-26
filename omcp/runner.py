@@ -13,6 +13,7 @@ import shutil
 import socket
 import ssl
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -41,6 +42,14 @@ class ProviderRequestError(Exception):
 
 class WorkerSandboxStartupError(RuntimeError):
     """The worker's external sandbox could not start; no task ran."""
+
+
+class ContractProbeError(RuntimeError):
+    """The shared policy could not write the completion contract path."""
+
+    def __init__(self, category: str):
+        super().__init__(category)
+        self.category = category
 
 
 class OpenCodeDiagnosticCollector:
@@ -239,6 +248,7 @@ SANDBOX_STARTUP_PREFIXES = (
 )
 MAX_WORKER_LOG_SCAN_BYTES = 4 * 1024 * 1024
 MAX_CREDIT_SCAN_BYTES = 256 * 1024
+TASK_TEMP_DIR = ".orchestra-tmp"
 CREDIT_EXHAUSTED_CODES = {
     "workspace_owner_credits_depleted",
     "workspace_member_credits_depleted",
@@ -413,15 +423,26 @@ def opencode_environment(runtime_dir: Path) -> dict[str, str]:
     return environment
 
 
+def routine_policy(
+    writable_paths: list[str], writable_files: list[str] | None = None,
+    git_read_paths: list[str] | None = None,
+    read_only_paths: list[str] | None = None,
+) -> RoutineConfinementPolicy:
+    """Build the one authoritative routine confinement policy."""
+    return RoutineConfinementPolicy(
+        tuple(writable_paths),
+        tuple(read_only_paths if read_only_paths is not None else (git_read_paths or ())),
+        writable_files=tuple(writable_files or ()),
+    )
+
+
 def routine_command(executable: str, workspace: Path, result_path: Path,
                     writable_paths: list[str], writable_files: list[str] | None = None,
                     git_read_paths: list[str] | None = None,
                     read_only_paths: list[str] | None = None) -> list[str]:
     """Build the Codex worker command from the shared routine policy."""
-    policy = RoutineConfinementPolicy(
-        tuple(writable_paths),
-        tuple(read_only_paths if read_only_paths is not None else (git_read_paths or ())),
-        writable_files=tuple(writable_files or ()),
+    policy = routine_policy(
+        writable_paths, writable_files, git_read_paths, read_only_paths,
     )
     return policy.worker_command(executable, workspace, result_path)
 
@@ -932,7 +953,8 @@ def run(spec_path: Path) -> int:
     if (not isinstance(seconds, int) or isinstance(seconds, bool) or not 60 <= seconds <= 7200
             or not isinstance(maximum, int) or isinstance(maximum, bool) or not 1024 <= maximum <= 1048576):
         raise ValueError("invalid worker bounds")
-    runtime_dir = routine_tmp = contract_tmp = None
+    runtime_dir = routine_tmp = contract_tmp = task_temp_tmp = None
+    contract_probe_command: list[str] | None = None
     codex_events = log.parent / "worker-events.jsonl" if adapter == "codex" else None
     gateway: PinnedProviderGateway | None = None
     worker_diagnostic: dict[str, Any] | None = None
@@ -979,7 +1001,9 @@ def run(spec_path: Path) -> int:
                 contract_tmp = workspace / worker_contract.CONTRACT_DIR
                 contract_tmp.mkdir(mode=0o700, exist_ok=True)
                 routine_tmp = contract_tmp
-                environment["TMPDIR"] = str(contract_tmp)
+                task_temp_tmp = workspace / TASK_TEMP_DIR
+                task_temp_tmp.mkdir(mode=0o700, exist_ok=True)
+                environment["TMPDIR"] = str(task_temp_tmp)
             else:
                 if (not isinstance(capabilities, dict) or capabilities.get("profile") != "routine_development_v1"
                         or capabilities.get("network") is not False or capabilities.get("external_credentials") is not False
@@ -990,17 +1014,46 @@ def run(spec_path: Path) -> int:
                 contract_tmp = workspace / worker_contract.CONTRACT_DIR
                 contract_tmp.mkdir(mode=0o700, exist_ok=True)
                 routine_tmp = contract_tmp
+                task_temp_tmp = workspace / TASK_TEMP_DIR
+                task_temp_tmp.mkdir(mode=0o700, exist_ok=True)
                 read_only_paths = spec.get(
                     "read_only_paths", spec.get("git_read_paths", []),
                 )
                 if not isinstance(read_only_paths, list):
                     raise ValueError("invalid routine read paths")
-                command = routine_command(
-                    executable, workspace, result, capabilities["writable_paths"],
-                    writable_files=capabilities.get("writable_files", []),
+                policy = routine_policy(
+                    capabilities["writable_paths"],
+                    capabilities.get("writable_files", []),
                     read_only_paths=read_only_paths,
                 )
-                environment = worker_environment(spec.get("codex_home")); environment["TMPDIR"] = str(routine_tmp)
+                command = policy.worker_command(executable, workspace, result)
+                contract_probe_command = policy.probe_command(
+                    executable, workspace, [
+                        sys.executable, "-c",
+                        "import os,sys; p=os.path.join(sys.argv[1], 'contract-write-probe'); "
+                        "open(p, 'x').write('ok'); os.unlink(p)",
+                        str(contract_tmp),
+                    ],
+                )
+                environment = worker_environment(spec.get("codex_home")); environment["TMPDIR"] = str(task_temp_tmp)
+            if (contract_probe_command is not None
+                    and spec.get("contract_probe") is True):
+                try:
+                    probe = subprocess.run(
+                        contract_probe_command, cwd=workspace, env=environment,
+                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, check=False, timeout=20,
+                    )
+                except subprocess.TimeoutExpired:
+                    raise ContractProbeError("sandbox") from None
+                if probe.returncode != 0:
+                    detail = ((probe.stderr or b"") + (probe.stdout or b""))
+                    if isinstance(detail, str):
+                        detail = detail.encode("utf-8", "replace")
+                    lowered = detail.lower()
+                    if b"permission denied" in lowered or b"read-only file system" in lowered:
+                        raise ContractProbeError("contract_path_denied")
+                    raise ContractProbeError("sandbox")
             if adapter == "opencode":
                 exit_code, worker_diagnostic = run_opencode_with_server(
                     server_command, command, workspace, environment, runtime_dir,
@@ -1044,6 +1097,26 @@ def run(spec_path: Path) -> int:
                 with prompt.open("rb") as input_file, log.open("ab") as output:
                     exit_code = subprocess.run(command, cwd=workspace, env=environment, stdin=input_file,
                         stdout=output, stderr=subprocess.STDOUT, check=False, timeout=seconds).returncode
+    except ContractProbeError as exc:
+        exit_code = 125
+        if exc.category == "contract_path_denied":
+            error_type = "ContractPathDenied"
+            worker_diagnostic = {
+                "category": "contract_path_denied", "stage": "completion",
+            }
+            write_failure_result(
+                result,
+                "The worker sandbox denied the completion-contract path; "
+                "the task did not run.\n",
+            )
+        else:
+            error_type = "ContractProbeFailed"
+            worker_diagnostic = {"category": "sandbox", "stage": "startup"}
+            write_failure_result(
+                result,
+                "The completion-contract write probe could not run; "
+                "the task did not run.\n",
+            )
     except subprocess.TimeoutExpired:
         exit_code, error_type = 124, "WorkerTimeout"
     except RunnerTerminated as exc:
@@ -1070,6 +1143,10 @@ def run(spec_path: Path) -> int:
         if routine_tmp is not None:
             shutil.rmtree(routine_tmp, ignore_errors=True)
             if routine_tmp.exists():
+                exit_code, error_type = 125, "RoutineTemporaryDirectoryCleanupError"
+        if task_temp_tmp is not None and task_temp_tmp != routine_tmp:
+            shutil.rmtree(task_temp_tmp, ignore_errors=True)
+            if task_temp_tmp.exists():
                 exit_code, error_type = 125, "RoutineTemporaryDirectoryCleanupError"
         if runtime_dir is not None:
             shutil.rmtree(runtime_dir, ignore_errors=True)

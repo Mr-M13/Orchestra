@@ -35,8 +35,10 @@ status, failure type, exit code and whether a workspace change was observed,
 without task instructions or result text.
 
 Failure categories are reported separately for `credit_exhausted`,
-`authentication`, `rate_limit`, `transient_provider`, `cancelled` and
-`malformed_completion`. A credit-exhausted last attempt includes the exact next
+`authentication`, `rate_limit`, `transient_provider`, `cancelled`,
+`malformed_completion`, `contract_path_denied` and `sandbox`. A
+`contract_path_denied` last attempt means the shared sandbox could not write
+the dedicated task-local completion-contract path; the worker did not run. A credit-exhausted last attempt includes the exact next
 action: add credits to that worker's workspace, then run a separately
 authorised small verification task. The audit does not infer a current account
 balance; a later successful coding task clears the last-observed failure.
