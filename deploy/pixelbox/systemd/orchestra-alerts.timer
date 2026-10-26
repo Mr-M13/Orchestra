@@ -1,0 +1,12 @@
+[Unit]
+Description=Evaluate Orchestra operational alerts every two minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Persistent=true
+Unit=orchestra-alerts.service
+
+[Install]
+WantedBy=timers.target

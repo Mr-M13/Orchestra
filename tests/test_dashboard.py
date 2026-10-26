@@ -99,7 +99,17 @@ class FakeOMCP:
             from dashboard.omcp import OMCPError
             raise OMCPError("offline")
         if tool == "bridge_status":
-            return {"status": "ok", "repository_profiles": ["Delnavazan"]}
+            return {
+                "status": "ok", "repository_profiles": ["Delnavazan"],
+                "readiness": {
+                    "status": "ready", "accepting": True,
+                    "can_complete_now": True, "reasons": [],
+                    "workers": [
+                        {"worker": "Ina", "role": "coding"},
+                        {"worker": "codex", "role": "coding"},
+                    ],
+                },
+            }
         if tool == "worker_availability":
             return {"workers": self.workers}
         if tool == "task_snapshot":
@@ -140,6 +150,12 @@ class DashboardTests(unittest.TestCase):
         self.assertIn('name="viewport"', body)
         self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", body)
         self.assertNotIn("<script>alert(1)</script>", body)
+
+    def test_home_renders_current_readiness_and_worker_roles(self):
+        _, body = request(Dashboard(FakeOMCP()))
+        self.assertIn("Current readiness: ready", body)
+        self.assertIn("A verified coding worker is available now.", body)
+        self.assertIn("coding ·", body)
 
     def test_worker_rows_show_credit_exhaustion_without_hiding_codex_success(self):
         _, body = request(Dashboard(FakeOMCP()))

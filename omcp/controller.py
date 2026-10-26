@@ -20,6 +20,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from omcp import trusted_probe, worker_contract
+from omcp.readiness import build_readiness
 from omcp.platform import (
     SandboxPolicy, canonical_git_executable, default_opencode_executable,
     describe_sandbox, host_platform, sandbox_command,
@@ -1600,6 +1601,9 @@ class TaskController:
         for task in self.state["tasks"].values():
             counts[task["status"]] = counts.get(task["status"], 0) + 1
         default_profile = self.config.profile(None)
+        readiness = build_readiness(
+            self.config, self.state, worker_health=self._worker_health,
+        )
         result = {**self.public_identity(),
                   "service": "omcp", "status": "ok", "task_counts": counts,
                   # Stable identity for diagnosing a lookup that reached a
@@ -1616,6 +1620,7 @@ class TaskController:
                   "repository_profiles": sorted((self.config.repository_profiles or {"default": default_profile})),
                   "platform": host_platform(),
                   "sandbox": describe_sandbox(self.config.sandbox_backend),
+                  "readiness": readiness,
                   "scheduler": {
                       "last_repository": self.state["scheduler"].get("last_repository"),
                       "queued": counts.get("accepted", 0),

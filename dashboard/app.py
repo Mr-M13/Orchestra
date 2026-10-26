@@ -183,6 +183,12 @@ class Dashboard:
 
     def home(self) -> str:
         status = self.client.call("bridge_status")
+        readiness = status.get("readiness") if isinstance(status.get("readiness"), dict) else {}
+        readiness_status = str(readiness.get("status") or status.get("status") or "offline")
+        readiness_workers = {
+            item.get("worker"): item for item in readiness.get("workers", [])
+            if isinstance(item, dict)
+        }
         workers = self.client.call("worker_availability").get("workers", [])
         snapshot = self.client.call("task_snapshot", {"recent_limit": RECENT_LIMIT})
         running = self._items(snapshot.get("running"))
@@ -193,6 +199,11 @@ class Dashboard:
         current_by_worker = {task.get("worker"): task for task in running}
 
         def worker_state(worker: dict[str, Any]) -> str:
+            info = readiness_workers.get(worker.get("worker"), {})
+            if info.get("role") == "response_only":
+                return "response-only"
+            if info.get("role") == "remote_unproven":
+                return "unproven"
             if worker.get("current_task_id") or worker.get("idle") is False:
                 return "busy"
             last_attempt = worker.get("last_attempt")
@@ -228,7 +239,9 @@ class Dashboard:
             return f" · {reason}"
 
         worker_rows = "".join(
-            f'<article class="worker"><h3>{esc(worker.get("worker"))}</h3>{state_badge(worker_state(worker))}<p>{esc(current_by_worker.get(worker.get("worker"), {}).get("title", ""))}{esc(worker_reason(worker))}</p></article>'
+            f'<article class="worker"><h3>{esc(worker.get("worker"))}</h3>{state_badge(worker_state(worker))}'
+            f'<p>{esc(readiness_workers.get(worker.get("worker"), {}).get("role", "coding").replace("_", "-"))}'
+            f' · {esc(current_by_worker.get(worker.get("worker"), {}).get("title", ""))}{esc(worker_reason(worker))}</p></article>'
             for worker in workers
         ) or "<p>No configured workers.</p>"
         approvals_html = (f'<a class="approval" href="/approvals">{len(pending)} task{"s" if len(pending) != 1 else ""} waiting for approval</a>' if pending else "")
@@ -239,7 +252,16 @@ class Dashboard:
         )
         recent_detail = f'Latest {int(counts.get("recent_limit", RECENT_LIMIT))}'
         monitor = f'''<section class="monitor-bar" aria-label="Task refresh controls"><div><strong>Live task monitor</strong><span id="refresh-status" role="status" aria-live="polite" data-generated-at="{esc(generated_at)}">Updated {timestamp(generated_at)}</span></div><button class="button secondary" id="refresh-tasks" type="button">Refresh</button></section><div class="warning" id="refresh-warning" role="status" aria-live="polite" hidden></div>'''
-        return self.layout("Dashboard", f'''<section class="intro"><div><h1>PixelBox home</h1><p>System overview and Orchestra tasks.</p></div>{approvals_html}</section>{self.system_panel()}{monitor}<section><h2>Workers</h2><div class="workers">{worker_rows}</div></section><div class="task-sections">{self.task_section("running", "Running Tasks", running, "No tasks are running.", True)}{self.task_section("queued", "Queued Tasks", queued, "No tasks are queued or awaiting approval.", True, queued_detail)}{self.task_section("recent", "Recent Tasks", recent, "No recent terminal tasks.", False, recent_detail)}</div>''', state_badge(status.get("status", "offline")))
+        reasons = readiness.get("reasons") if isinstance(readiness.get("reasons"), list) else []
+        readiness_html = (
+            f'<section class="panel readiness readiness-{esc(readiness_status)}">'
+            f'<h2>Current readiness: {esc(readiness_status)}</h2>'
+            f'<p>{"Accepting new tasks." if readiness.get("accepting") else "Not accepting new tasks."} '
+            f'{"A verified coding worker is available now." if readiness.get("can_complete_now") else "No verified coding worker is available to complete a task immediately."}</p>'
+            + (f'<p>Reasons: {esc(", ".join(str(item) for item in reasons))}</p>' if reasons else "")
+            + '</section>'
+        )
+        return self.layout("Dashboard", f'''<section class="intro"><div><h1>PixelBox home</h1><p>System overview and Orchestra tasks.</p></div>{approvals_html}</section>{readiness_html}{self.system_panel()}{monitor}<section><h2>Workers</h2><div class="workers">{worker_rows}</div></section><div class="task-sections">{self.task_section("running", "Running Tasks", running, "No tasks are running.", True)}{self.task_section("queued", "Queued Tasks", queued, "No tasks are queued or awaiting approval.", True, queued_detail)}{self.task_section("recent", "Recent Tasks", recent, "No recent terminal tasks.", False, recent_detail)}</div>''', state_badge(readiness_status))
 
     def system_panel(self) -> str:
         labels = [

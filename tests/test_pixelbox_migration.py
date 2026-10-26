@@ -666,16 +666,24 @@ class HealthTests(unittest.TestCase):
             codex.chmod(0o700)
             state = base / "state"
             state.mkdir(mode=0o700)
+            now = datetime.now(timezone.utc).isoformat()
             (state / "state.json").write_text(json.dumps({
-                "schema_version": 1, "tasks": {}, "requests": {},
+                "schema_version": 1, "requests": {},
                 "scheduler": {"last_repository": None},
+                "tasks": {
+                    "11111111-1111-1111-1111-111111111111": {
+                        "task_id": "11111111-1111-1111-1111-111111111111",
+                        "status": "succeeded", "worker": "ina",
+                        "created_at": now, "finished_at": now,
+                    },
+                },
             }))
             (state / "state.json").chmod(0o600)
             (state / "audit.jsonl").write_text("")
             (state / "audit.jsonl").chmod(0o600)
             (state / "heartbeat.json").write_text(json.dumps({
                 "pid": os.getpid(),
-                "last_tick": datetime.now(timezone.utc).isoformat(),
+                "last_tick": now,
                 "active_tasks": 0, "execution_limit": 2,
             }))
             config_path = base / "omcp.json"
@@ -756,15 +764,18 @@ class HealthTests(unittest.TestCase):
                     patch("omcp.platform.host_platform", return_value="linux"):
                 report = collect_health(config_path)
         self.assertEqual(report["status"], "degraded")
-        for warning in (
-            "stale_accepted_tasks", "runner_startup_failures",
-            "failed_tasks_present", "credit_exhausted_tasks",
+        self.assertIn("stale_accepted_tasks", report["warnings"])
+        self.assertIn("readiness_unavailable", report["warnings"])
+        for historical in (
+            "runner_startup_failures", "failed_tasks_present",
+            "credit_exhausted_tasks", "failed_actions_dispatch",
         ):
-            self.assertIn(warning, report["warnings"])
+            self.assertNotIn(historical, report["warnings"])
         self.assertEqual(report["checks"]["tasks"]["recent_credit_exhausted"], 1)
         self.assertEqual(
             report["checks"]["tasks"]["failure_categories"]["credit_exhausted"], 1,
         )
+        self.assertEqual(report["checks"]["readiness"]["status"], "unavailable")
         self.assertNotIn("private task content", json.dumps(report))
 
     def test_health_uses_verified_backup_status_and_warns_on_failure(self):
