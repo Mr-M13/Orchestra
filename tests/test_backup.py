@@ -142,6 +142,12 @@ class BackupConfigurationTests(unittest.TestCase):
 
 
 class BackupHealthTests(unittest.TestCase):
+    def test_missing_config_is_unchecked_not_failed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status = backup_health(Path(directory) / "missing.json")
+            self.assertEqual(status["status"], "unchecked")
+            self.assertEqual(status["reason"], "backup_config_not_configured")
+
     def test_no_status_is_unchecked_not_healthy(self):
         with tempfile.TemporaryDirectory() as directory:
             path, _, _ = _config(Path(directory))
