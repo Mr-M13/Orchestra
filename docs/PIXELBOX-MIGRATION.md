@@ -764,13 +764,16 @@ release directory is a Git checkout and does not run the source-tree unit suite
 by default; add `--with-tests` only when you deliberately want that extra
 source check. Live mode also checks the coordinator, health timer, MCP socket
 mode, tunnel, optional dashboard and GitHub dispatch broker units, and reports
-`UNCHECKED` separately from `PASS`, `SKIP` and `FAIL`.
+`UNCHECKED` separately from `PASS`, `SKIP` and `FAIL`. An MCP socket mode of
+`600` or `660` passes; world-accessible modes fail. A degraded health report is
+shown with its warnings and passes by default; add `--require-health` to make
+degraded health or any unchecked required probe fatal.
 
 Optional read-only health probes can be enabled without changing the
 coordinator:
 
 ```sh
-export ORCHESTRA_DASHBOARD_HEALTH_URL=http://127.0.0.1:8082/healthz
+export ORCHESTRA_DASHBOARD_HEALTH_URL=http://127.0.0.1:8082/
 export ORCHESTRA_MCP_HEALTH_URL=<authenticated-gateway-health-url>
 export ORCHESTRA_BACKUP_DIR=/home/hamed/orchestra-migration/backup
 ```
@@ -779,8 +782,8 @@ export ORCHESTRA_BACKUP_DIR=/home/hamed/orchestra-migration/backup
 stale accepted tasks, failed GitHub Actions tasks, dispatch-broker socket
 health, backup archive age, and each external health probe. Missing optional
 probes are reported as `unchecked`, not healthy. The health timer exits nonzero
-for failed checks and optional `--allow-degraded` controls whether warnings are
-returned as status 2. It does not send success notifications.
+for failed checks; warnings are returned as status 2 unless `--allow-degraded`
+is set. It does not send success notifications.
 
 Only then route the production ChatGPT app to the PixelBox tunnel. Keep the Mac
 service available for rollback until the owner records a successful observation
