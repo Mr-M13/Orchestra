@@ -61,5 +61,6 @@
   "sandbox_backend": "bubblewrap",
   "local_worker_launcher": "systemd-user",
   "task_approval_mode": "disabled",
+  "instance_role": "authoritative",
   "standing_authorizations": []
 }

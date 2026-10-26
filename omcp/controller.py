@@ -374,6 +374,8 @@ class Config:
     standing_authorizations: tuple[StandingAuthorization, ...] = ()
     host_operations: dict[str, HostOperation] | None = None
     task_approval_mode: str = "required"
+    instance_role: str = "authoritative"
+    authoritative_instance_id: str | None = None
     local_worker_git_mode: str = "fetch"
     local_worker_source_sha: str | None = None
     local_worker_launcher: str = "direct"
@@ -572,6 +574,19 @@ class Config:
         task_approval_mode = raw.get("task_approval_mode", "required")
         if task_approval_mode not in {"required", "disabled"}:
             raise ValueError("task_approval_mode must be required or disabled")
+        instance_role = raw.get("instance_role", "authoritative")
+        if instance_role not in {"authoritative", "retired"}:
+            raise ValueError("instance_role must be authoritative or retired")
+        authoritative_instance_id = raw.get("authoritative_instance_id")
+        if authoritative_instance_id is not None and (
+            not isinstance(authoritative_instance_id, str)
+            or not re.fullmatch(r"[0-9a-f-]{36}", authoritative_instance_id)
+        ):
+            raise ValueError("authoritative_instance_id must be a UUID")
+        if instance_role == "authoritative" and authoritative_instance_id is not None:
+            raise ValueError(
+                "authoritative_instance_id is only valid for a retired instance"
+            )
         local_worker_git_mode = raw.get("local_worker_git_mode", "fetch")
         if local_worker_git_mode not in {"fetch", "owner_synced"}:
             raise ValueError("local_worker_git_mode must be fetch or owner_synced")
@@ -801,6 +816,8 @@ class Config:
             standing_authorizations=tuple(standing_authorizations),
             host_operations=host_operations,
             task_approval_mode=task_approval_mode,
+            instance_role=instance_role,
+            authoritative_instance_id=authoritative_instance_id,
             local_worker_git_mode=local_worker_git_mode,
             local_worker_source_sha=local_worker_source_sha,
             local_worker_launcher=local_worker_launcher,
@@ -841,6 +858,23 @@ class AuthorizationError(PermissionError):
     pass
 
 
+class WrongInstanceError(RuntimeError):
+    """The connector reached a coordinator that is not authoritative."""
+
+    def __init__(self, message: str, controller: "TaskController"):
+        super().__init__(message)
+        self.identity = controller.public_identity()
+
+
+class UnknownTaskError(KeyError):
+    """The task ID is not present in this coordinator's durable state store."""
+
+    def __init__(self, task_id: str, controller: "TaskController"):
+        self.task_id = task_id
+        self.identity = controller.public_identity()
+        super().__init__("task not found in this coordinator instance")
+
+
 class TaskController:
     def __init__(
         self,
@@ -873,6 +907,7 @@ class TaskController:
         # and turning an immediate startup failure into runner_disappeared.
         self._children: dict[str, subprocess.Popen[Any]] = {}
         self.state = self._load()
+        self._initialize_instance()
         try:
             self._drain_legacy_github_runs()
         except Exception as exc:
@@ -962,6 +997,67 @@ class TaskController:
                 occupied_lanes.add(reservation["lane"])
         return value
 
+    def _initialize_instance(self) -> None:
+        """Persist stable instance and state-store identities for every response."""
+        state_store_id = hashlib.sha256(
+            f"{self.config.repository.lower()}\0{self.config.state_dir.resolve()}".encode()
+        ).hexdigest()[:24]
+        current = self.state.get("instance")
+        instance_id = current.get("instance_id") if isinstance(current, dict) else None
+        if not isinstance(instance_id, str) or not re.fullmatch(r"[0-9a-f-]{36}", instance_id):
+            instance_id = str(uuid.uuid4())
+        changed = (
+            not isinstance(current, dict)
+            or current.get("instance_id") != instance_id
+            or current.get("state_store_id") != state_store_id
+        )
+        self._instance_id = instance_id
+        self._state_store_id = state_store_id
+        self.state["instance"] = {
+            "instance_id": instance_id,
+            "state_store_id": state_store_id,
+            "created_at": (
+                current.get("created_at") if isinstance(current, dict)
+                and isinstance(current.get("created_at"), str) else utc_now()
+            ),
+        }
+        for task in self.state["tasks"].values():
+            if task.get("instance_id") != instance_id:
+                task["instance_id"] = instance_id
+                changed = True
+            if task.get("state_store_id") != state_store_id:
+                task["state_store_id"] = state_store_id
+                changed = True
+            if task.get("instance_role") != self.config.instance_role:
+                task["instance_role"] = self.config.instance_role
+                changed = True
+        if changed:
+            self._save()
+
+    def public_identity(self) -> dict[str, Any]:
+        """Return non-sensitive routing identity, never a filesystem path."""
+        identity = {
+            "instance_id": self._instance_id,
+            "state_store_id": self._state_store_id,
+            "instance_role": self.config.instance_role,
+        }
+        if self.config.authoritative_instance_id is not None:
+            identity["authoritative_instance_id"] = self.config.authoritative_instance_id
+        return identity
+
+    def _stamp_instance(self, task: dict[str, Any]) -> None:
+        task["instance_id"] = self._instance_id
+        task["state_store_id"] = self._state_store_id
+        task["instance_role"] = self.config.instance_role
+
+    def _require_authoritative(self, action: str) -> None:
+        if self.config.instance_role != "authoritative":
+            self._audit(action, None, "wrong_instance", self.public_identity())
+            target = self.config.authoritative_instance_id or "the authoritative instance"
+            raise WrongInstanceError(
+                f"this connector is retired; use {target}", self,
+            )
+
     def _save(self) -> None:
         _atomic_json(self.state_path, self.state)
 
@@ -1000,6 +1096,8 @@ class TaskController:
         entry = {
             "time": utc_now(), "principal": self.config.principal.identity,
             "authentication": self.config.principal.authentication,
+            "instance_id": getattr(self, "_instance_id", None),
+            "state_store_id": getattr(self, "_state_store_id", None),
             "action": action, "task_id": task_id, "outcome": outcome,
             "details": details,
         }
@@ -1030,11 +1128,7 @@ class TaskController:
         try:
             return self.state["tasks"][task_id]
         except KeyError:
-            raise KeyError(
-                "task not found in this coordinator state; "
-                "use list_tasks(status=...) to query durable terminal records "
-                "and compare bridge_status.state_dir with the active coordinator"
-            ) from None
+            raise UnknownTaskError(task_id, self) from None
 
     @staticmethod
     def _public(task: dict[str, Any]) -> dict[str, Any]:
@@ -1048,7 +1142,7 @@ class TaskController:
             "kind", "operation_id", "operation_type", "target_commit",
             "harness_commit", "remote_run_id", "remote_run_url",
             "remote_status", "remote_conclusion", "remote_artifact",
-            "source_sha",
+            "source_sha", "instance_id", "state_store_id", "instance_role",
         )
         return {key: task[key] for key in keys if key in task}
 
@@ -1163,6 +1257,7 @@ class TaskController:
         consequence_class: str = "unclassified",
     ) -> dict[str, Any]:
         self._authorize("tasks:submit", "task.submit")
+        self._require_authoritative("task.submit")
         if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id):
             raise ValueError("request_id must be 1-128 safe characters")
         if not isinstance(title, str) or not title.strip() or len(title) > 200:
@@ -1270,6 +1365,7 @@ class TaskController:
         task["resource_requirements"] = {
             "worker": worker, "repository": profile.repository.lower(), "access": access,
         }
+        self._stamp_instance(task)
         self.state["tasks"][task_id] = task
         self.state["requests"][request_id] = task_id
         self._save()
@@ -1287,6 +1383,7 @@ class TaskController:
     ) -> dict[str, Any]:
         """Queue one built-in host operation; no command or arguments cross the MCP boundary."""
         self._authorize("host_operations:submit", "host_operation.submit")
+        self._require_authoritative("host_operation.submit")
         if self.config.task_approval_mode == "disabled":
             self._audit("host_operation.submit", None, "denied", {
                 "reason": "host_operations_unavailable_in_autonomous_mode",
@@ -1351,6 +1448,7 @@ class TaskController:
                 "access": "write",
             },
         }
+        self._stamp_instance(task)
         self.state["tasks"][task_id] = task
         self.state["requests"][request_id] = task_id
         self._save()
@@ -1369,10 +1467,10 @@ class TaskController:
         for task in self.state["tasks"].values():
             counts[task["status"]] = counts.get(task["status"], 0) + 1
         default_profile = self.config.profile(None)
-        result = {"service": "omcp", "status": "ok", "task_counts": counts,
+        result = {**self.public_identity(),
+                  "service": "omcp", "status": "ok", "task_counts": counts,
                   # Stable identity for diagnosing a lookup that reached a
-                  # different coordinator or state directory.
-                  "state_dir": str(self.config.state_dir),
+                  # different coordinator or state store, without exposing a path.
                   "coordinator_pid": os.getpid(),
                   "coordinator_started_at": self.started_at,
                   "repository": default_profile.repository,
@@ -1397,6 +1495,7 @@ class TaskController:
 
     def task_status(self, task_id: str) -> dict[str, Any]:
         self._authorize("tasks:read", "task.status", task_id)
+        self._require_authoritative("task.status")
         self.tick()
         task = self._task(task_id)
         self._audit("task.status", task_id, "allowed", {})
@@ -1404,6 +1503,7 @@ class TaskController:
 
     def list_tasks(self, status: str | None = None, limit: int = 100) -> dict[str, Any]:
         self._authorize("tasks:read", "task.list")
+        self._require_authoritative("task.list")
         self.tick()
         if status is not None and status not in ({"accepted", "approval_required"} | ACTIVE | TERMINAL):
             raise ValueError("unknown task status")
@@ -1416,7 +1516,7 @@ class TaskController:
         )
         result = [self._public(task) for task in tasks[:limit]]
         self._audit("task.list", None, "allowed", {"status": status, "count": len(result)})
-        return {"tasks": result}
+        return {**self.public_identity(), "tasks": result}
 
     def task_snapshot(self, recent_limit: int = 20) -> dict[str, Any]:
         """Return every running and queued task plus bounded terminal history.
@@ -1426,8 +1526,10 @@ class TaskController:
         active work, and it does not page or truncate running/queued tasks.
         """
         self._authorize("tasks:read", "task.snapshot")
+        self._require_authoritative("task.snapshot")
         self.tick()
         result = self.build_task_snapshot(self.state["tasks"], recent_limit)
+        result.update(self.public_identity())
         result["generated_at"] = utc_now()
         self._audit("task.snapshot", None, "allowed", {
             "running": result["counts"]["running"],
@@ -1438,6 +1540,7 @@ class TaskController:
 
     def task_result(self, task_id: str) -> dict[str, Any]:
         self._authorize("results:read", "task.result", task_id)
+        self._require_authoritative("task.result")
         self.tick()
         task = self._task(task_id)
         if task["status"] not in TERMINAL:
@@ -1458,6 +1561,7 @@ class TaskController:
 
     def worker_availability(self) -> dict[str, Any]:
         self._authorize("workers:read", "worker.availability")
+        self._require_authoritative("worker.availability")
         self.tick()
         active = [task for task in self.state["tasks"].values() if task["status"] in ACTIVE]
         active_by_worker = {task["worker"]: task for task in active}
@@ -1472,12 +1576,14 @@ class TaskController:
             })
         self._audit("worker.availability", None, "allowed", {})
         return {
+            **self.public_identity(),
             "workers": workers, "active_tasks": len(active),
             "execution_limit": self.config.max_parallel_tasks,
         }
 
     def cancel_task(self, task_id: str, reason: str) -> dict[str, Any]:
         self._authorize("tasks:cancel", "task.cancel", task_id)
+        self._require_authoritative("task.cancel")
         task = self._task(task_id)
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 500:
             raise ValueError("cancellation reason must be 1-500 characters")
@@ -1555,15 +1661,17 @@ class TaskController:
 
     def list_approvals(self) -> dict[str, Any]:
         self._authorize("approvals:read", "approval.list")
+        self._require_authoritative("approval.list")
         self._apply_task_approval_policy()
         approvals = [self._public(task) for task in self.state["tasks"].values()
                      if task["status"] == "approval_required"]
         self._audit("approval.list", None, "allowed", {"count": len(approvals)})
-        return {"approvals": approvals}
+        return {**self.public_identity(), "approvals": approvals}
 
     def resolve_approval(
         self, task_id: str, decision: str, reason: str, approver_identity: str,
     ) -> dict[str, Any]:
+        self._require_authoritative("approval.resolve")
         task = self._task(task_id)
         if not isinstance(approver_identity, str) or not approver_identity.startswith("local:"):
             self._audit("approval.resolve", task_id, "denied", {"reason": "not_local_human"})
@@ -1598,6 +1706,7 @@ class TaskController:
 
     def local_approval_details(self, task_id: str) -> dict[str, Any]:
         """Return the complete request only to the local approval command."""
+        self._require_authoritative("approval.review")
         if self.config.task_approval_mode == "disabled":
             self._apply_task_approval_policy()
         task = self._task(task_id)
@@ -1627,6 +1736,7 @@ class TaskController:
 
     def local_task_details(self, task_id: str) -> dict[str, Any]:
         """Return complete task context only through the owner-only local channel."""
+        self._require_authoritative("approval.details")
         if self.config.task_approval_mode == "disabled":
             self._apply_task_approval_policy()
         task = self._task(task_id)
@@ -1647,6 +1757,7 @@ class TaskController:
 
     def local_approval_history(self, limit: int = 100) -> dict[str, Any]:
         """Return bounded approval history only through the owner-only local channel."""
+        self._require_authoritative("approval.history")
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 500:
             raise ValueError("limit must be an integer from 1 to 500")
         self._apply_task_approval_policy()
@@ -1725,6 +1836,12 @@ class TaskController:
                 })
 
     def tick(self) -> None:
+        if self.config.instance_role != "authoritative":
+            # A retired coordinator preserves history but must never execute
+            # queued work or mutate approval state. Its MCP task methods fail
+            # with an explicit wrong-instance response.
+            self._heartbeat()
+            return
         self._apply_task_approval_policy()
         self.reconcile()
         while sum(task["status"] in ACTIVE for task in self.state["tasks"].values()) < self.config.max_parallel_tasks:
