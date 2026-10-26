@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from omcp.worker_contract import CONTRACT_DIR
+
 
 PROFILE_NAME = "orchestra-routine"
 
@@ -54,7 +56,7 @@ class RoutineConfinementPolicy:
 
     def config_args(self) -> list[str]:
         rules = ','.join([
-            '"."="read"', '".orchestra-tmp"="write"',
+            '"."="read"', f'"{CONTRACT_DIR}"="write"',
             *(f'"{value}"="write"' for value in self.writable_paths),
             *(f'"{value}"="write"' for value in self.writable_files),
         ])

@@ -82,7 +82,8 @@ def codex_contract_fixture(
         f"printf '%s\\n' '{result}' > \"$result\"",
     ]
     if contract is not None:
-        lines.append(f"printf '%s\\n' '{contract}' > \"$TMPDIR/orchestra-completion.json\"")
+        lines.append("mkdir -p .orchestra-contract")
+        lines.append(f"printf '%s\\n' '{contract}' > \".orchestra-contract/orchestra-completion.json\"")
     lines.append("exit 0")
     executable.write_text("\n".join(lines) + "\n")
     executable.chmod(0o700)
@@ -772,6 +773,7 @@ class ControllerTests(unittest.TestCase):
             (self.state / "tasks" / submitted["task_id"] / "runner.json").read_text()
         )
         self.assertEqual(spec["execution_capabilities"]["writable_files"], task["routine_writable_files"])
+        self.assertIs(spec["contract_probe"], True)
         audit = (self.state / "audit.jsonl").read_text()
         self.assertIn("ina-orchestra-dashboard-v1", audit)
         self.assertNotIn("Edit the reviewed dashboard files", audit)
@@ -1285,6 +1287,7 @@ class ControllerTests(unittest.TestCase):
         spec_path = self.state / "tasks" / submitted["task_id"] / "runner.json"
         spec = json.loads(spec_path.read_text())
         self.assertIs(spec["sandbox_startup_probe"], True)
+        self.assertIs(spec["contract_probe"], False)
 
     def test_exit_zero_without_required_result_is_reconciled_as_failed(self):
         submitted = self.submit("missing-result")
@@ -3382,6 +3385,61 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(record["completion_contract"], "failure")
             self.assertIn("required filesystem operation", (root / "result").read_text())
 
+    def test_runner_denied_contract_directory_remains_failed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = self._contract_spec(root)
+            contract_dir = root / ".orchestra-contract"
+            contract_dir.mkdir(mode=0o500)
+            try:
+                with patch.dict(os.environ, codex_contract_fixture(root), clear=True):
+                    self.assertEqual(run_worker(spec), 125)
+                record = json.loads((root / "completion").read_text())
+            finally:
+                if contract_dir.exists():
+                    contract_dir.chmod(0o700)
+        self.assertEqual(record["exit_code"], 125)
+        self.assertEqual(record["runner_error"], "TaskContractInvalid")
+        self.assertEqual(record["completion_contract"], "invalid")
+
+    def test_contract_write_probe_denial_is_distinct_from_malformed_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt = root / "prompt"
+            prompt.write_text("task")
+            spec = root / "spec.json"
+            spec.write_text(json.dumps({
+                "adapter": "codex", "command": ["codex"], "codex_home": None,
+                "sandbox_startup_probe": False, "contract_probe": True,
+                "require_completion_contract": True,
+                "max_worker_seconds": 60, "max_response_bytes": 1024,
+                "workspace": str(root), "prompt_path": str(prompt),
+                "log_path": str(root / "log"),
+                "result_path": str(root / "result"),
+                "completion_path": str(root / "completion"),
+                "execution_capabilities": {
+                    "profile": "routine_development_v1", "network": False,
+                    "external_credentials": False, "git_metadata": "read_only",
+                    "writable_paths": ["tests"], "writable_files": [],
+                },
+                "read_only_paths": [],
+            }))
+            probe_failure = subprocess.CompletedProcess(
+                args=[], returncode=1, stdout=b"",
+                stderr=b"Permission denied: .orchestra-contract",
+            )
+            with patch("omcp.runner.canonical_codex_executable", return_value="/codex"), \
+                    patch("omcp.runner.subprocess.run", return_value=probe_failure) as execute:
+                self.assertEqual(run_worker(spec), 125)
+            self.assertEqual(execute.call_count, 1)
+            record = json.loads((root / "completion").read_text())
+            result_text = (root / "result").read_text()
+        self.assertEqual(record["runner_error"], "ContractPathDenied")
+        self.assertEqual(record["worker_diagnostic"], {
+            "category": "contract_path_denied", "stage": "completion",
+        })
+        self.assertIn("completion-contract path", result_text)
+
     def test_runner_missing_contract_fails_even_when_result_exists(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3572,11 +3630,12 @@ class RunnerTests(unittest.TestCase):
                 command,
             )
             self.assertIn(
-                'permissions.orchestra-routine.filesystem.:workspace_roots={"."="read",".orchestra-tmp"="write","src"="write"}',
+                'permissions.orchestra-routine.filesystem.:workspace_roots={"."="read",".orchestra-contract"="write","src"="write"}',
                 command,
             )
-            self.assertIn('".orchestra-tmp"="write"', " ".join(command))
+            self.assertIn('".orchestra-contract"="write"', " ".join(command))
             self.assertFalse((root / ".orchestra-tmp").exists())
+            self.assertFalse((root / ".orchestra-contract").exists())
             self.assertEqual(execute.call_args.kwargs["env"]["TMPDIR"], str(root / ".orchestra-tmp"))
 
     def test_standing_runner_supports_exact_file_grants_and_completion_contract(self):
@@ -3605,11 +3664,11 @@ class RunnerTests(unittest.TestCase):
             command = execute.call_args.args[0]
             self.assertIn(
                 'permissions.orchestra-routine.filesystem.:workspace_roots={'
-                '"."="read",".orchestra-tmp"="write",'
+                '"."="read",".orchestra-contract"="write",'
                 '"dashboard/system.py"="write","dashboard/app.py"="write"}',
                 command,
             )
-            self.assertIn('".orchestra-tmp"="write"', " ".join(command))
+            self.assertIn('".orchestra-contract"="write"', " ".join(command))
             self.assertNotIn('"."="write"', " ".join(command))
             self.assertEqual(execute.call_args.kwargs["env"]["TMPDIR"], str(root / ".orchestra-tmp"))
 

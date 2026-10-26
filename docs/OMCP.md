@@ -166,7 +166,7 @@ The coordinator keeps each launcher `Popen` handle until reconciliation. A launc
 
 `writable_paths` are owner-reviewed relative directory roots, not task-supplied paths. Absolute paths, parent traversal, `.git`, `.codex`, duplicate paths, and punctuation that could change the permission-profile structure are rejected at configuration load. A read-only routine grant uses an empty list.
 
-`writable_files` is an optional list of exact regular files, using the same relative-path validation but allowing a final filename such as `dashboard/system.py`. The coordinator creates only the missing parent directories; it does not create the file, grant its directory, or widen the rule to a glob. Symlink parents/targets, non-regular targets, Git metadata, traversal and duplicates fail closed. The task-local `.orchestra-tmp` directory remains writable in the shared policy so the worker can write `orchestra-completion.json`; that is not a repository-wide write grant.
+`writable_files` is an optional list of exact regular files, using the same relative-path validation but allowing a final filename such as `dashboard/system.py`. The coordinator creates only the missing parent directories; it does not create the file, grant its directory, or widen the rule to a glob. Symlink parents/targets, non-regular targets, Git metadata, traversal and duplicates fail closed. The task-local `.orchestra-contract` directory remains writable in the shared policy so the worker can write `orchestra-completion.json`; that is not a repository-wide write grant. It is deliberately separate from the worker's general `TMPDIR` (`workspace/.orchestra-tmp`), which remains under `:tmpdir="deny"`; the contract path is the only additional write granted for completion.
 
 Keep security policy, deployment, infrastructure, credential, release, and production configuration outside every standing grant. If a repository cannot be divided into non-sensitive write roots/files, do not configure a standing grant for edits; use explicit approval instead. Git metadata remains read-only in routine mode, so the worker produces commit-ready changes but cannot create, merge, update, or push refs. Integration remains an independently reviewed action.
 
@@ -174,7 +174,7 @@ Before a routine worker starts, the coordinator materialises each configured wri
 
 ### Structured completion and executed security assertions
 
-Natural-language worker output is never interpreted as task success. Every local Codex task must write a structured completion file under the task worktree's private `.orchestra-tmp` directory:
+Natural-language worker output is never interpreted as task success. Every local Codex task must write a structured completion file under the task worktree's private `.orchestra-contract` directory:
 
 ```json
 {"status":"success"}
@@ -186,7 +186,7 @@ or:
 {"status":"failure","reason":"required operation was denied"}
 ```
 
-The coordinator marks the task `succeeded` only when the process exits zero, the mandatory result exists and is non-empty, and the structured status is exactly `success`. A zero process exit with a missing, invalid or failure contract is recorded as `failed` (`TaskContractFailed`, `TaskContractInvalid` or `MissingWorkerResult`). The PR #50 Bubblewrap-startup and missing-result protections remain in force.
+The coordinator marks the task `succeeded` only when the process exits zero, the mandatory result exists and is non-empty, and the structured status is exactly `success`. A zero process exit with a missing, invalid or failure contract is recorded as `failed` (`TaskContractFailed`, `TaskContractInvalid` or `MissingWorkerResult`). Before a standing routine Codex worker starts, a credit-free `codex sandbox` write probe checks the dedicated contract directory using the same authoritative policy. If that probe is denied, the task fails before the worker runs as `ContractPathDenied` with failure category `contract_path_denied`; this is distinct from malformed JSON or a worker that omitted the contract. The PR #50 Bubblewrap-startup and missing-result protections remain in force.
 
 Codex output is requested as JSONL into a private task file. Only a bounded
 tail is inspected for failure classification, then the JSONL stream is deleted
@@ -209,7 +209,7 @@ workers unfunded.
 
 Standing routine tasks are also verified by a coordinator-controlled security probe. The probe implementation and report live under coordinator-owned state, outside every path writable by the Codex worker. The coordinator launches a separate transient systemd user service and runs `codex sandbox` with the same authoritative routine permission profile used by the real worker. Both paths consume the same `RoutineConfinementPolicy` definition; the probe does not construct an independent stricter sandbox. Codex does not execute, edit or replace the probe, and Codex cannot write the report location.
 
-The probe actually attempts to read `/etc/orchestra/omcp.json` and the Orchestra secret file, write outside the worktree, connect to an external destination, and modify Git metadata. It emits structured evidence with `attempted: true` and `allowed: false` for every required assertion; the coordinator writes the trusted report. A missing report, an unattempted assertion or any `allowed: true` result fails the task with `SecurityAssertionFailed`. The probe does not treat a natural-language claim of denial as evidence, and worker-created files under `.orchestra-tmp` cannot substitute for trusted evidence.
+The probe actually attempts to read `/etc/orchestra/omcp.json` and the Orchestra secret file, write outside the worktree, connect to an external destination, and modify Git metadata. It emits structured evidence with `attempted: true` and `allowed: false` for every required assertion; the coordinator writes the trusted report. A missing report, an unattempted assertion or any `allowed: true` result fails the task with `SecurityAssertionFailed`. The probe does not treat a natural-language claim of denial as evidence, and worker-created files under `.orchestra-contract` cannot substitute for trusted evidence.
 
 A real Delnavazan canary should use an existing development area such as `platform/tests/`, not a root directory that is absent from the repository.
 

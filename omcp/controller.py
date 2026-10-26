@@ -144,7 +144,8 @@ def safe_opencode_diagnostic(value: object) -> dict[str, Any] | None:
 
 WORKER_FAILURE_CATEGORIES = {
     "credit_exhausted", "authentication", "rate_limit", "transient_provider",
-    "cancelled", "malformed_completion", "sandbox", "unknown",
+    "cancelled", "malformed_completion", "contract_path_denied", "sandbox",
+    "unknown",
 }
 WORKER_FAILURE_STAGES = {"provider", "startup", "process", "completion"}
 HISTORICAL_CREDIT_LINES = (
@@ -184,6 +185,10 @@ def failure_category(task: dict[str, Any]) -> str:
         failure_type = failure.get("type")
         if failure_type == "CreditExhausted":
             return "credit_exhausted"
+        if failure_type == "ContractPathDenied":
+            return "contract_path_denied"
+        if failure_type == "ContractProbeFailed":
+            return "sandbox"
         if failure_type in {"TaskContractFailed", "TaskContractInvalid", "MissingWorkerResult"}:
             return "malformed_completion"
         if failure_type in {"WorkerTimeout", "RunnerTerminated"}:
@@ -2660,6 +2665,9 @@ class TaskController:
                 # execution.  Probe the same seccomp/sandbox context before
                 # starting it so a startup failure cannot become a false success.
                 "sandbox_startup_probe": worker.adapter == "codex",
+                "contract_probe": (
+                    worker.adapter == "codex" and execution_capabilities is not None
+                ),
                 "require_completion_contract": worker.adapter == "codex",
                 "provider": worker.provider,
                 "model": worker.model,
