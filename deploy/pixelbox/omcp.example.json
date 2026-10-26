@@ -39,14 +39,14 @@
     "deepseek-primary": {
       "adapter": "deepseek",
       "provider": "deepseek",
-      "model": "deepseek/deepseek-chat",
+      "model": "deepseek-flash",
       "credential_file": "/etc/orchestra/secrets/deepseek-api-key",
       "endpoint_addresses": []
     },
     "deepseek-secondary": {
       "adapter": "deepseek",
       "provider": "deepseek",
-      "model": "deepseek/deepseek-chat",
+      "model": "deepseek-flash",
       "credential_file": "/etc/orchestra/secrets/deepseek-api-key",
       "endpoint_addresses": []
     }
