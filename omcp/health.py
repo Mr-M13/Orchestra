@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import sys
 import time
 import urllib.error
@@ -41,21 +42,146 @@ def _iso_age_seconds(value: object) -> float | None:
     return age if age >= -5 else None
 
 
-def _tunnel_check(url: str | None) -> dict[str, Any]:
+def _http_check(url: str | None) -> dict[str, Any]:
+    """Return checked/unchecked distinctly; a missing URL is not healthy."""
     if not url:
-        return {"checked": False}
+        return {"checked": False, "status": "unchecked"}
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "orchestra-health"})
         with urllib.request.urlopen(request, timeout=5) as response:
+            ok = 200 <= response.status < 300
             return {
-                "checked": True, "ok": 200 <= response.status < 300,
-                "status": response.status,
+                "checked": True, "ok": ok,
+                "status": "healthy" if ok else "failed",
+                "http_status": response.status,
             }
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        return {"checked": True, "ok": False, "error": type(exc).__name__}
+        return {
+            "checked": True, "ok": False, "status": "failed",
+            "error": type(exc).__name__,
+        }
 
 
-def collect_health(config_path: Path, tunnel_url: str | None = None) -> dict[str, Any]:
+def _tunnel_check(url: str | None) -> dict[str, Any]:
+    return _http_check(url)
+
+
+def _dispatch_broker_check(config: Any) -> dict[str, Any]:
+    workers = [
+        worker for worker in config.workers.values()
+        if worker.adapter == "github_actions"
+    ]
+    if not workers:
+        return {"checked": False, "status": "not_configured"}
+    checks = []
+    ok = True
+    for worker in sorted(workers, key=lambda item: item.name):
+        path = Path(worker.github_dispatch_socket or "")
+        try:
+            metadata = path.stat()
+        except OSError:
+            worker_ok = False
+        else:
+            worker_ok = bool(
+                stat.S_ISSOCK(metadata.st_mode)
+                and metadata.st_uid == worker.github_service_uid
+                and not metadata.st_mode & 0o007
+            )
+        ok = ok and worker_ok
+        checks.append({"worker": worker.name, "ok": worker_ok})
+    return {"checked": True, "ok": ok, "workers": checks, "status": "healthy" if ok else "failed"}
+
+
+def _task_health(config: Any, state: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    now = datetime.now(timezone.utc)
+    recent_cutoff = now.timestamp() - 86_400
+    stale_cutoff = now.timestamp() - max(300, 10 * config.heartbeat_seconds)
+    tasks = state.get("tasks", {})
+    failed = interrupted = startup_failures = actions_failures = stale_accepted = 0
+    for task in tasks.values():
+        status = task.get("status")
+        failure = task.get("failure")
+        failure_type = failure.get("type") if isinstance(failure, dict) else None
+        finished_raw = task.get("finished_at") or task.get("created_at")
+        try:
+            finished = datetime.fromisoformat(finished_raw).timestamp()
+        except (TypeError, ValueError):
+            finished = 0
+        recent = finished >= recent_cutoff
+        if status == "failed" and recent:
+            failed += 1
+        if status == "interrupted" and recent:
+            interrupted += 1
+        if recent and failure_type in {
+            "runner_startup_failed", "runner_disappeared", "runner_exited_without_completion",
+            "startup_lease_expired", "SandboxStartupError",
+        }:
+            startup_failures += 1
+        worker = config.workers.get(task.get("worker"))
+        if (recent and worker is not None and worker.adapter == "github_actions"
+                and status in {"failed", "interrupted"}):
+            actions_failures += 1
+        if status == "accepted":
+            try:
+                created = datetime.fromisoformat(task.get("created_at", "")).timestamp()
+            except (TypeError, ValueError):
+                created = 0
+            if created <= stale_cutoff:
+                stale_accepted += 1
+    warnings: list[str] = []
+    if failed:
+        warnings.append("failed_tasks_present")
+    if interrupted:
+        warnings.append("interrupted_tasks_present")
+    if startup_failures:
+        warnings.append("runner_startup_failures")
+    if actions_failures:
+        warnings.append("failed_actions_dispatch")
+    if stale_accepted:
+        warnings.append("stale_accepted_tasks")
+    return {
+        "recent_failed": failed,
+        "recent_interrupted": interrupted,
+        "recent_startup_failures": startup_failures,
+        "recent_actions_failures": actions_failures,
+        "stale_accepted": stale_accepted,
+        "window_seconds": 86_400,
+    }, warnings
+
+
+def _backup_check(config: Any, backup_dir: str | None) -> tuple[dict[str, Any], list[str]]:
+    path = Path(backup_dir).expanduser() if backup_dir else config.state_dir.parent / "backup"
+    if not path.is_dir():
+        return {"checked": False, "status": "not_configured"}, []
+    candidates: list[Path] = []
+    for pattern in ("state-*.tar.gz", "state-*.tar.gz.gpg", "orchestra-state-*.tar.gz"):
+        candidates.extend(path.glob(pattern))
+    archives = [
+        item for item in candidates
+        if item.is_file() and not item.is_symlink()
+    ]
+    if not archives:
+        # An owner may keep unrelated snapshots in this directory.  Do not
+        # claim a backup is healthy or failed when no reviewed state archive
+        # naming convention is present.
+        return {
+            "checked": False, "status": "unverified",
+            "reason": "no_recognized_state_archive", "path": str(path),
+        }, []
+    newest = max(archives, key=lambda item: item.stat().st_mtime)
+    age = max(0.0, time.time() - newest.stat().st_mtime)
+    ok = age <= 7 * 86_400
+    return {
+        "checked": True, "ok": ok, "status": "healthy" if ok else "failed",
+        "newest_age_seconds": round(age, 1), "archive_count": len(archives),
+    }, [] if ok else ["backup_stale"]
+
+
+def collect_health(
+    config_path: Path, tunnel_url: str | None = None,
+    dashboard_url: str | None = None, mcp_url: str | None = None,
+    backup_dir: str | None = None,
+) -> dict[str, Any]:
     """Return only safe metadata; never include instructions or credentials."""
     report: dict[str, Any] = {
         "service": "omcp", "checked_at": datetime.now(timezone.utc).isoformat(),
@@ -174,9 +300,23 @@ def collect_health(config_path: Path, tunnel_url: str | None = None) -> dict[str
     checks["scheduler"] = {
         "active_tasks": active, "limit": config.max_parallel_tasks,
         "saturated": active >= config.max_parallel_tasks,
+        "repository_parallelism": getattr(
+            config, "repository_parallelism", "serialized",
+        ),
         "last_repository": state.get("scheduler", {}).get("last_repository")
         if isinstance(state.get("scheduler"), dict) else None,
     }
+    task_check, task_warnings = _task_health(config, state)
+    checks["tasks"] = task_check
+    report["warnings"].extend(task_warnings)
+    checks["dispatch_broker"] = _dispatch_broker_check(config)
+    if checks["dispatch_broker"].get("status") == "failed":
+        report["warnings"].append("dispatch_broker_unavailable")
+    checks["dashboard"] = _http_check(dashboard_url)
+    checks["mcp_gateway"] = _http_check(mcp_url)
+    backup, backup_warnings = _backup_check(config, backup_dir)
+    checks["backup"] = backup
+    report["warnings"].extend(backup_warnings)
     try:
         usage = shutil.disk_usage(config.state_dir)
         checks["disk"] = {
@@ -220,10 +360,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Report sanitized Orchestra health")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--tunnel-health-url")
+    parser.add_argument("--dashboard-health-url")
+    parser.add_argument("--mcp-health-url")
+    parser.add_argument("--backup-dir")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--allow-degraded", action="store_true")
     args = parser.parse_args(argv)
-    report = collect_health(args.config, args.tunnel_health_url)
+    report = collect_health(
+        args.config, args.tunnel_health_url, args.dashboard_health_url,
+        args.mcp_health_url, args.backup_dir,
+    )
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:

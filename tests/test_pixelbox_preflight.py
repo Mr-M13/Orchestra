@@ -42,9 +42,13 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
         )
         self.assertEqual(help_result.returncode, 0, help_result.stderr)
         self.assertIn("--live", help_result.stdout)
+        self.assertIn("--with-tests", help_result.stdout)
         verify_source = verify.read_text()
         self.assertIn('if [[ "$LIVE" == "0" ]]', verify_source)
         self.assertIn("health_args+=(--allow-degraded)", verify_source)
+        self.assertIn("source-tree unit tests", verify_source)
+        self.assertIn("UNCHECKED", verify_source)
+        self.assertIn("release_digest", verify_source)
 
     def test_installer_cannot_start_services_before_readiness_preflight(self):
         source = (DEPLOY / "install.sh").read_text()
