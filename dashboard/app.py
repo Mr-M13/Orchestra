@@ -200,7 +200,10 @@ class Dashboard:
                 last_attempt.get("failure_category")
                 if isinstance(last_attempt, dict) else None
             )
+            last_status = last_attempt.get("status") if isinstance(last_attempt, dict) else None
             if last_category == "credit_exhausted":
+                return "unavailable"
+            if last_status in {"failed", "interrupted"} and worker.get("proven_healthy") is not True:
                 return "unavailable"
             if worker.get("proven_healthy") is True:
                 return "available"
@@ -214,8 +217,11 @@ class Dashboard:
                 last_attempt.get("failure_category")
                 if isinstance(last_attempt, dict) else None
             )
+            last_status = last_attempt.get("status") if isinstance(last_attempt, dict) else None
             if last_category == "credit_exhausted":
                 return " · last attempt blocked: workspace credits exhausted"
+            if last_status in {"failed", "interrupted"} and worker.get("proven_healthy") is not True:
+                return f" · last attempt failed: {last_category or 'unknown'}"
             reason = worker.get("reason")
             if reason in (None, "no_queued_task", "worker_busy"):
                 return ""

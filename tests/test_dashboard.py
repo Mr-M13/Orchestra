@@ -69,6 +69,30 @@ class FakeOMCP:
             },
         }
 
+        self.workers = [
+            {
+                "worker": "Ina", "available": True, "current_task_id": None,
+                "idle": True, "runnable": True, "reason": "no_queued_task",
+                "proven_healthy": False,
+                "health_reason": "last_attempt_credit_exhausted",
+                "last_attempt": {
+                    "task_id": RECENT_ID, "status": "failed", "exit_code": 1,
+                    "failure_category": "credit_exhausted", "finished_at": NOW,
+                },
+                "next_action": "Add credits to Ina's workspace, then run a separately authorised small verification task.",
+            },
+            {
+                "worker": "codex", "available": True, "current_task_id": None,
+                "idle": True, "runnable": True, "reason": "no_queued_task",
+                "proven_healthy": True, "health_reason": "verified_success",
+                "last_attempt": {
+                    "task_id": TASK_ID, "status": "succeeded", "exit_code": 0,
+                    "failure_category": None, "finished_at": NOW,
+                },
+                "next_action": None,
+            },
+        ]
+
     def call(self, tool, arguments=None):
         self.calls.append((tool, arguments or {}))
         if self.offline:
@@ -77,29 +101,7 @@ class FakeOMCP:
         if tool == "bridge_status":
             return {"status": "ok", "repository_profiles": ["Delnavazan"]}
         if tool == "worker_availability":
-            return {"workers": [
-                {
-                    "worker": "Ina", "available": True, "current_task_id": None,
-                    "idle": True, "runnable": True, "reason": "no_queued_task",
-                    "proven_healthy": False,
-                    "health_reason": "last_attempt_credit_exhausted",
-                    "last_attempt": {
-                        "task_id": RECENT_ID, "status": "failed", "exit_code": 1,
-                        "failure_category": "credit_exhausted", "finished_at": NOW,
-                    },
-                    "next_action": "Add credits to Ina's workspace, then run a separately authorised small verification task.",
-                },
-                {
-                    "worker": "codex", "available": True, "current_task_id": None,
-                    "idle": True, "runnable": True, "reason": "no_queued_task",
-                    "proven_healthy": True, "health_reason": "verified_success",
-                    "last_attempt": {
-                        "task_id": TASK_ID, "status": "succeeded", "exit_code": 0,
-                        "failure_category": None, "finished_at": NOW,
-                    },
-                    "next_action": None,
-                },
-            ]}
+            return {"workers": self.workers}
         if tool == "task_snapshot":
             return self.snapshot
         if tool == "list_tasks":
@@ -146,6 +148,19 @@ class DashboardTests(unittest.TestCase):
         codex_start = body.index("<h3>codex</h3>")
         codex_row = body[codex_start:body.index("</article>", codex_start)]
         self.assertIn("state-available", codex_row)
+
+    def test_worker_rows_do_not_advertise_a_failed_last_attempt_as_available(self):
+        client = FakeOMCP()
+        client.workers[0]["last_attempt"].update({
+            "failure_category": "malformed_completion",
+        })
+        client.workers[0]["health_reason"] = "last_attempt_failed"
+        client.workers[0]["next_action"] = None
+        _, body = request(Dashboard(client))
+        ina_start = body.index("<h3>Ina</h3>")
+        ina_row = body[ina_start:body.index("</article>", ina_start)]
+        self.assertIn("state-unavailable", ina_row)
+        self.assertIn("last attempt failed: malformed_completion", ina_row)
 
     def test_task_detail_renders_credit_failure_and_next_action(self):
         client = FakeOMCP()
