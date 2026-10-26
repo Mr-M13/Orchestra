@@ -236,7 +236,7 @@ Use Python 3.11 or newer and a current Codex CLI. Create a state directory outsi
     "deepseek": {
       "adapter": "deepseek",
       "provider": "deepseek",
-      "model": "deepseek/deepseek-chat",
+      "model": "deepseek-flash",
       "credential_file": "/Users/ACCOUNT/Library/Application Support/Orchestra/credentials/deepseek-api-key"
     }
   },

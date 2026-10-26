@@ -329,7 +329,7 @@ class ControllerTests(unittest.TestCase):
             "owner/repo", self.root, self.state, "origin/main",
             {"deepseek": Worker(
                 "deepseek", (), adapter="deepseek", provider="deepseek",
-                model="deepseek/deepseek-chat",
+                model="deepseek-flash",
                 credential_file=str(credential), endpoint_host="api.deepseek.com",
             )},
             Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
@@ -373,7 +373,7 @@ class ControllerTests(unittest.TestCase):
                 "owner/repo", self.root, self.state, "origin/main",
                 {"deepseek": Worker(
                     "deepseek", (), adapter="deepseek", provider="deepseek",
-                    model="deepseek/deepseek-chat",
+                    model="deepseek-flash",
                     credential_file=str(credential), endpoint_host="api.deepseek.com",
                 )},
                 Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
@@ -835,7 +835,7 @@ class ControllerTests(unittest.TestCase):
                 "owner/repo", self.root, self.state, "origin/main",
                 {"deepseek": Worker(
                     "deepseek", (), adapter="deepseek",
-                    provider="deepseek", model="deepseek/deepseek-chat",
+                    provider="deepseek", model="deepseek-flash",
                     credential_file=str(credential),
                 )},
                 Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
@@ -859,7 +859,7 @@ class ControllerTests(unittest.TestCase):
         spec = json.loads((self.state / "tasks" / submitted["task_id"] / "runner.json").read_text())
         self.assertEqual(spec["adapter"], "deepseek")
         self.assertEqual(spec["provider"], "deepseek")
-        self.assertEqual(spec["model"], "deepseek/deepseek-chat")
+        self.assertEqual(spec["model"], "deepseek-flash")
         self.assertEqual(spec["command"], [])
         self.assertEqual(spec["endpoint_host"], "api.deepseek.com")
         self.assertEqual(spec["max_worker_seconds"], 600)
@@ -874,7 +874,7 @@ class ControllerTests(unittest.TestCase):
         self.controller = TaskController(
             Config("owner/repo", self.root, self.state, "origin/main", {
                 "deepseek": Worker("deepseek", (), adapter="deepseek", provider="deepseek",
-                                   model="deepseek/deepseek-chat", credential_file=str(credential)),
+                                   model="deepseek-flash", credential_file=str(credential)),
             }, Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
             task_approval_mode="disabled"), popen=self.popen,
             workspace_preparer=lambda *_: self.root,
@@ -1770,7 +1770,7 @@ class ConfigTests(unittest.TestCase):
                 "state_dir": str(base / "state"),
                 "workers": {"deepseek": {
                     "adapter": "deepseek", "provider": "deepseek",
-                    "model": "deepseek/deepseek-chat",
+                    "model": "deepseek-flash",
                     "credential_file": str(credential),
                 }},
                 "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
@@ -1835,7 +1835,7 @@ class ConfigTests(unittest.TestCase):
                     },
                     "deepseek": {
                         "adapter": "deepseek",
-                        "provider": "deepseek", "model": "deepseek/deepseek-chat",
+                        "provider": "deepseek", "model": "deepseek-flash",
                         "credential_file": str(credential),
                     },
                 },
@@ -2458,7 +2458,7 @@ class RunnerTests(unittest.TestCase):
             spec = root / "spec.json"
             spec.write_text(json.dumps({
                 "adapter": "deepseek", "command": [],
-                "provider": "deepseek", "model": "deepseek/deepseek-chat",
+                "provider": "deepseek", "model": "deepseek-flash",
                 "endpoint_host": "api.deepseek.com", "max_response_bytes": 1024,
                 "credential_file": str(credential), "max_worker_seconds": 600,
                 "workspace": str(root), "prompt_path": str(prompt),
@@ -2478,6 +2478,8 @@ class RunnerTests(unittest.TestCase):
                     patch("omcp.runner.signal.setitimer") as setitimer:
                 self.assertEqual(run_worker(spec), 0)
             self.assertEqual(connect.call_args.args[:2], ("api.deepseek.com", 443))
+            sent_payload = json.loads(connection.request.call_args.args[2])
+            self.assertEqual(sent_payload["model"], "deepseek-flash")
             self.assertEqual(setitimer.call_args_list[0].args, (signal.ITIMER_REAL, 600))
             self.assertEqual(setitimer.call_args_list[-1].args, (signal.ITIMER_REAL, 0))
             self.assertFalse((root / "log").exists())
@@ -2565,7 +2567,7 @@ class RunnerTests(unittest.TestCase):
             spec = root / "spec.json"
             spec.write_text(json.dumps({
                 "adapter": "deepseek", "command": [], "provider": "deepseek",
-                "model": "deepseek/deepseek-chat", "endpoint_host": "api.deepseek.com",
+                "model": "deepseek-flash", "endpoint_host": "api.deepseek.com",
                 "credential_file": str(credential), "max_worker_seconds": 60,
                 "max_response_bytes": 1024, "workspace": str(root), "prompt_path": str(prompt),
                 "log_path": str(root / "log"), "result_path": str(root / "result"),

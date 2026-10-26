@@ -36,7 +36,8 @@ WORKER_ADAPTERS = {"codex", "opencode", "deepseek", "github_actions"}
 GITHUB_ACTION_AGENTS = {"codex", "deepseek"}
 ACTIONS_WORKFLOW = "orchestra-worker.yml"
 DEEPSEEK_PROVIDER = "deepseek"
-DEEPSEEK_MODEL = "deepseek/deepseek-chat"
+# Direct DeepSeek API model ID (not the provider-prefixed OpenCode model ID).
+DEEPSEEK_MODEL = "deepseek-flash"
 OPENCODE_PROVIDER_ENDPOINTS = {
     "deepseek": "api.deepseek.com",
     "openai": "api.openai.com",
