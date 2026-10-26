@@ -571,7 +571,7 @@ preflight_activation() {
 
 preflight_activation_config() {
   local release_root="$1"
-  sudo env PYTHONPATH="$release_root" /usr/bin/python3 \
+  sudo -u "$SERVICE_USER" env PYTHONPATH="$release_root" /usr/bin/python3 \
     "$SOURCE_ROOT/deploy/pixelbox/config_preflight.py" \
     --config "$CONFIG_ROOT/omcp.json" \
     --config-root "$CONFIG_ROOT" \
