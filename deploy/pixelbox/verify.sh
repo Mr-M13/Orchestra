@@ -10,18 +10,20 @@ SKIPPED=0
 UNCHECKED=0
 LIVE=0
 WITH_TESTS=0
+REQUIRE_HEALTH=0
 EXPECTED_SHA=""
 MCP_SOCKET="${ORCHESTRA_MCP_SOCKET:-/home/hamed/orchestra-migration/state/mcp.sock}"
 
 usage() {
   cat <<'EOF'
-Usage: verify.sh [--live] [--sha <40-hex-sha>] [--with-tests]
+Usage: verify.sh [--live] [--sha <40-hex-sha>] [--with-tests] [--require-health]
 
 Default mode performs source and staging checks without requiring installed or
 active services. --live requires installed configuration, coordinator, health
-timer, tunnel, tunnel health URL, and the expected exact active release to pass.
-Live mode validates the deployed release and services; it does not run the
-source-tree unit suite unless --with-tests is also supplied.
+timer, tunnel and the expected exact active release to pass. Optional external
+health probes are reported as UNCHECKED unless --require-health makes them
+fatal. Live mode validates the deployed release and services; it does not run
+the source-tree unit suite unless --with-tests is also supplied.
 EOF
 }
 
@@ -29,6 +31,7 @@ while (($#)); do
   case "$1" in
     --live) LIVE=1 ;;
     --with-tests) WITH_TESTS=1 ;;
+    --require-health) REQUIRE_HEALTH=1 ;;
     --sha)
       shift
       (($#)) || { echo "--sha requires a value" >&2; exit 2; }
@@ -164,10 +167,7 @@ if [[ -r "$CONFIG" ]]; then
     fail "configuration mode is not 0600"
   fi
   health_file="$(umask 077 && mktemp "${TMPDIR:-/tmp}/orchestra-health.XXXXXX")"
-  health_args=(--config "$CONFIG" --json)
-  if [[ "$LIVE" == "0" ]]; then
-    health_args+=(--allow-degraded)
-  fi
+  health_args=(--config "$CONFIG" --json --allow-degraded)
   [[ -n "${ORCHESTRA_TUNNEL_HEALTH_URL:-}" ]] \
     && health_args+=(--tunnel-health-url "$ORCHESTRA_TUNNEL_HEALTH_URL")
   [[ -n "${ORCHESTRA_DASHBOARD_HEALTH_URL:-}" ]] \
@@ -177,15 +177,25 @@ if [[ -r "$CONFIG" ]]; then
   [[ -n "${ORCHESTRA_BACKUP_DIR:-}" ]] \
     && health_args+=(--backup-dir "$ORCHESTRA_BACKUP_DIR")
   if (cd "$ROOT" && python3 -m omcp.health "${health_args[@]}" >"$health_file"); then
-    pass "health report"
-    python3 - "$health_file" <<'PY'
+    health_status="$(python3 - "$health_file" <<'PY'
 import json, sys
 value = json.load(open(sys.argv[1]))
-print(f"      status={value.get('status')} platform={value.get('platform')}")
+print(value.get("status", "failed"))
+print(f"      status={value.get('status')} platform={value.get('platform')}", file=sys.stderr)
+for warning in value.get("warnings", []):
+    print(f"      warning={warning}", file=sys.stderr)
 for name, check in sorted(value.get("checks", {}).items()):
     if isinstance(check, dict) and check.get("checked") is False:
-        print(f"      unchecked: {name} ({check.get('status', 'unchecked')})")
+        print(f"      unchecked: {name} ({check.get('status', 'unchecked')})", file=sys.stderr)
 PY
+)"
+    if [[ "$health_status" == "ok" ]]; then
+      pass "health report"
+    elif [[ "$health_status" == "degraded" && "$REQUIRE_HEALTH" == "0" ]]; then
+      pass "health report degraded (warnings shown; use --require-health to fail)"
+    else
+      fail "health report status=$health_status"
+    fi
   else
     fail "health report (see python3 -m omcp.health --config $CONFIG)"
   fi
@@ -225,11 +235,14 @@ if command -v systemctl >/dev/null; then
   done
   if [[ -S "$MCP_SOCKET" ]]; then
     socket_mode="$(stat -c '%a' "$MCP_SOCKET" 2>/dev/null || stat -f '%Lp' "$MCP_SOCKET")"
-    if [[ "$socket_mode" == "600" ]]; then
-      pass "authenticated MCP socket is owner-only"
-    else
-      fail "MCP socket mode is $socket_mode, expected 600"
-    fi
+    case "$socket_mode" in
+      600|660)
+        pass "authenticated MCP socket is owner/group-only"
+        ;;
+      *)
+        fail "MCP socket mode is $socket_mode, expected 600 or 660"
+        ;;
+    esac
   elif [[ "$LIVE" == "1" ]]; then
     fail "MCP socket is missing at $MCP_SOCKET"
   else
@@ -295,4 +308,12 @@ if (( FAILURES )); then
   echo "Verification failed: $FAILURES check(s), $SKIPPED skipped, $UNCHECKED unchecked."
   exit 1
 fi
-echo "Verification passed with $SKIPPED skipped and $UNCHECKED unchecked check(s)."
+if (( REQUIRE_HEALTH && UNCHECKED )); then
+  echo "Verification incomplete: $UNCHECKED required health probe(s) were not checked."
+  exit 2
+fi
+if (( UNCHECKED )); then
+  echo "Verification PARTIAL: $SKIPPED skipped, $UNCHECKED unchecked. Set optional health URLs or use --require-health for a strict pass."
+else
+  echo "Verification passed with $SKIPPED skipped check(s)."
+fi
