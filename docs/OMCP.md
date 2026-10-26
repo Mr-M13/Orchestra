@@ -53,6 +53,19 @@ OpenCode is independent. Its only accepted executable is the reviewed absolute O
 
 OpenCode has no remote socket permission and cannot read the provider credential. Its generated provider base URL is a one-task, random capability URL on a second runner-selected `localhost` port; the synthetic API key accepted there has no provider authority. The trusted runner validates an exact `/v1/chat/completions` request, request size, JSON shape and selected model, then injects the owner-only credential and opens verified TLS to the code-owned provider host and path. Redirects, CONNECT, arbitrary destinations, forwarded request headers, transfer encoding, content encoding, model changes, oversized bodies and more than 64 requests fail closed. Provider responses are streamed with a per-response bound and only JSON or event-stream content types. Separate Seatbelt profiles allow the V2 server to bind/inbound only on its exact port and connect only to the exact gateway port, while the CLI client can connect only to the exact V2 server port. Neither profile contains a wildcard loopback rule, remote hostname rule or `*:443` rule. Other same-user processes are outside this boundary, so the V2 server also uses a random task password and the gateway requires both an unguessable path capability and the fixed synthetic authorization header; both exist only for the task lifetime.
 
+The Seatbelt profile also grants read-only traversal of the task workspace's
+ancestor directories and both `/private/...` and symlinked `/var`/`/tmp`
+spellings. OpenCode resolves real paths and discovers configuration by walking
+from its workdir toward the root; without that traversal it exits with an
+opaque `EPERM lstat` and HTTP 500 before contacting the gateway. This is
+traversal, not sibling worktree read access: the profile uses literal ancestor
+paths and does not add a subpath grant for the worktree parent.
+
+OpenCode's private runtime log is inspected before cleanup and merged into the
+bounded diagnostic. A server-side `EPERM`, authentication, model, TLS, or
+transport failure therefore surfaces as an allowlisted category instead of
+`unknown`, while raw log lines, prompts and provider bodies are discarded.
+
 OpenCode cannot receive standing authorization. Provider output and raw diagnostics are discarded; failures expose only an allowlisted category, optional integer HTTP status, and process-exit cause. Setup, gateway, TLS or provider failures fail closed rather than falling back or claiming success. See [ADR-005](decisions/ADR-005-opencode-pinned-egress.md) for the boundary and remaining host-verification gate.
 
 The state directory and its files are owner-only. State updates are atomic. `audit.jsonl` is append-only and fsynced for each event; it records principal, authentication context, action, outcome and safe metadata, but not task instructions or worker output. Result retrieval is size-bounded.
