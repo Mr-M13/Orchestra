@@ -27,8 +27,10 @@ starts the tunnel or touches unrelated host services.
   `/etc/orchestra`. It never grants read/list access or changes the owner, and
   it verifies that `other` remains `---`.
 - `verify.sh` — read-only staging checks by default; `--live` makes missing or
-  inactive installed services, tunnel health, platform, and exact active SHA a
-  failure.
+  inactive installed services, tunnel health, platform, exact active SHA and
+  release digest a failure. Live mode checks the deployed release without
+  assuming it is a Git checkout; use `--with-tests` only to add the
+  source-tree unit suite. Optional probes are reported as `UNCHECKED`.
 - `reproduce-worker-startup.sh` — credit-free, `/usr/bin/true` reproduction of
   the Bubblewrap-versus-`RestrictSUIDSGID` startup failure using the configured
   DeepSeek filesystem policy. It reads no credential contents and opens no

@@ -7,22 +7,28 @@ CONFIG="${ORCHESTRA_CONFIG:-/etc/orchestra/omcp.json}"
 INSTALL_ROOT="${ORCHESTRA_INSTALL_ROOT:-/opt/orchestra}"
 FAILURES=0
 SKIPPED=0
+UNCHECKED=0
 LIVE=0
+WITH_TESTS=0
 EXPECTED_SHA=""
+MCP_SOCKET="${ORCHESTRA_MCP_SOCKET:-/home/hamed/orchestra-migration/state/mcp.sock}"
 
 usage() {
   cat <<'EOF'
-Usage: verify.sh [--live] [--sha <40-hex-sha>]
+Usage: verify.sh [--live] [--sha <40-hex-sha>] [--with-tests]
 
 Default mode performs source and staging checks without requiring installed or
 active services. --live requires installed configuration, coordinator, health
 timer, tunnel, tunnel health URL, and the expected exact active release to pass.
+Live mode validates the deployed release and services; it does not run the
+source-tree unit suite unless --with-tests is also supplied.
 EOF
 }
 
 while (($#)); do
   case "$1" in
     --live) LIVE=1 ;;
+    --with-tests) WITH_TESTS=1 ;;
     --sha)
       shift
       (($#)) || { echo "--sha requires a value" >&2; exit 2; }
@@ -46,6 +52,40 @@ fi
 pass() { echo "PASS  $*"; }
 fail() { echo "FAIL  $*"; FAILURES=$((FAILURES + 1)); }
 skip() { echo "SKIP  $*"; SKIPPED=$((SKIPPED + 1)); }
+unchecked() { echo "UNCHECKED  $*"; UNCHECKED=$((UNCHECKED + 1)); }
+
+release_digest() {
+  python3 - "$1" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+digest = hashlib.sha256()
+excluded = {".orchestra-release-sha", ".orchestra-release-digest"}
+for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+    relative = path.relative_to(root).as_posix()
+    if relative in excluded:
+        continue
+    metadata = path.lstat()
+    if stat.S_ISDIR(metadata.st_mode):
+        continue
+    digest.update(relative.encode("utf-8") + b"\0")
+    if stat.S_ISLNK(metadata.st_mode):
+        digest.update(b"L\0" + os.readlink(path).encode("utf-8") + b"\0")
+    elif stat.S_ISREG(metadata.st_mode):
+        digest.update(b"X\0" if metadata.st_mode & 0o111 else b"F\0")
+        with path.open("rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+        digest.update(b"\0")
+    else:
+        raise SystemExit(f"unsupported release entry: {relative}")
+print(digest.hexdigest())
+PY
+}
 
 echo "Orchestra PixelBox verification"
 echo "source: $ROOT"
@@ -77,6 +117,19 @@ if [[ -r "$ROOT/.orchestra-release-sha" ]]; then
   else
     skip "$INSTALL_ROOT/current does not select this staged release"
   fi
+  if [[ -r "$ROOT/.orchestra-release-digest" ]]; then
+    RECORDED_DIGEST="$(<"$ROOT/.orchestra-release-digest")"
+    ACTUAL_DIGEST="$(release_digest "$ROOT" 2>/dev/null || true)"
+    if [[ "$RECORDED_DIGEST" =~ ^[0-9a-f]{64}$ && "$ACTUAL_DIGEST" == "$RECORDED_DIGEST" ]]; then
+      pass "release tree matches its validated digest"
+    else
+      fail "release tree differs from its validated digest"
+    fi
+  elif [[ "$LIVE" == "1" ]]; then
+    fail "release digest is missing"
+  else
+    skip "release digest is missing from this staging directory"
+  fi
 elif [[ "$LIVE" == "1" ]]; then
   fail "versioned release marker is missing"
 else
@@ -91,7 +144,9 @@ if command -v python3 >/dev/null; then
   else
     fail "Python compilation"
   fi
-  if (cd "$ROOT" && PYTHONPYCACHEPREFIX="$CACHE_ROOT" \
+  if [[ "$LIVE" == "1" && "$WITH_TESTS" == "0" ]]; then
+    unchecked "source-tree unit tests (live mode; use --with-tests to run them)"
+  elif (cd "$ROOT" && PYTHONPYCACHEPREFIX="$CACHE_ROOT" \
       python3 -m unittest discover -s tests -q); then
     pass "unit and integration tests"
   else
@@ -113,12 +168,23 @@ if [[ -r "$CONFIG" ]]; then
   if [[ "$LIVE" == "0" ]]; then
     health_args+=(--allow-degraded)
   fi
+  [[ -n "${ORCHESTRA_TUNNEL_HEALTH_URL:-}" ]] \
+    && health_args+=(--tunnel-health-url "$ORCHESTRA_TUNNEL_HEALTH_URL")
+  [[ -n "${ORCHESTRA_DASHBOARD_HEALTH_URL:-}" ]] \
+    && health_args+=(--dashboard-health-url "$ORCHESTRA_DASHBOARD_HEALTH_URL")
+  [[ -n "${ORCHESTRA_MCP_HEALTH_URL:-}" ]] \
+    && health_args+=(--mcp-health-url "$ORCHESTRA_MCP_HEALTH_URL")
+  [[ -n "${ORCHESTRA_BACKUP_DIR:-}" ]] \
+    && health_args+=(--backup-dir "$ORCHESTRA_BACKUP_DIR")
   if (cd "$ROOT" && python3 -m omcp.health "${health_args[@]}" >"$health_file"); then
     pass "health report"
     python3 - "$health_file" <<'PY'
 import json, sys
 value = json.load(open(sys.argv[1]))
 print(f"      status={value.get('status')} platform={value.get('platform')}")
+for name, check in sorted(value.get("checks", {}).items()):
+    if isinstance(check, dict) and check.get("checked") is False:
+        print(f"      unchecked: {name} ({check.get('status', 'unchecked')})")
 PY
   else
     fail "health report (see python3 -m omcp.health --config $CONFIG)"
@@ -144,6 +210,31 @@ if command -v systemctl >/dev/null; then
       fi
     fi
   done
+  for unit in orchestra-dashboard.service orchestra-github-dispatch.service; do
+    if systemctl list-unit-files --no-legend "$unit" 2>/dev/null | grep -q "^$unit"; then
+      if systemctl is-active --quiet "$unit"; then
+        pass "$unit active"
+      elif [[ "$LIVE" == "1" ]]; then
+        fail "$unit is installed but not active"
+      else
+        skip "$unit installed but not active"
+      fi
+    else
+      unchecked "$unit is not installed"
+    fi
+  done
+  if [[ -S "$MCP_SOCKET" ]]; then
+    socket_mode="$(stat -c '%a' "$MCP_SOCKET" 2>/dev/null || stat -f '%Lp' "$MCP_SOCKET")"
+    if [[ "$socket_mode" == "600" ]]; then
+      pass "authenticated MCP socket is owner-only"
+    else
+      fail "MCP socket mode is $socket_mode, expected 600"
+    fi
+  elif [[ "$LIVE" == "1" ]]; then
+    fail "MCP socket is missing at $MCP_SOCKET"
+  else
+    skip "MCP socket is not present"
+  fi
   if systemctl is-active --quiet orchestra-tunnel.service; then
     pass "orchestra-tunnel.service active"
   else
@@ -185,9 +276,23 @@ else
   fi
 fi
 
+for name in DASHBOARD MCP; do
+  variable="ORCHESTRA_${name}_HEALTH_URL"
+  url="${!variable:-}"
+  if [[ -z "$url" ]]; then
+    unchecked "$variable is not set"
+    continue
+  fi
+  if curl --fail --silent --show-error --max-time 5 "$url" >/dev/null; then
+    pass "$name health endpoint"
+  else
+    fail "$name health endpoint"
+  fi
+done
+
 echo
 if (( FAILURES )); then
-  echo "Verification failed: $FAILURES check(s), $SKIPPED skipped."
+  echo "Verification failed: $FAILURES check(s), $SKIPPED skipped, $UNCHECKED unchecked."
   exit 1
 fi
-echo "Verification passed with $SKIPPED skipped check(s)."
+echo "Verification passed with $SKIPPED skipped and $UNCHECKED unchecked check(s)."

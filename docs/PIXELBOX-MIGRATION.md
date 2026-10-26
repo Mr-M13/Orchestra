@@ -757,9 +757,30 @@ of the following evidence is recorded:
 After the tunnel is enabled, run
 `ORCHESTRA_TUNNEL_HEALTH_URL=<verified-local-ready-url> ./deploy/pixelbox/verify.sh --live --sha <40-character-sha>`.
 Default verification mode is staging-safe and may skip absent services; only
-`--live` turns those skips into cutover failures. It also requires Linux ARM64
-and proves that `current`, the release directory, and its marker identify the
-expected exact SHA.
+`--live` turns those skips into cutover failures. Live mode requires Linux
+ARM64 and proves that `current`, the release directory, its marker and its
+full-tree digest identify the expected exact SHA. It does not assume the
+release directory is a Git checkout and does not run the source-tree unit suite
+by default; add `--with-tests` only when you deliberately want that extra
+source check. Live mode also checks the coordinator, health timer, MCP socket
+mode, tunnel, optional dashboard and GitHub dispatch broker units, and reports
+`UNCHECKED` separately from `PASS`, `SKIP` and `FAIL`.
+
+Optional read-only health probes can be enabled without changing the
+coordinator:
+
+```sh
+export ORCHESTRA_DASHBOARD_HEALTH_URL=http://127.0.0.1:8082/healthz
+export ORCHESTRA_MCP_HEALTH_URL=<authenticated-gateway-health-url>
+export ORCHESTRA_BACKUP_DIR=/home/hamed/orchestra-migration/backup
+```
+
+`omcp.health` reports recent failed/interrupted tasks, runner startup failures,
+stale accepted tasks, failed GitHub Actions tasks, dispatch-broker socket
+health, backup archive age, and each external health probe. Missing optional
+probes are reported as `unchecked`, not healthy. The health timer exits nonzero
+for failed checks and optional `--allow-degraded` controls whether warnings are
+returned as status 2. It does not send success notifications.
 
 Only then route the production ChatGPT app to the PixelBox tunnel. Keep the Mac
 service available for rollback until the owner records a successful observation
