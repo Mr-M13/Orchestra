@@ -610,6 +610,15 @@ class OMCPClientTests(unittest.TestCase):
                 OMCPClient(str(socket_path), timeout=0.01).call("bridge_status")
             thread.join(2)
 
+    def test_instance_identity_cannot_change_between_dashboard_calls(self):
+        client = OMCPClient("/tmp/unused-orchestra.sock")
+        client._guard_instance({"instance_id": "a" * 36})
+        client._guard_instance({"instance_id": "a" * 36})
+        with self.assertRaisesRegex(OMCPError, "instance changed"):
+            client._guard_instance({"instance_id": "b" * 36})
+        with self.assertRaisesRegex(OMCPError, "invalid Orchestra instance"):
+            client._guard_instance({"instance_id": ""})
+
     def test_tools_outside_the_allowlist_never_reach_the_socket(self):
         client = OMCPClient("/definitely/not/a/socket")
         with self.assertRaises(OMCPError):

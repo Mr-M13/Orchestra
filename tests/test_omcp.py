@@ -17,8 +17,9 @@ from urllib.parse import urlparse
 from omcp import worker_contract
 from omcp.approval import format_review
 from omcp.controller import (
-    AuthorizationError, Config, HostOperation, Principal, RepositoryProfile, StandingAuthorization,
-    TaskController, Worker, systemd_user_worker_command,
+    AuthorizationError, Config, HostOperation, Principal, RepositoryProfile,
+    StandingAuthorization, TaskController, UnknownTaskError, Worker, WrongInstanceError,
+    systemd_user_worker_command,
 )
 from omcp.docker_gate import gated_command
 from omcp.host_runner import run as run_host_operation
@@ -142,6 +143,60 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(persisted["requests"]["request-1"], first["task_id"])
         with self.assertRaisesRegex(ValueError, "different task content"):
             self.controller.submit_task("request-1", "Other", "Other work", "ina")
+
+    def test_submission_ack_and_restart_keep_one_instance_identity(self):
+        submitted = self.submit()
+        identity = (
+            submitted["instance_id"], submitted["state_store_id"],
+            submitted["instance_role"],
+        )
+        self.assertEqual(identity[2], "authoritative")
+        self.assertRegex(identity[0], r"^[0-9a-f-]{36}$")
+        self.assertRegex(identity[1], r"^[0-9a-f]{24}$")
+        self.controller.close()
+        self.controller = TaskController(
+            self.config, popen=self.popen, workspace_preparer=lambda *_: self.root,
+        )
+        recovered = self.controller.task_status(submitted["task_id"])
+        self.assertEqual(
+            (recovered["instance_id"], recovered["state_store_id"],
+             recovered["instance_role"]),
+            identity,
+        )
+        self.assertEqual(
+            self.controller.bridge_status()["instance_id"], identity[0],
+        )
+
+    def test_retired_instance_rejects_task_methods_with_explicit_identity(self):
+        retired_state = Path(self.temp.name) / "retired-state"
+        config = replace(
+            self.config, state_dir=retired_state, instance_role="retired",
+            authoritative_instance_id="11111111-1111-1111-1111-111111111111",
+        )
+        self.controller.close()
+        self.controller = TaskController(
+            config, popen=self.popen, workspace_preparer=lambda *_: self.root,
+        )
+        with self.assertRaises(WrongInstanceError) as caught:
+            self.controller.list_tasks()
+        self.assertEqual(
+            caught.exception.identity["instance_role"], "retired",
+        )
+        self.assertEqual(
+            caught.exception.identity["authoritative_instance_id"],
+            "11111111-1111-1111-1111-111111111111",
+        )
+        status = self.controller.bridge_status()
+        self.assertEqual(status["instance_role"], "retired")
+        self.assertNotIn("state_dir", status)
+
+    def test_unknown_task_is_an_explicit_instance_scoped_error(self):
+        with self.assertRaises(UnknownTaskError) as caught:
+            self.controller.task_status("99999999-9999-4999-8999-999999999999")
+        self.assertEqual(
+            caught.exception.identity["instance_id"],
+            self.controller.bridge_status()["instance_id"],
+        )
 
     def test_local_worker_refreshes_base_ref_before_workspace_creation(self):
         workspace_preparer = Mock(return_value=self.root)
@@ -425,9 +480,10 @@ class ControllerTests(unittest.TestCase):
         })
         self.assertEqual(task["reservation"]["status"], "released")
 
-    def test_bridge_status_identifies_the_durable_state_directory(self):
+    def test_bridge_status_identifies_the_durable_state_store_without_a_path(self):
         status = self.controller.bridge_status()
-        self.assertEqual(status["state_dir"], str(self.state))
+        self.assertRegex(status["state_store_id"], r"^[0-9a-f]{24}$")
+        self.assertNotIn("state_dir", status)
         self.assertEqual(status["coordinator_pid"], os.getpid())
         self.assertIsInstance(status["coordinator_started_at"], str)
 
@@ -1971,6 +2027,40 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "direct or systemd-user"):
                     Config.load(config_path)
 
+    def test_config_loads_retired_instance_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            codex = Path(directory) / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            config_path = Path(directory) / "omcp.json"
+            raw = {
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(Path(directory) / "state"),
+                "workers": {"ina": {"command": [str(codex)]}},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:read"]},
+                "instance_role": "retired",
+                "authoritative_instance_id": "11111111-1111-1111-1111-111111111111",
+            }
+            config_path.write_text(json.dumps(raw))
+            os.chmod(config_path, 0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                config = Config.load(config_path)
+                self.assertEqual(config.instance_role, "retired")
+                self.assertEqual(
+                    config.authoritative_instance_id,
+                    "11111111-1111-1111-1111-111111111111",
+                )
+                raw["instance_role"] = "authoritative"
+                config_path.write_text(json.dumps(raw))
+                with self.assertRaisesRegex(ValueError, "only valid for a retired"):
+                    Config.load(config_path)
+                raw["instance_role"] = "primary"
+                config_path.write_text(json.dumps(raw))
+                with self.assertRaisesRegex(ValueError, "authoritative or retired"):
+                    Config.load(config_path)
+
     def test_config_supports_future_parallel_capacity_without_hardcoded_two(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "project"
@@ -3183,6 +3273,31 @@ class ServerTests(unittest.TestCase):
         })
         self.assertFalse(response["result"]["isError"])
         self.assertEqual(response["result"]["structuredContent"], {"status": "ok"})
+
+    def test_unknown_task_returns_structured_instance_error(self):
+        identity = {
+            "instance_id": "11111111-1111-1111-1111-111111111111",
+            "state_store_id": "a" * 24,
+            "instance_role": "authoritative",
+        }
+        self.controller.public_identity.return_value = identity
+        self.controller.task_status.side_effect = UnknownTaskError(
+            "22222222-2222-2222-2222-222222222222", self.controller,
+        )
+        session = self.server.new_session()
+        session.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+        session.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        response = session.handle({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "task_status", "arguments": {
+                "task_id": "22222222-2222-2222-2222-222222222222",
+            }},
+        })
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(
+            response["result"]["structuredContent"],
+            {"error": "task_not_found_in_instance", **identity},
+        )
 
     def test_mutating_server_startup_requires_authenticated_tunnel_identity(self):
         config = Mock()
