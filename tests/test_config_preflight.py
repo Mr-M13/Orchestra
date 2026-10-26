@@ -55,7 +55,11 @@ class ConfigPreflightTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             config, config_root = _config(base)
-            self.assertEqual(self._run(config, config_root, ROOT), 0)
+            codex = base / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                self.assertEqual(self._run(config, config_root, ROOT), 0)
 
     def test_wrong_owner_fails_before_activation(self):
         with tempfile.TemporaryDirectory() as directory:
