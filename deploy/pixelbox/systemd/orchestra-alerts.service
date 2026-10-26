@@ -1,0 +1,29 @@
+[Unit]
+Description=Orchestra operational alert evaluation
+Documentation=file:/opt/orchestra/current/docs/OPERATIONS.md
+After=network-online.target orchestra-omcp.service
+Wants=network-online.target
+ConditionPathExists=/etc/orchestra/alerts.json
+
+[Service]
+Type=oneshot
+User=hamed
+Group=hamed
+WorkingDirectory=/opt/orchestra/current
+Environment=PYTHONPATH=/opt/orchestra/current
+ExecStartPre=/usr/bin/test -r /etc/orchestra/alerts.json
+ExecStart=/usr/bin/python3 -m omcp.alerts --config /etc/orchestra/alerts.json --health-config /etc/orchestra/omcp.json --backup-config /etc/orchestra/backup.json --tunnel-health-url http://127.0.0.1:8788 --dashboard-health-url http://127.0.0.1:8082/ --mcp-health-url http://127.0.0.1:8090/healthz
+TimeoutStartSec=2min
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/hamed/orchestra-migration/state
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

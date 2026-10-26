@@ -51,10 +51,14 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
         self.assertIn("source-tree unit tests", verify_source)
         self.assertIn("UNCHECKED", verify_source)
         self.assertIn("release_digest", verify_source)
-        for unit in ("orchestra-backup.service", "orchestra-backup.timer"):
+        for unit in (
+            "orchestra-backup.service", "orchestra-backup.timer",
+            "orchestra-alerts.service", "orchestra-alerts.timer",
+        ):
             self.assertTrue((DEPLOY / "systemd" / unit).is_file())
             self.assertIn(unit, (DEPLOY / "install.sh").read_text())
         self.assertIn("--backup-config", verify_source)
+        self.assertIn("--alerts-config", verify_source)
 
     def test_installer_cannot_start_services_before_readiness_preflight(self):
         source = (DEPLOY / "install.sh").read_text()

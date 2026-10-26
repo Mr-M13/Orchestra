@@ -19,6 +19,7 @@ from typing import Any
 from omcp.backup import backup_health
 from omcp.controller import Config, failure_category
 from omcp.platform import describe_sandbox, host_platform
+from omcp.readiness import build_readiness, worker_health_from_state
 
 
 def _owner_only(path: Path) -> bool:
@@ -100,6 +101,8 @@ def _task_health(config: Any, state: dict[str, Any]) -> tuple[dict[str, Any], li
     tasks = state.get("tasks", {})
     failed = interrupted = startup_failures = actions_failures = stale_accepted = 0
     failure_categories: dict[str, int] = {}
+    failed_ids: list[str] = []
+    interrupted_ids: list[str] = []
     for task in tasks.values():
         status = task.get("status")
         failure = task.get("failure")
@@ -112,8 +115,12 @@ def _task_health(config: Any, state: dict[str, Any]) -> tuple[dict[str, Any], li
         recent = finished >= recent_cutoff
         if status == "failed" and recent:
             failed += 1
+            if isinstance(task.get("task_id"), str):
+                failed_ids.append(task["task_id"])
         if status == "interrupted" and recent:
             interrupted += 1
+            if isinstance(task.get("task_id"), str):
+                interrupted_ids.append(task["task_id"])
         if recent and status in {"failed", "interrupted", "cancelled"}:
             category = failure_category(task)
             failure_categories[category] = failure_categories.get(category, 0) + 1
@@ -134,16 +141,6 @@ def _task_health(config: Any, state: dict[str, Any]) -> tuple[dict[str, Any], li
             if created <= stale_cutoff:
                 stale_accepted += 1
     warnings: list[str] = []
-    if failed:
-        warnings.append("failed_tasks_present")
-    if interrupted:
-        warnings.append("interrupted_tasks_present")
-    if startup_failures:
-        warnings.append("runner_startup_failures")
-    if actions_failures:
-        warnings.append("failed_actions_dispatch")
-    if failure_categories.get("credit_exhausted"):
-        warnings.append("credit_exhausted_tasks")
     if stale_accepted:
         warnings.append("stale_accepted_tasks")
     return {
@@ -153,8 +150,11 @@ def _task_health(config: Any, state: dict[str, Any]) -> tuple[dict[str, Any], li
         "recent_actions_failures": actions_failures,
         "recent_credit_exhausted": failure_categories.get("credit_exhausted", 0),
         "failure_categories": failure_categories,
+        "recent_failed_ids": sorted(failed_ids),
+        "recent_interrupted_ids": sorted(interrupted_ids),
         "stale_accepted": stale_accepted,
         "window_seconds": 86_400,
+        "historical_only": True,
     }, warnings
 
 
@@ -190,6 +190,7 @@ def collect_health(
     config_path: Path, tunnel_url: str | None = None,
     dashboard_url: str | None = None, mcp_url: str | None = None,
     backup_dir: str | None = None, backup_config: str | None = None,
+    alerts_config: str | None = None,
 ) -> dict[str, Any]:
     """Return only safe metadata; never include instructions or credentials."""
     report: dict[str, Any] = {
@@ -319,6 +320,16 @@ def collect_health(
     task_check, task_warnings = _task_health(config, state)
     checks["tasks"] = task_check
     report["warnings"].extend(task_warnings)
+    readiness = build_readiness(
+        config, state,
+        worker_health=worker_health_from_state(config, state),
+        coordinator_ok=bool(checks["coordinator"].get("ok")),
+    )
+    checks["readiness"] = readiness
+    if readiness["status"] == "unavailable":
+        report["warnings"].append("readiness_unavailable")
+    elif readiness["status"] == "degraded":
+        report["warnings"].append("readiness_degraded")
     checks["dispatch_broker"] = _dispatch_broker_check(config)
     if checks["dispatch_broker"].get("status") == "failed":
         report["warnings"].append("dispatch_broker_unavailable")
@@ -335,6 +346,13 @@ def collect_health(
     elif checks["backup"].get("status") == "unchecked" and backup_config:
         if checks["backup"].get("reason") not in {"backup_config_not_configured"}:
             report["warnings"].append("backup_unverified")
+    from omcp.alerts import alert_health
+    checks["alerts"] = alert_health(Path(alerts_config) if alerts_config else None)
+    if checks["alerts"].get("status") == "failed":
+        report["warnings"].append("alerts_failed")
+    elif checks["alerts"].get("status") == "unchecked" and alerts_config:
+        if checks["alerts"].get("reason") not in {"alert_config_not_configured"}:
+            report["warnings"].append("alerts_unverified")
     try:
         usage = shutil.disk_usage(config.state_dir)
         checks["disk"] = {
@@ -382,12 +400,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mcp-health-url")
     parser.add_argument("--backup-dir")
     parser.add_argument("--backup-config")
+    parser.add_argument("--alerts-config")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--allow-degraded", action="store_true")
     args = parser.parse_args(argv)
     report = collect_health(
         args.config, args.tunnel_health_url, args.dashboard_health_url,
         args.mcp_health_url, args.backup_dir, args.backup_config,
+        args.alerts_config,
     )
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))

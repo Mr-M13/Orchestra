@@ -16,13 +16,16 @@ starts the tunnel or touches unrelated host services.
   deliberately local-only (`off_device: false`); health reports it as
   `unchecked` until the owner chooses an off-device destination and key
   custody. See [docs/BACKUP-RECOVERY.md](../../docs/BACKUP-RECOVERY.md).
+- `alerts.example.json` — external Healthchecks dead-man/webhook template.
+  The timer remains disabled and health reports `unchecked` until the owner
+  supplies a channel. See [docs/OPERATIONS.md](../../docs/OPERATIONS.md).
 - `omcp.dashboard-development.example.json` — policy-only
   `orchestra-dashboard` profile plus exact `dashboard/*` file grant for Ina; it
   is not merged automatically and requires separate owner approval.
-- `systemd/` — coordinator, tunnel, health, daily encrypted backup,
-  optional loopback HTTP gateway, loopback unified dashboard and owner-only
-  approval portal units. The backup units are installed but not enabled until
-  an owner-approved off-device repository exists.
+- `systemd/` — coordinator, tunnel, readiness/health, daily encrypted backup,
+  alerts, optional loopback HTTP gateway, loopback unified dashboard and
+  owner-only approval portal units. Backup and alert timers are installed but
+  not enabled until the owner supplies the external destination/channel.
 - `install.sh` — exports an exact 40-character Git SHA into
   `/opt/orchestra/releases/<sha>`, validates it, and atomically updates the
   `/opt/orchestra/current` symlink only during a separately approved

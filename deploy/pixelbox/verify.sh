@@ -170,6 +170,8 @@ if [[ -r "$CONFIG" ]]; then
   health_args=(--config "$CONFIG" --json --allow-degraded)
   backup_config="${ORCHESTRA_BACKUP_CONFIG:-/etc/orchestra/backup.json}"
   [[ -n "$backup_config" ]] && health_args+=(--backup-config "$backup_config")
+  alerts_config="${ORCHESTRA_ALERTS_CONFIG:-/etc/orchestra/alerts.json}"
+  [[ -n "$alerts_config" ]] && health_args+=(--alerts-config "$alerts_config")
   [[ -n "${ORCHESTRA_TUNNEL_HEALTH_URL:-}" ]] \
     && health_args+=(--tunnel-health-url "$ORCHESTRA_TUNNEL_HEALTH_URL")
   [[ -n "${ORCHESTRA_DASHBOARD_HEALTH_URL:-}" ]] \

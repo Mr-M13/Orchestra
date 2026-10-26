@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "healthcheck_ping_url": null,
+  "webhook_url": null,
+  "state_file": "/home/hamed/orchestra-migration/state/alert-state.json",
+  "threshold_seconds": 600,
+  "disk_free_bytes": 536870912
+}

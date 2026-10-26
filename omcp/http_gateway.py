@@ -161,13 +161,56 @@ class Gateway:
         except (UnicodeEncodeError, ValueError):
             return False
 
-    def ready(self) -> bool:
+    def readiness(self) -> dict[str, Any]:
+        """Ask the backend for current readiness, not historical task health."""
+        connection: socket.socket | None = None
         try:
             connection = self._backend_socket()
-        except (OSError, PermissionError, ValueError, KeyError):
-            return False
-        connection.close()
-        return True
+            initialize = {
+                "jsonrpc": "2.0", "id": "readiness-init",
+                "method": "initialize",
+                "params": {"protocolVersion": PROTOCOL_VERSION, "capabilities": {}},
+            }
+            connection.sendall(json.dumps(initialize, separators=(",", ":")).encode() + b"\n")
+            initialized = json.loads(self._read_line(connection))
+            if not isinstance(initialized, dict) or "error" in initialized:
+                return {"ready": False, "status": "unavailable"}
+            notification = {
+                "jsonrpc": "2.0", "method": "notifications/initialized",
+            }
+            connection.sendall(json.dumps(notification, separators=(",", ":")).encode() + b"\n")
+            request = {
+                "jsonrpc": "2.0", "id": "readiness-status",
+                "method": "tools/call",
+                "params": {"name": "bridge_status", "arguments": {}},
+            }
+            connection.sendall(json.dumps(request, separators=(",", ":")).encode() + b"\n")
+            response = json.loads(self._read_line(connection))
+            if not isinstance(response, dict) or "error" in response:
+                return {"ready": False, "status": "unavailable"}
+            result = response.get("result")
+            structured = result.get("structuredContent") if isinstance(result, dict) else None
+            readiness = structured.get("readiness") if isinstance(structured, dict) else None
+            if not isinstance(readiness, dict):
+                # Older coordinators do not publish the readiness projection;
+                # a successful backend round-trip is still current liveness.
+                return {"ready": True, "status": "ready", "legacy": True}
+            status = readiness.get("status")
+            return {
+                "ready": status == "ready",
+                "status": status if isinstance(status, str) else "unavailable",
+                "reasons": readiness.get("reasons") if isinstance(readiness.get("reasons"), list) else [],
+                "accepting": readiness.get("accepting"),
+                "can_complete_now": readiness.get("can_complete_now"),
+            }
+        except (OSError, PermissionError, ValueError, KeyError, json.JSONDecodeError):
+            return {"ready": False, "status": "unavailable"}
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def ready(self) -> bool:
+        return bool(self.readiness().get("ready"))
 
     def rpc(self, session: str | None, payload: bytes) -> tuple[str, bytes]:
         request, method = self._parse(payload)
@@ -493,9 +536,10 @@ def make_handler(gateway: Gateway,
                 if not gateway.allowed(self.headers.get("Authorization")):
                     audit("auth_failure", logging.WARNING, status=401)
                     return self.send(401, b'{"error":"unauthorized"}')
-                if gateway.ready():
-                    return self.send(200, b'{"ready":true}')
-                return self.send(503, b'{"ready":false}')
+                readiness = gateway.readiness()
+                if readiness.get("ready"):
+                    return self.send(200, json.dumps(readiness, sort_keys=True).encode())
+                return self.send(503, json.dumps(readiness, sort_keys=True).encode())
             self.send(404, b"{}")
 
         def do_POST(self) -> None:
