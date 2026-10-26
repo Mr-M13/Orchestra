@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import hashlib
 import heapq
@@ -379,6 +380,7 @@ class Config:
     local_worker_git_mode: str = "fetch"
     local_worker_source_sha: str | None = None
     local_worker_launcher: str = "direct"
+    repository_parallelism: str = "serialized"
     max_worker_seconds: int = 1_800
     max_parallel_tasks: int = 1
     startup_lease_seconds: int = 30
@@ -599,6 +601,11 @@ class Config:
         local_worker_launcher = raw.get("local_worker_launcher", "direct")
         if local_worker_launcher not in {"direct", "systemd-user"}:
             raise ValueError("local_worker_launcher must be direct or systemd-user")
+        repository_parallelism = raw.get("repository_parallelism", "serialized")
+        if repository_parallelism not in {"serialized", "isolated_worktrees"}:
+            raise ValueError(
+                "repository_parallelism must be serialized or isolated_worktrees"
+            )
         max_worker_seconds = int(raw.get("max_worker_seconds", 1_800))
         if not 60 <= max_worker_seconds <= 7_200:
             raise ValueError("max_worker_seconds must be between 60 and 7200")
@@ -821,6 +828,7 @@ class Config:
             local_worker_git_mode=local_worker_git_mode,
             local_worker_source_sha=local_worker_source_sha,
             local_worker_launcher=local_worker_launcher,
+            repository_parallelism=repository_parallelism,
             max_worker_seconds=max_worker_seconds,
             max_parallel_tasks=max_parallel_tasks,
             startup_lease_seconds=startup_lease_seconds,
@@ -873,6 +881,10 @@ class UnknownTaskError(KeyError):
         self.task_id = task_id
         self.identity = controller.public_identity()
         super().__init__("task not found in this coordinator instance")
+
+
+class DuplicateWorkspaceIdentity(RuntimeError):
+    """Two tasks tried to share a branch or worktree identity."""
 
 
 class TaskController:
@@ -955,6 +967,7 @@ class TaskController:
             "active_tasks": sum(task["status"] in ACTIVE
                                 for task in self.state["tasks"].values()),
             "execution_limit": self.config.max_parallel_tasks,
+            "repository_parallelism": self.config.repository_parallelism,
             "task_counts": counts,
         })
 
@@ -1359,9 +1372,17 @@ class TaskController:
             task["approval"] = {
                 "status": "pending", "requested_at": now, "expires_at": expires_at,
             }
-        access = ("read" if standing_authorization
-                  and not standing_authorization.writable_paths
-                  and not standing_authorization.writable_files else "write")
+        # The direct DeepSeek adapter is response-only: it reads the task
+        # worktree but the sandbox never grants a workspace write.  Do not
+        # reserve a writer slot for it.  Standing grants with no writable roots
+        # are read-only for the same reason.
+        response_only = self.config.workers[worker].adapter == "deepseek"
+        read_only_grant = (
+            standing_authorization is not None
+            and not standing_authorization.writable_paths
+            and not standing_authorization.writable_files
+        )
+        access = "read" if response_only or read_only_grant else "write"
         task["resource_requirements"] = {
             "worker": worker, "repository": profile.repository.lower(), "access": access,
         }
@@ -1478,6 +1499,7 @@ class TaskController:
                   "active_tasks": sum(task["status"] in ACTIVE
                                       for task in self.state["tasks"].values()),
                   "execution_limit": self.config.max_parallel_tasks,
+                  "repository_parallelism": self.config.repository_parallelism,
                   "default_profile": default_profile.profile_id,
                   "repository_profiles": sorted((self.config.repository_profiles or {"default": default_profile})),
                   "platform": host_platform(),
@@ -1565,21 +1587,89 @@ class TaskController:
         self.tick()
         active = [task for task in self.state["tasks"].values() if task["status"] in ACTIVE]
         active_by_worker = {task["worker"]: task for task in active}
+        capacity_available = len(active) < self.config.max_parallel_tasks
+        queued = sorted(
+            (task for task in self.state["tasks"].values() if task["status"] == "accepted"),
+            key=lambda task: (task["created_at"], task["task_id"]),
+        )
         workers = []
         for name in sorted(self.config.workers):
             current = active_by_worker.get(name)
+            next_task = next((task for task in queued if task["worker"] == name), None)
+            reason: str | None = None
+            if current is not None:
+                reason = "worker_busy"
+            elif not capacity_available:
+                reason = "execution_limit_reached"
+            elif next_task is None:
+                reason = "no_queued_task"
+            else:
+                reason = self._repository_block_reason(next_task, active)
+                if reason is None and self._task_identity_conflict(next_task):
+                    reason = "duplicate_task_identity"
+            runnable = reason is None
             workers.append({
                 "worker": name,
                 "adapter": self.config.workers[name].adapter,
-                "available": current is None and len(active) < self.config.max_parallel_tasks,
+                "configured": True,
+                "idle": current is None,
+                "capacity_available": capacity_available,
+                # Legacy field: idle process capacity, not proof that the next
+                # queued task can start.
+                "available": current is None and capacity_available,
+                # Authoritative scheduling readiness.  The dashboard must use
+                # this field (and reason) instead of advertising idle capacity
+                # that a repository or worker block makes unusable.
+                "runnable": runnable,
+                "reason": reason,
                 "current_task_id": current["task_id"] if current else None,
+                "next_task_id": next_task["task_id"] if next_task else None,
             })
         self._audit("worker.availability", None, "allowed", {})
         return {
             **self.public_identity(),
             "workers": workers, "active_tasks": len(active),
             "execution_limit": self.config.max_parallel_tasks,
+            "repository_parallelism": self.config.repository_parallelism,
         }
+
+    @staticmethod
+    def _task_repository(task: dict[str, Any]) -> str:
+        requirement = task.get("resource_requirements", {})
+        return requirement.get("repository", task.get("repository", "").lower())
+
+    def _repository_block_reason(
+        self, task: dict[str, Any], active: list[dict[str, Any]],
+    ) -> str | None:
+        repository = self._task_repository(task)
+        held = {
+            item.get("resource_requirements", {}).get("access", "write")
+            for item in active
+            if self._task_repository(item) == repository
+        }
+        if not held:
+            return None
+        if self.config.repository_parallelism != "isolated_worktrees":
+            return "repository_serialized"
+        # Isolated worktrees permit a writer beside other writers and beside a
+        # read-only response task.  A writer does not need to wait for readers.
+        return None
+
+    def _task_identity_conflict(self, task: dict[str, Any]) -> bool:
+        profile = self.config.profile(task.get("repository_profile"))
+        branch = "omcp/task-" + task["task_id"].split("-", 1)[0]
+        workspace = (
+            self.config.state_dir / "worktrees" / profile.profile_id / task["task_id"]
+        ).resolve()
+        for other in self.state["tasks"].values():
+            if other is task:
+                continue
+            other_workspace = other.get("workspace")
+            if (other.get("branch") == branch
+                    or (isinstance(other_workspace, str)
+                        and Path(other_workspace).resolve() == workspace)):
+                return True
+        return False
 
     def cancel_task(self, task_id: str, reason: str) -> dict[str, Any]:
         self._authorize("tasks:cancel", "task.cancel", task_id)
@@ -1885,6 +1975,7 @@ class TaskController:
             index = repository_order.index(cursor) + 1
             repository_order = repository_order[index:] + repository_order[:index]
 
+        isolated = self.config.repository_parallelism == "isolated_worktrees"
         for repository in repository_order:
             task = repository_heads[repository]
             if task["worker"] in active_workers:
@@ -1892,7 +1983,16 @@ class TaskController:
             requirement = task.get("resource_requirements", {})
             access = requirement.get("access", "write")
             held = active_repository_access.get(repository, set())
-            if held and (access == "write" or "write" in held):
+            # Default installations keep the conservative serializer: any
+            # active task for the repository blocks another.  The opt-in
+            # isolated_worktrees mode permits distinct workers and distinct
+            # worktree/branch identities to write the same repository at once.
+            if held and not isolated:
+                continue
+            # A read-only response task may share a repository with a writer in
+            # isolated mode; it cannot write the worktree.  Writers are already
+            # separated by worker and by the unique workspace/branch guard.
+            if held and isolated and access == "write" and "write" not in held:
                 continue
             return task
         return None
@@ -2200,6 +2300,72 @@ class TaskController:
         if worker is not None and worker.adapter == "github_actions":
             self._cancel_remote_best_effort(task)
 
+    @contextlib.contextmanager
+    def _repository_setup_lock(self, profile: RepositoryProfile):
+        """Serialize worktree creation and metadata updates per repository.
+
+        Worker execution happens after this short critical section.  The lock
+        file is owner-only and keyed by the normalized repository plus the
+        configured checkout, so two profiles for the same Git repository share
+        one lock while unrelated repositories remain independent.
+        """
+        lock_dir = self.config.state_dir / "locks"
+        lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(lock_dir, 0o700)
+        key = hashlib.sha256(
+            f"{profile.repository.lower()}\0{profile.project_root}".encode()
+        ).hexdigest()[:32]
+        path = lock_dir / f"repository-{key}.lock"
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+    def _task_workspace_path(self, task_id: str, profile: RepositoryProfile) -> Path:
+        return (
+            self.config.state_dir / "worktrees" / profile.profile_id / task_id
+        ).resolve()
+
+    def _assert_unique_task_identity(
+        self, task: dict[str, Any], branch: str, profile: RepositoryProfile,
+    ) -> None:
+        workspace = self._task_workspace_path(task["task_id"], profile)
+        for other in self.state["tasks"].values():
+            if other is task:
+                continue
+            other_workspace = other.get("workspace")
+            if (other.get("branch") == branch
+                    or (isinstance(other_workspace, str)
+                        and Path(other_workspace).resolve() == workspace)):
+                raise DuplicateWorkspaceIdentity(
+                    "task workspace or branch identity is already in use"
+                )
+
+    def _discard_partial_workspace(
+        self, branch: str, profile: RepositoryProfile, task_id: str,
+    ) -> None:
+        """Remove only the exact task worktree after a pre-execution failure.
+
+        A custom workspace preparer may return a different path.  Cleanup is
+        deliberately limited to the deterministic task path so a failed test
+        hook or an unexpected callback can never delete an owner checkout.
+        """
+        expected = self._task_workspace_path(task_id, profile)
+        if not expected.exists() or expected.is_symlink():
+            return
+        self._git(
+            profile.project_root, "worktree", "remove", "--force", str(expected),
+            allow_failure=True,
+        )
+        if expected.exists():
+            shutil.rmtree(expected, ignore_errors=True)
+        self._git(profile.project_root, "branch", "-D", branch, allow_failure=True)
+
     def _start(self, task: dict[str, Any]) -> None:
         if task.get("kind") == "host_operation":
             self._start_host_operation(task)
@@ -2211,18 +2377,46 @@ class TaskController:
             raise RuntimeError("task must hold an active reservation before startup")
         task.update({"branch": branch})
         self._save()
+        workspace: Path | None = None
+        worker_started = False
         try:
             worker = self.config.workers[task["worker"]]
-            # GitHub Actions checks out the exact source SHA remotely.  Its local
-            # worktree is prepared from the owner-synchronised tracking ref so
-            # the coordinator never needs the broker's private GitHub token.
-            # Local workers fetch by default; owner_synced requires an
-            # owner-pinned exact commit and never accesses GitHub credentials.
-            workspace = self.workspace_preparer(
-                task_id, branch, profile,
-                worker.adapter != "github_actions"
-                and profile.local_worker_git_mode == "fetch",
-            )
+            task_dir = self.config.state_dir / "tasks" / task_id
+            task_dir.mkdir(parents=True, mode=0o700)
+            os.chmod(task_dir, 0o700)
+            git_metadata_paths: list[Path] = []
+            # The setup lock covers only Git worktree creation and the durable
+            # workspace/branch metadata update.  It is released before any
+            # worker process starts, so two isolated writers do not hold a
+            # repository lock for the duration of their model calls.
+            with self._repository_setup_lock(profile):
+                self._assert_unique_task_identity(task, branch, profile)
+                # GitHub Actions checks out the exact source SHA remotely.  Its
+                # local worktree is prepared from the owner-synchronised tracking
+                # ref so the coordinator never needs the broker's private GitHub
+                # token.  Local workers fetch by default; owner_synced requires an
+                # owner-pinned exact commit and never accesses GitHub credentials.
+                workspace = self.workspace_preparer(
+                    task_id, branch, profile,
+                    worker.adapter != "github_actions"
+                    and profile.local_worker_git_mode == "fetch",
+                )
+                if worker.adapter in {"codex", "opencode"}:
+                    for option in ("--git-dir", "--git-common-dir"):
+                        git_code, git_value = self._git(
+                            workspace, "rev-parse", option, allow_failure=True,
+                        )
+                        if git_code != 0 or not git_value:
+                            continue
+                        candidate = Path(git_value)
+                        resolved = (
+                            candidate if candidate.is_absolute() else workspace / candidate
+                        ).resolve()
+                        if resolved not in git_metadata_paths:
+                            git_metadata_paths.append(resolved)
+                task.update({"workspace": str(workspace)})
+                self._save()
+            assert workspace is not None
             execution_capabilities = task.get("execution_capabilities")
             writable_paths: list[str] = []
             writable_files: list[str] = []
@@ -2251,23 +2445,6 @@ class TaskController:
                 )
                 if source_code != 0 or not re.fullmatch(r"[0-9a-f]{40}", source_sha):
                     raise RuntimeError("task worktree has no exact source commit")
-            git_metadata_paths: list[Path] = []
-            if worker.adapter in {"codex", "opencode"}:
-                for option in ("--git-dir", "--git-common-dir"):
-                    git_code, git_value = self._git(
-                        workspace, "rev-parse", option, allow_failure=True,
-                    )
-                    if git_code != 0 or not git_value:
-                        continue
-                    candidate = Path(git_value)
-                    resolved = (
-                        candidate if candidate.is_absolute() else workspace / candidate
-                    ).resolve()
-                    if resolved not in git_metadata_paths:
-                        git_metadata_paths.append(resolved)
-            task_dir = self.config.state_dir / "tasks" / task_id
-            task_dir.mkdir(parents=True, mode=0o700)
-            os.chmod(task_dir, 0o700)
             prompt_path = task_dir / "prompt.txt"
             log_path = task_dir / "worker.log"
             startup_log_path = task_dir / "startup.log"
@@ -2407,6 +2584,7 @@ class TaskController:
                 )
             finally:
                 os.close(startup_descriptor)
+            worker_started = True
             if isinstance(proc, subprocess.Popen):
                 # Own the handle before any other code can drop the reference.
                 self._children[task_id] = proc
@@ -2435,6 +2613,8 @@ class TaskController:
                 raise
         except Exception as exc:
             self._children.pop(task_id, None)
+            if not worker_started:
+                self._discard_partial_workspace(branch, profile, task_id)
             finished_at = utc_now()
             self._release_reservation(task, finished_at)
             task.update({"status": "failed", "finished_at": finished_at,
@@ -2590,7 +2770,15 @@ class TaskController:
             raise RuntimeError("task branch is not safely available")
         workspace.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._git(profile.project_root, "worktree", "add", "--detach", str(workspace), profile.base_ref)
-        self._git(workspace, "switch", "-c", branch)
+        try:
+            self._git(workspace, "switch", "-c", branch)
+        except Exception:
+            # Do not leave a half-created worktree that blocks the next attempt.
+            self._git(
+                profile.project_root, "worktree", "remove", "--force", str(workspace),
+                allow_failure=True,
+            )
+            raise
         return workspace
 
     def _prepare_host_workspace(

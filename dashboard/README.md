@@ -90,7 +90,13 @@ OMCP's published responses do not include the current task title in
 `worker_availability`, nor a pre-submission policy-preview endpoint. The
 dashboard therefore derives the display-only current title from
 `task_snapshot` and tells the user that Orchestra makes the authority decision
-after submission.
+after submission. `worker_availability` now reports both idle process capacity
+(`available`) and scheduling readiness for the next queued task (`runnable`),
+with a `reason` such as `worker_busy`, `execution_limit_reached`,
+`repository_serialized`, or `no_queued_task`. The dashboard uses `runnable` and
+`reason` for the worker status badge so an idle worker blocked by a repository
+rule is not advertised as usable execution capacity. The new-task form uses
+idle process capacity because a submission may legitimately queue.
 The smallest future addition would be a read-only `task_submission_preview`
 tool accepting the same bounded submit fields and returning only the server's
 policy decision and structured execution capabilities.

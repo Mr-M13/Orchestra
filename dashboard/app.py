@@ -191,8 +191,22 @@ class Dashboard:
         counts = snapshot.get("counts") if isinstance(snapshot.get("counts"), dict) else {}
         pending = [task for task in queued if task.get("queue_state") == "approval_pending"]
         current_by_worker = {task.get("worker"): task for task in running}
+
+        def worker_state(worker: dict[str, Any]) -> str:
+            if worker.get("current_task_id") or worker.get("idle") is False:
+                return "busy"
+            if worker.get("runnable") or worker.get("reason") == "no_queued_task":
+                return "available"
+            return "unavailable"
+
+        def worker_reason(worker: dict[str, Any]) -> str:
+            reason = worker.get("reason")
+            if reason in (None, "no_queued_task", "worker_busy"):
+                return ""
+            return f" · {reason}"
+
         worker_rows = "".join(
-            f'<article class="worker"><h3>{esc(worker.get("worker"))}</h3>{state_badge("busy" if worker.get("current_task_id") else "available" if worker.get("available") else "unavailable")}<p>{esc(current_by_worker.get(worker.get("worker"), {}).get("title", ""))}</p></article>'
+            f'<article class="worker"><h3>{esc(worker.get("worker"))}</h3>{state_badge(worker_state(worker))}<p>{esc(current_by_worker.get(worker.get("worker"), {}).get("title", ""))}{esc(worker_reason(worker))}</p></article>'
             for worker in workers
         ) or "<p>No configured workers.</p>"
         approvals_html = (f'<a class="approval" href="/approvals">{len(pending)} task{"s" if len(pending) != 1 else ""} waiting for approval</a>' if pending else "")

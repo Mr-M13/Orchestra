@@ -1,4 +1,5 @@
 import io
+from contextlib import contextmanager
 from dataclasses import replace
 import http.client
 import json
@@ -1581,6 +1582,253 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(reservations[1]["status"], "released")
         self.assertEqual(self.controller.worker_availability()["execution_limit"], 4)
 
+    def _same_repository_controller(
+        self, worker_names=("one", "two", "three"), *, limit=2,
+        mode="isolated_worktrees", ids=None,
+    ):
+        self.controller.close()
+        identifiers = iter(ids or [
+            f"{number:08d}-1111-1111-1111-111111111111" for number in range(1, 10)
+        ])
+        created: list[Path] = []
+
+        def prepare(task_id, branch, profile, refresh):
+            path = self.state / "worktrees" / profile.profile_id / task_id
+            path.mkdir(parents=True, exist_ok=True)
+            created.append(path)
+            return path
+
+        self.controller = TaskController(
+            Config(
+                "owner/shared", self.root, self.state, "origin/main",
+                {name: Worker(name, ("codex",)) for name in worker_names},
+                Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+                task_approval_mode="disabled", max_parallel_tasks=limit,
+                repository_parallelism=mode,
+            ),
+            popen=self.popen, workspace_preparer=prepare,
+            id_factory=lambda: next(identifiers),
+        )
+        return self.controller, created
+
+    def test_isolated_mode_runs_two_writers_and_promotes_the_third(self):
+        controller, created = self._same_repository_controller(limit=2)
+        submitted = [
+            controller.submit_task(
+                f"isolated-{number}", "Write", "Edit independently",
+                worker, True, None, "routine_development",
+            )
+            for number, worker in enumerate(("one", "two", "three"), 1)
+        ]
+        self.assertEqual(
+            [item["status"] for item in submitted], ["running", "running", "accepted"],
+        )
+        self.assertEqual(self.popen.call_count, 2)
+        self.assertEqual(len(created), 2)
+        running = [controller.state["tasks"][item["task_id"]] for item in submitted[:2]]
+        self.assertEqual(len({task["workspace"] for task in running}), 2)
+        self.assertEqual(len({task["branch"] for task in running}), 2)
+        self.assertEqual(
+            {task["reservation"]["lane"] for task in running}, {1, 2},
+        )
+
+        self.complete(submitted[0]["task_id"])
+        controller.tick()
+        self.assertEqual(
+            controller.state["tasks"][submitted[2]["task_id"]]["status"], "running",
+        )
+        self.assertEqual(self.popen.call_count, 3)
+
+    def test_same_worker_never_overlaps_in_isolated_mode(self):
+        controller, _ = self._same_repository_controller(worker_names=("one",), limit=2)
+        first = controller.submit_task(
+            "same-worker-1", "Write", "Edit", "one", True, None, "routine_development",
+        )
+        second = controller.submit_task(
+            "same-worker-2", "Write", "Edit", "one", True, None, "routine_development",
+        )
+        self.assertEqual(first["status"], "running")
+        self.assertEqual(second["status"], "accepted")
+        self.assertEqual(self.popen.call_count, 1)
+
+    def test_duplicate_branch_identity_fails_closed(self):
+        controller, created = self._same_repository_controller(
+            ids=[
+                "11111111-1111-1111-1111-111111111111",
+                "11111111-2222-2222-2222-222222222222",
+            ],
+        )
+        first = controller.submit_task(
+            "duplicate-1", "Write", "Edit", "one", True, None, "routine_development",
+        )
+        second = controller.submit_task(
+            "duplicate-2", "Write", "Edit", "two", True, None, "routine_development",
+        )
+        self.assertEqual(first["status"], "running")
+        self.assertEqual(second["status"], "failed")
+        self.assertEqual(second["failure"]["type"], "DuplicateWorkspaceIdentity")
+        self.assertEqual(second["reservation"]["status"], "released")
+        self.assertEqual(self.popen.call_count, 1)
+        self.assertEqual(len(created), 1)
+
+    def test_partial_worktree_preparation_is_cleaned_up(self):
+        controller, _ = self._same_repository_controller(worker_names=("one",))
+
+        def partial(task_id, branch, profile, refresh):
+            path = self.state / "worktrees" / profile.profile_id / task_id
+            path.mkdir(parents=True, exist_ok=True)
+            raise RuntimeError("partial worktree preparation failed")
+
+        controller.workspace_preparer = partial
+        submitted = controller.submit_task(
+            "partial", "Write", "Edit", "one", True, None, "routine_development",
+        )
+        task = controller.state["tasks"][submitted["task_id"]]
+        self.assertEqual(task["status"], "failed")
+        self.assertEqual(task["failure"]["type"], "RuntimeError")
+        self.assertEqual(task["reservation"]["status"], "released")
+        expected = (
+            self.state / "worktrees" / "default" / submitted["task_id"]
+        )
+        self.assertFalse(expected.exists())
+
+    def test_repository_setup_lock_is_released_before_worker_start(self):
+        controller, _ = self._same_repository_controller(worker_names=("one",))
+        events: list[str] = []
+
+        @contextmanager
+        def observed_lock(profile):
+            events.append("lock-enter")
+            yield
+            events.append("lock-exit")
+
+        def observed_popen(*_args, **_kwargs):
+            events.append("popen")
+            return FakeProcess()
+
+        controller._repository_setup_lock = observed_lock
+        controller.popen = observed_popen
+        controller.submit_task(
+            "lock", "Write", "Edit", "one", True, None, "routine_development",
+        )
+        self.assertIn("lock-enter", events)
+        self.assertIn("lock-exit", events)
+        self.assertIn("popen", events)
+        self.assertLess(events.index("lock-exit"), events.index("popen"))
+
+    def test_restart_preserves_isolated_queue_and_reservations(self):
+        controller, _ = self._same_repository_controller()
+        submitted = [
+            controller.submit_task(
+                f"restart-{number}", "Write", "Edit", worker, True, None,
+                "routine_development",
+            )
+            for number, worker in enumerate(("one", "two", "three"), 1)
+        ]
+        self.assertEqual(
+            [item["status"] for item in submitted], ["running", "running", "accepted"],
+        )
+        controller.close()
+        self.controller = TaskController(
+            controller.config, popen=self.popen,
+            workspace_preparer=lambda task_id, branch, profile, refresh: (
+                self.state / "worktrees" / profile.profile_id / task_id
+            ),
+        )
+        recovered = [self.controller.state["tasks"][item["task_id"]] for item in submitted]
+        self.assertEqual([item["status"] for item in recovered],
+                         ["running", "running", "accepted"])
+        self.assertEqual(
+            [item["reservation"]["status"] for item in recovered[:2]],
+            ["active", "active"],
+        )
+        self.complete(submitted[0]["task_id"])
+        self.controller.tick()
+        self.assertEqual(
+            self.controller.state["tasks"][submitted[2]["task_id"]]["status"],
+            "running",
+        )
+
+    def test_direct_deepseek_is_read_only_and_shares_only_in_isolated_mode(self):
+        credential = Path(self.temp.name) / "deepseek-key"
+        credential.write_text("test-key-not-used\n")
+        os.chmod(credential, 0o600)
+
+        def build(mode):
+            self.controller.close()
+            state = Path(self.temp.name) / f"deepseek-state-{mode}"
+            self.controller = TaskController(
+                Config(
+                    "owner/shared", self.root, state, "origin/main",
+                    {
+                        "writer": Worker("writer", ("codex",)),
+                        "responder": Worker(
+                            "responder", (), adapter="deepseek", provider="deepseek",
+                            model="deepseek/deepseek-chat",
+                            credential_file=str(credential),
+                            endpoint_host="api.deepseek.com",
+                        ),
+                    },
+                    Principal("chatgpt:test", ALL_PERMISSIONS, "test-session"),
+                    task_approval_mode="disabled", max_parallel_tasks=2,
+                    repository_parallelism=mode,
+                ),
+                popen=self.popen, workspace_preparer=lambda *_: self.root,
+                id_factory=iter([
+                    "11111111-1111-1111-1111-111111111111",
+                    "22222222-2222-2222-2222-222222222222",
+                ]).__next__,
+            )
+            with patch("omcp.controller.deepseek_runner_command",
+                       return_value=["/usr/bin/true"]):
+                first = self.controller.submit_task(
+                    "writer", "Write", "Edit", "writer", True, None,
+                    "routine_development",
+                )
+                second = self.controller.submit_task(
+                    "respond", "Respond", "Read only", "responder", True, None,
+                    "routine_development",
+                )
+            return first, second
+
+        first, second = build("serialized")
+        self.assertEqual(first["status"], "running")
+        self.assertEqual(second["status"], "accepted")
+        self.assertEqual(
+            self.controller.state["tasks"][second["task_id"]]["resource_requirements"]["access"],
+            "read",
+        )
+
+        first, second = build("isolated_worktrees")
+        self.assertEqual([first["status"], second["status"]], ["running", "running"])
+        self.assertEqual(
+            self.controller.state["tasks"][second["task_id"]]["resource_requirements"]["access"],
+            "read",
+        )
+
+    def test_worker_availability_explains_a_repository_block(self):
+        controller, _ = self._same_repository_controller(
+            worker_names=("one", "two"), limit=2, mode="serialized",
+        )
+        first = controller.submit_task(
+            "block-1", "Write", "Edit", "one", True, None, "routine_development",
+        )
+        second = controller.submit_task(
+            "block-2", "Write", "Edit", "two", True, None, "routine_development",
+        )
+        availability = controller.worker_availability()
+        by_name = {item["worker"]: item for item in availability["workers"]}
+        self.assertTrue(by_name["two"]["idle"])
+        self.assertTrue(by_name["two"]["available"])
+        self.assertFalse(by_name["two"]["runnable"])
+        self.assertEqual(by_name["two"]["reason"], "repository_serialized")
+        self.assertEqual(by_name["two"]["next_task_id"], second["task_id"])
+        self.assertEqual(by_name["one"]["reason"], "worker_busy")
+        self.assertEqual(availability["repository_parallelism"], "serialized")
+        self.assertEqual(
+            controller.state["tasks"][first["task_id"]]["status"], "running",
+        )
+
     def test_repository_writer_conflict_blocks_second_profile_for_same_repository(self):
         self.controller.close()
         other = Path(self.temp.name) / "other-checkout"
@@ -2060,6 +2308,37 @@ class ConfigTests(unittest.TestCase):
                 raw["instance_role"] = "primary"
                 config_path.write_text(json.dumps(raw))
                 with self.assertRaisesRegex(ValueError, "authoritative or retired"):
+                    Config.load(config_path)
+
+    def test_config_repository_parallelism_defaults_off_and_validates_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            codex = Path(directory) / "codex"
+            codex.write_text("#!/bin/sh\nexit 0\n")
+            codex.chmod(0o700)
+            config_path = Path(directory) / "omcp.json"
+            raw = {
+                "repository": "owner/repo", "project_root": str(root),
+                "state_dir": str(Path(directory) / "state"),
+                "workers": {"ina": {"command": [str(codex)]}},
+                "principal": {"identity": "chatgpt:test", "permissions": ["tasks:submit"]},
+            }
+            config_path.write_text(json.dumps(raw))
+            os.chmod(config_path, 0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                self.assertEqual(
+                    Config.load(config_path).repository_parallelism, "serialized",
+                )
+                raw["repository_parallelism"] = "isolated_worktrees"
+                config_path.write_text(json.dumps(raw))
+                self.assertEqual(
+                    Config.load(config_path).repository_parallelism,
+                    "isolated_worktrees",
+                )
+                raw["repository_parallelism"] = "unbounded"
+                config_path.write_text(json.dumps(raw))
+                with self.assertRaisesRegex(ValueError, "repository_parallelism"):
                     Config.load(config_path)
 
     def test_config_supports_future_parallel_capacity_without_hardcoded_two(self):

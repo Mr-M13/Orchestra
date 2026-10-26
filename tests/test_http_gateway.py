@@ -635,8 +635,20 @@ class GatewayIntegrationTests(unittest.TestCase):
                 if time.monotonic() > deadline:
                     self.fail("coordinator socket was not created")
                 time.sleep(0.02)
-            self.assertEqual(socket_path.stat().st_mode & 0o777, 0o660)
-            self.assertEqual(socket_path.parent.stat().st_mode & 0o777, 0o710)
+            # bind() creates the socket with the process umask before the
+            # coordinator applies 0660/0710. Wait for the final modes instead
+            # of racing the chmod on a fast runner.
+            deadline = time.monotonic() + 2
+            while True:
+                socket_mode = socket_path.stat().st_mode & 0o777
+                parent_mode = socket_path.parent.stat().st_mode & 0o777
+                if socket_mode == 0o660 and parent_mode == 0o710:
+                    break
+                if time.monotonic() > deadline:
+                    self.fail(
+                        f"socket modes did not settle: {socket_mode:o}/{parent_mode:o}"
+                    )
+                time.sleep(0.01)
             gateway = Gateway(
                 socket_path, TOKEN,
                 socket_owner=socket_owner, socket_group=socket_group,
