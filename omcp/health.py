@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -112,6 +113,17 @@ def collect_health(config_path: Path, tunnel_url: str | None = None) -> dict[str
         checks["state"] = {"ok": False}
         report["errors"].append("state")
         state = {"tasks": {}}
+
+    instance = state.get("instance") if isinstance(state, dict) else None
+    state_store_id = hashlib.sha256(
+        f"{config.repository.lower()}\0{config.state_dir.resolve()}".encode()
+    ).hexdigest()[:24]
+    checks["instance"] = {
+        "instance_id": instance.get("instance_id") if isinstance(instance, dict) else None,
+        "state_store_id": state_store_id,
+        "instance_role": config.instance_role,
+        "authoritative_instance_id": config.authoritative_instance_id,
+    }
 
     audit_path = config.state_dir / "audit.jsonl"
     checks["audit"] = {

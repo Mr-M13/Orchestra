@@ -63,6 +63,37 @@ OpenCode cannot receive standing authorization. Provider output and raw diagnost
 
 The state directory and its files are owner-only. State updates are atomic. `audit.jsonl` is append-only and fsynced for each event; it records principal, authentication context, action, outcome and safe metadata, but not task instructions or worker output. Result retrieval is size-bounded.
 
+### Instance and state-store identity
+
+Every coordinator persists a random `instance_id` and a deterministic,
+non-sensitive `state_store_id` (a hash of repository plus canonical state
+directory, never the path itself). Submission acknowledgements, task status,
+task results, task lists, snapshots, worker availability, approvals and
+`bridge_status` include:
+
+```json
+{
+  "instance_id": "…",
+  "state_store_id": "…",
+  "instance_role": "authoritative"
+}
+```
+
+`bridge_status` also accepts an optional `authoritative_instance_id` on a
+retired instance, so an operator can see which coordinator should receive work.
+The dashboard client refuses to mix responses from two instance IDs during one
+dashboard session. A task ID that is not present in this state store returns
+`task_not_found_in_instance` with the same identity fields; it is not reported
+as a bare `task not found` and never triggers a cross-store lookup.
+
+A retired coordinator is configured with `"instance_role": "retired"`. It keeps
+its durable history, still reports identity through `bridge_status`, and
+refuses task, worker and approval methods with `wrong_instance`. It does not
+execute queued work. This is the supported read-only cutover posture for the
+old Mac state; it does not delete tasks or rewrite their IDs. The active
+connector must point at the PixelBox authoritative instance. Do not run two
+authoritative connectors over different state stores.
+
 ## Repository profiles
 
 V1 configuration remains valid and describes one implicit `default` profile. A multi-repository deployment adds `repository_profiles` and `default_profile`. Every profile binds a stable ID to one GitHub repository, one existing local checkout, and one `origin/<branch>` base ref. OMCP validates the selected ID before persisting a task, records the resolved profile, repository, and ref in task status and local approval review, checks the checkout's HTTPS GitHub origin at worktree creation, and creates the worktree under a profile-specific private state path.
@@ -253,6 +284,7 @@ Use Python 3.11 or newer and a current Codex CLI. Create a state directory outsi
   "max_parallel_tasks": 2,
   "startup_lease_seconds": 30,
   "task_approval_mode": "disabled",
+  "instance_role": "authoritative",
   "standing_authorizations": [
     {
       "id": "routine-development-v1",

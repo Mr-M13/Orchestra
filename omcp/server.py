@@ -12,7 +12,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from omcp import __version__
-from omcp.controller import AuthorizationError, Config, TaskController
+from omcp.controller import (
+    AuthorizationError, Config, TaskController, UnknownTaskError, WrongInstanceError,
+)
 from omcp.local_control import LocalApprovalServer
 
 
@@ -199,6 +201,17 @@ class MCPServer:
                 "content": [{"type": "text", "text": json.dumps(value, sort_keys=True)}],
                 "structuredContent": value,
                 "isError": False,
+            })
+        except (WrongInstanceError, UnknownTaskError) as exc:
+            self.controller.audit_tool_failure(name, exc)
+            error_type = (
+                "wrong_instance" if isinstance(exc, WrongInstanceError)
+                else "task_not_found_in_instance"
+            )
+            return self._result(request_id, {
+                "content": [{"type": "text", "text": f"{error_type}: {exc}"}],
+                "structuredContent": {"error": error_type, **exc.identity},
+                "isError": True,
             })
         except (AuthorizationError, KeyError, ValueError) as exc:
             self.controller.audit_tool_failure(name, exc)
