@@ -642,6 +642,22 @@ def _classify_opencode_logs(runtime_dir: Path, collector: OpenCodeDiagnosticColl
             continue
 
 
+def merge_opencode_runtime_diagnostic(
+    runtime_dir: Path, diagnostic: dict[str, Any], exit_code: int,
+) -> dict[str, Any]:
+    """Upgrade a client-side unknown failure with bounded server-log categories."""
+    collector = OpenCodeDiagnosticCollector()
+    category = diagnostic.get("category")
+    if category in OPENCODE_DIAGNOSTIC_CATEGORIES:
+        collector.category = category
+    status = diagnostic.get("status")
+    if isinstance(status, int) and not isinstance(status, bool):
+        collector.status = status
+    _classify_opencode_logs(runtime_dir, collector)
+    collector.finish()
+    return collector.result(exit_code, timed_out=diagnostic.get("exit_cause") == "timeout")
+
+
 def run_opencode_process(command: list[str], workspace: Path, environment: dict[str, str],
                          runtime_dir: Path, seconds: int) -> tuple[int, dict[str, Any]]:
     """Run OpenCode while reducing all output to a small redacted diagnostic."""
@@ -900,6 +916,9 @@ def run(spec_path: Path) -> int:
                 exit_code, worker_diagnostic = run_opencode_with_server(
                     server_command, command, workspace, environment, runtime_dir,
                     server_port, seconds,
+                )
+                worker_diagnostic = merge_opencode_runtime_diagnostic(
+                    runtime_dir, worker_diagnostic, exit_code,
                 )
                 error_type = "WorkerTimeout" if exit_code == 124 else (
                     "OpenCodeExecutionFailed" if exit_code else None
