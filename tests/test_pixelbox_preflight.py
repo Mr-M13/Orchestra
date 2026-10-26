@@ -63,6 +63,7 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
         install_source = install.read_text()
         self.assertIn("preflight_activation_config", install_source)
         self.assertIn("tar --acls --xattrs", install_source)
+        self.assertIn('dirname "$STATE_ROOT")/backup/pre-activate', install_source)
 
     def test_installer_cannot_start_services_before_readiness_preflight(self):
         source = (DEPLOY / "install.sh").read_text()
