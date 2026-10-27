@@ -244,3 +244,13 @@ test("display helpers are deterministic", () => {
   assert.equal(formatDuration(125), "2m");
   assert.equal(formatDuration(3725), "1h 2m");
 });
+
+
+test("New Task never offers unproven or response-only workers for coding", () => {
+  const { workerIntentAllowed } = require("../dashboard/static/dashboard.js");
+  assert.equal(workerIntentAllowed("analysis", "false"), true);
+  assert.equal(workerIntentAllowed("code_change", "false"), false);
+  assert.equal(workerIntentAllowed("code_change", undefined), false);
+  assert.equal(workerIntentAllowed("code_change", "true"), true);
+  assert.equal(workerIntentAllowed("deployment", "true"), false);
+});

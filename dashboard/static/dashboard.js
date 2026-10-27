@@ -479,7 +479,26 @@
     });
   }
 
+  function workerIntentAllowed(intent, codingReady) {
+    return intent === "analysis" || (intent === "code_change" && codingReady === "true");
+  }
+
   function init() {
+    var intentSelect = document.querySelector('select[name="task_intent"]');
+    var workerSelect = document.querySelector('select[name="worker"]');
+    if (intentSelect && workerSelect) {
+      var updateWorkers = function () {
+        Array.prototype.forEach.call(workerSelect.options, function (option) {
+          option.disabled = !workerIntentAllowed(intentSelect.value, option.dataset.codingReady);
+        });
+        if (workerSelect.selectedIndex < 0 || workerSelect.options[workerSelect.selectedIndex].disabled) {
+          workerSelect.value = "";
+        }
+      };
+      intentSelect.addEventListener("change", updateWorkers);
+      updateWorkers();
+    }
+
     var dashboard = document.getElementById("task-dashboard");
     if (!dashboard || !document.querySelector('[data-section-toggle="running"]')) return;
 
@@ -588,6 +607,7 @@
   }
 
   return {
+    workerIntentAllowed: workerIntentAllowed,
     TaskPoller: TaskPoller,
     init: init,
     nextDelay: nextDelay,

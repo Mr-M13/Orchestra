@@ -344,7 +344,7 @@ class Dashboard:
                     ("Writable files", writable_files),
                 )
             ) + "</ul>"
-        fields = [("Project", task.get("repository_profile", task.get("repository"))), ("Worker", task.get("worker")), ("State", task.get("status")), ("Consequence class", task.get("consequence_class")), ("Authorisation", auth.get("mode")), ("Standing-authorisation ID", auth.get("authorization_id")), ("Created", timestamp(task.get("created_at"))), ("Started", timestamp(task.get("started_at"))), ("Completed", timestamp(task.get("finished_at")))]
+        fields = [("Project", task.get("repository_profile", task.get("repository"))), ("Worker", task.get("worker")), ("State", task.get("status")), ("Intent", task.get("task_intent")), ("Objective", task.get("objective_status", "unverified")), ("Objective note", task.get("objective_note")), ("Consequence class", task.get("consequence_class")), ("Authorisation", auth.get("mode")), ("Standing-authorisation ID", auth.get("authorization_id")), ("Created", timestamp(task.get("created_at"))), ("Started", timestamp(task.get("started_at"))), ("Completed", timestamp(task.get("finished_at")))]
         details = "".join(f"<dt>{esc(name)}</dt><dd>{value if name in {'Created', 'Started', 'Completed'} else esc(value or '—')}</dd>" for name, value in fields)
         failure = task.get("failure") if isinstance(task.get("failure"), dict) else None
         failure_html = ""
@@ -376,10 +376,13 @@ class Dashboard:
         workers = self.client.call("worker_availability").get("workers", [])
         profiles = status.get("repository_profiles", [])
         options = "".join(f'<option value="{esc(value)}">{esc(value)}</option>' for value in profiles)
-        worker_options = "".join(f'<option value="{esc(item.get("worker"))}">{esc(item.get("worker"))}</option>' for item in workers if item.get("available"))
+        worker_options = "".join(
+            f'<option value="{esc(item.get("worker"))}" data-coding-ready="{str(bool(item.get("coding_ready"))).lower()}">{esc(item.get("worker"))} — {"verified coding artifacts" if item.get("coding_ready") else "analysis only in this form; coding unproven or unsupported"}</option>'
+            for item in workers if item.get("available")
+        )
         message = f'<p class="error">{esc(error)}</p>' if error else ""
         request_id = "dashboard-" + uuid.uuid4().hex
-        return self.layout("New Task", f'''<a class="back" href="/">← Dashboard</a><section class="panel"><h1>New Task</h1>{message}<form method="post" action="/new-task"><input type="hidden" name="csrf" value="{esc(self.csrf_token)}"><input type="hidden" name="request_id" value="{request_id}"><label>Project<select name="repository_profile" required>{options}</select></label><label>Worker<select name="worker" required>{worker_options}</select></label><label>Task type<input value="Routine development" disabled><input type="hidden" name="consequence_class" value="routine_development"></label><label>Title<input name="title" maxlength="200" required></label><label>Instructions<textarea name="instructions" required></textarea></label><section class="preview"><h2>Authority preview</h2><p>Orchestra will decide whether standing authorisation applies. Network, credentials, production, deployment, and Git merge/push are not granted by this dashboard.</p></section><button type="submit">Submit task</button></form></section>''')
+        return self.layout("New Task", f'''<a class="back" href="/">← Dashboard</a><section class="panel"><h1>New Task</h1>{message}<form method="post" action="/new-task"><input type="hidden" name="csrf" value="{esc(self.csrf_token)}"><input type="hidden" name="request_id" value="{request_id}"><label>Project<select name="repository_profile" required>{options}</select></label><label>Deliverable<select name="task_intent" required><option value="analysis">Analysis / review — response delivered</option><option value="code_change">Code change — contract and changed files required</option><option value="deployment" disabled>Deployment — no compatible verified worker</option></select></label><label>Worker<select name="worker" required>{worker_options}</select></label><label>Task type<input value="Routine development" disabled><input type="hidden" name="consequence_class" value="routine_development"></label><label>Title<input name="title" maxlength="200" required></label><label>Instructions<textarea name="instructions" required></textarea></label><section class="preview"><h2>Authority preview</h2><p>Orchestra will decide whether standing authorisation applies. Network, credentials, production, deployment, and Git merge/push are not granted by this dashboard.</p></section><button type="submit">Submit task</button></form></section>''')
 
     def _form(self, environ: dict[str, Any]) -> dict[str, str]:
         raw_length = environ.get("CONTENT_LENGTH")
@@ -405,7 +408,7 @@ class Dashboard:
         if (not title or not instructions or len(title) > 200 or "\n" in title
                 or not re.fullmatch(r"dashboard-[0-9a-f]{32}", request_id)):
             return self._page(start_response, self.new_task("Enter a single-line title and instructions."), HTTPStatus.BAD_REQUEST)
-        acknowledgement = self.client.call("submit_task", {"request_id": request_id, "title": title, "instructions": instructions, "worker": form.get("worker", ""), "repository_profile": form.get("repository_profile", ""), "consequence_class": "routine_development"})
+        acknowledgement = self.client.call("submit_task", {"request_id": request_id, "title": title, "instructions": instructions, "worker": form.get("worker", ""), "repository_profile": form.get("repository_profile", ""), "consequence_class": "routine_development", "task_intent": form.get("task_intent", "analysis")})
         return self._page(start_response, self.layout("Task submitted", f'<section class="panel"><h1>Task submitted</h1><p>{state_badge(acknowledgement.get("status"))}</p><p><a href="/tasks/{esc(acknowledgement.get("task_id"))}">View task {esc(acknowledgement.get("task_id"))}</a></p></section>'))
 
     def cancel(self, task_id: str, environ: dict[str, Any], start_response: Callable[..., Any]) -> list[bytes]:

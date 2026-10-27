@@ -48,6 +48,8 @@ TOOLS = [
             "instructions": {"type": "string", "minLength": 1},
             "worker": {"type": "string", "minLength": 1},
             "repository_profile": {"type": "string", "minLength": 1, "maxLength": 64},
+            "task_intent": {"type": "string", "enum": ["analysis", "code_change", "deployment"],
+                            "description": "Required deliverable. Omitted by legacy clients: conservatively inferred; responses never prove implementation."},
             "consequence_class": {
                 "type": "string",
                 "enum": [
@@ -136,7 +138,7 @@ class MCPServer:
             "submit_task": lambda value: controller.submit_task(
                 value.get("request_id"), value.get("title"), value.get("instructions"),
                 value.get("worker"), True, value.get("repository_profile"),
-                value.get("consequence_class", "unclassified"),
+                value.get("consequence_class", "unclassified"), value.get("task_intent"),
             ),
             "submit_host_operation": lambda value: controller.submit_host_operation(
                 value.get("request_id"), value.get("operation_id"), value.get("target_commit"),
