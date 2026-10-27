@@ -138,8 +138,15 @@ def classify_task_intent(title: str, instructions: str, declared: str | None,
     coding = bool(re.search(
         r"\b(?:hotfix|fix|implement|modify|refactor|patch|code change|edit files)\b", text))
     if coding and declared == "analysis":
-        # Explicit reviews may discuss a fix, but must be framed as a review.
-        if not re.search(r"\b(?:review|analyze|analyse|explain|inspect)\b", title.lower()):
+        # Discussion of a fix is analysis; an imperative edit request is not.
+        imperative_code = re.search(
+            r"(?:^|[.;\n]\s*|\bthen\s+)(?:please\s+)?"
+            r"(?:fix|implement|modify|edit|patch|write code|change code)\b",
+            instructions.lower(),
+        )
+        if imperative_code or not re.search(
+            r"\b(?:review|analyze|analyse|explain|inspect)\b", title.lower(),
+        ):
             raise ValueError("code work requires task_intent code_change")
     return declared or ("code_change" if coding else "analysis")
 

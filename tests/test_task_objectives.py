@@ -66,6 +66,12 @@ class ObjectiveTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, 'deployment work requires'):
             classify_task_intent('Fix admin error', 'Change the import; then deploy', 'code_change', 'routine_development')
+        with self.assertRaisesRegex(ValueError, 'code work requires'):
+            classify_task_intent('Review and fix admin error', 'Fix the import', 'analysis', 'routine_development')
+        self.assertEqual(
+            classify_task_intent('Review proposed fix', 'Explain the code change', 'analysis', 'routine_development'),
+            'analysis',
+        )
 
     def test_analysis_response_delivered_without_implementation_claim(self):
         task = self.submit()
