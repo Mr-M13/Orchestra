@@ -4,7 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from omcp.controller import Config, Principal, TaskController, Worker, classify_task_intent
 
@@ -16,6 +16,9 @@ class ObjectiveTests(unittest.TestCase):
         self.root = Path(self.temp.name) / 'repo'
         self.root.mkdir()
         self.launch = Mock(return_value=Mock(pid=os.getpid(), poll=Mock(return_value=None)))
+        sandbox_command = patch('omcp.controller.deepseek_runner_command', return_value=['fake-runner'])
+        sandbox_command.start()
+        self.addCleanup(sandbox_command.stop)
         self.config = Config(
             'owner/repo', self.root, Path(self.temp.name) / 'state', 'origin/main',
             {'codex': Worker('codex', ('codex',)),
