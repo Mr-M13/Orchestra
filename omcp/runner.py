@@ -1035,7 +1035,7 @@ def run(spec_path: Path) -> int:
     worker_diagnostic: dict[str, Any] | None = None
     completion_contract: str | None = None
     completion_contract_error: str | None = None
-    require_contract = adapter == "codex" and spec.get("require_completion_contract") is True
+    require_contract = adapter in {"codex", "opencode"} and spec.get("require_completion_contract") is True
     exit_code, error_type = 125, None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     def terminate(signum: int, _frame: Any) -> None: raise RunnerTerminated(signum)
@@ -1225,7 +1225,7 @@ def run(spec_path: Path) -> int:
         # Read the structured contract and security report while the private
         # contract directory still exists.  These files are never interpreted
         # as natural-language assertions.
-        if adapter == "codex" and contract_tmp is not None and require_contract:
+        if require_contract:
             try:
                 contract = worker_contract.read_completion_contract(
                     worker_contract.contract_path(workspace),

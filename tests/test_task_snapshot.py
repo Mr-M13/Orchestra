@@ -234,7 +234,7 @@ class SnapshotControllerTests(unittest.TestCase):
         self.assertIn("generated_at", result)
         self.assertEqual(result["counts"]["queued"], 1)
         self.assertEqual(result["counts"]["recent"], 1)
-        self.assertEqual(result["recent"][0]["progress"], "Completed")
+        self.assertEqual(result["recent"][0]["progress"], "Objective unverified")
 
 
 if __name__ == "__main__":

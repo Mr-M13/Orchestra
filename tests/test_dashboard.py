@@ -318,6 +318,33 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(arguments["request_id"], request_id)
         self.assertNotIn("requires_approval", arguments)
 
+    def test_new_task_explains_deliverables_and_unproven_workers(self):
+        client = FakeOMCP()
+        client.workers[0]["coding_ready"] = False
+        client.workers[1]["coding_ready"] = True
+        _, page = request(Dashboard(client), "/new-task")
+        self.assertIn('name="task_intent"', page)
+        self.assertIn('value="analysis"', page)
+        self.assertIn('value="code_change"', page)
+        self.assertIn('value="deployment" disabled', page)
+        self.assertIn('value="Ina" data-coding-ready="false"', page)
+        self.assertIn('value="codex" data-coding-ready="true"', page)
+        self.assertIn('coding unproven or unsupported', page)
+
+    def test_new_task_forwards_explicit_code_intent(self):
+        client = FakeOMCP()
+        app = Dashboard(client)
+        form = f"csrf={app.csrf_token}&request_id=dashboard-{'a' * 32}&repository_profile=Delnavazan&worker=codex&title=Fix&instructions=Test&task_intent=code_change"
+        request(app, "/new-task", "POST", form)
+        self.assertEqual(client.calls[-1][1]["task_intent"], "code_change")
+
+    def test_analysis_detail_distinguishes_response_from_implementation(self):
+        client = FakeOMCP()
+        client.task.update(task_intent="analysis", objective_status="response_delivered")
+        _, body = request(Dashboard(client), "/tasks/" + TASK_ID)
+        self.assertIn('response_delivered', body)
+        self.assertIn('analysis', body)
+
     def test_invalid_csrf_cannot_submit_or_cancel(self):
         client = FakeOMCP()
         app = Dashboard(client)

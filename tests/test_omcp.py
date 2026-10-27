@@ -173,6 +173,8 @@ class ControllerTests(unittest.TestCase):
     def complete(self, task_id, exit_code=0, result="finished"):
         task = self.controller.state["tasks"][task_id]
         Path(task["result_path"]).write_text(result)
+        if exit_code == 0 and task.get("task_intent") == "code_change":
+            (Path(task["workspace"]) / "implemented.py").write_text("implemented = True\n")
         record = {
             "exit_code": exit_code, "finished_at": "2026-10-11T00:00:00+00:00",
             "runner_error": None,
@@ -1039,7 +1041,7 @@ class ControllerTests(unittest.TestCase):
         )
 
         for index, consequence_class in enumerate((
-            "production_deployment", "destructive_operation", "security_change", "unclassified",
+            "destructive_operation", "security_change", "unclassified",
         )):
             submitted = self.controller.submit_task(
                 f"protected-{index}", "Consequential work", "Do consequential work", "ina",
@@ -1048,7 +1050,12 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(submitted["status"], "approval_required")
             self.assertEqual(submitted["authorization"], {"mode": "explicit"})
             self.assertEqual(submitted["approval"]["status"], "pending")
-        self.assertEqual(len(self.controller.list_approvals()["approvals"]), 4)
+        with self.assertRaisesRegex(ValueError, "worker does not support task_intent deployment"):
+            self.controller.submit_task(
+                "protected-deployment", "Consequential work", "Do consequential work", "ina",
+                True, "default", "production_deployment",
+            )
+        self.assertEqual(len(self.controller.list_approvals()["approvals"]), 3)
         self.popen.assert_not_called()
 
     def test_disabled_approval_policy_rejects_non_routine_work_without_waiting(self):
@@ -1279,8 +1286,9 @@ class ControllerTests(unittest.TestCase):
         self.assertFalse(by_name["ina"]["proven_healthy"])
         self.assertEqual(by_name["ina"]["last_attempt"]["failure_category"], "credit_exhausted")
         self.assertIn("Add credits to ina", by_name["ina"]["next_action"])
-        self.assertTrue(by_name["codex"]["proven_healthy"])
-        self.assertEqual(by_name["codex"]["health_reason"], "verified_success")
+        self.assertFalse(by_name["codex"]["proven_healthy"])
+        self.assertFalse(by_name["codex"]["coding_ready"])
+        self.assertEqual(by_name["codex"]["health_reason"], "last_attempt_succeeded")
         self.assertIsNone(by_name["codex"]["next_action"])
 
     def test_codex_spec_enables_the_sandbox_startup_probe(self):
@@ -1378,6 +1386,7 @@ class ControllerTests(unittest.TestCase):
 
     def test_trusted_security_evidence_success_marks_task_succeeded(self):
         submitted, task = self._standing_completion("trusted-success")
+        (self.root / "implemented.py").write_text("implemented = True\n")
         with patch(
             "omcp.controller.trusted_probe.run_trusted_security_probe",
             return_value=self._trusted_checks(),
