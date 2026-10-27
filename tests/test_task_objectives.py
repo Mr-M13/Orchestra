@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock
 
-from omcp.controller import Config, Principal, TaskController, Worker
+from omcp.controller import Config, Principal, TaskController, Worker, classify_task_intent
 
 
 class ObjectiveTests(unittest.TestCase):
@@ -54,6 +54,18 @@ class ObjectiveTests(unittest.TestCase):
             with self.subTest(intent=intent), self.assertRaises(ValueError):
                 self.submit('Deploy hotfix', 'Deploy to production', intent=intent)
         self.launch.assert_not_called()
+
+    def test_explicit_intent_allows_deployment_discussion_but_not_execution(self):
+        self.assertEqual(
+            classify_task_intent('Review deployment plan', 'Explain the risks', 'analysis', 'routine_development'),
+            'analysis',
+        )
+        self.assertEqual(
+            classify_task_intent('Fix admin error', 'Change the import; no deployment', 'code_change', 'routine_development'),
+            'code_change',
+        )
+        with self.assertRaisesRegex(ValueError, 'deployment work requires'):
+            classify_task_intent('Fix admin error', 'Change the import; then deploy', 'code_change', 'routine_development')
 
     def test_analysis_response_delivered_without_implementation_claim(self):
         task = self.submit()

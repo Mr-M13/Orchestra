@@ -113,15 +113,28 @@ def classify_task_intent(title: str, instructions: str, declared: str | None,
     if declared is not None and (not isinstance(declared, str) or declared not in TASK_INTENTS):
         raise ValueError("unknown task_intent")
     text = (title + "\n" + instructions).lower()
-    # This bounded compatibility guard catches common legacy misroutes; declared
-    # intent remains mandatory in the dashboard. Prose never grants capability.
-    text = re.sub(r"\b(?:do not|don't|never|without)\s+(?:deploy|deployment)\b", "", text)
-    deployment = consequence == "production_deployment" or bool(
-        re.search(r"\b(?:deploy|deployment|rollout|roll out)\b", text))
-    if deployment and declared not in {None, "deployment"}:
-        raise ValueError("deployment work requires task_intent deployment")
-    if deployment:
-        return "deployment"
+    # An explicit intent is authoritative for ordinary discussion of deployment.
+    # An imperative deployment request still needs deployment authority.
+    imperative_deploy = bool(re.search(
+        r"(?:^|[.;\n]\s*|\bthen\s+)(?:please\s+)?(?:deploy|roll out|release)\b",
+        text,
+    ))
+    if declared is not None:
+        if (consequence == "production_deployment" or imperative_deploy) and declared != "deployment":
+            raise ValueError("deployment work requires task_intent deployment")
+        if declared == "deployment":
+            return "deployment"
+    else:
+        # Legacy clients have no intent field. Fail closed on likely work requests;
+        # ordinary analysis clients should start declaring intent explicitly.
+        legacy_text = re.sub(
+            r"\b(?:do not|don't|never|without|no|avoid)\s+"
+            r"(?:deploy|deployment|rollout|roll out)\b", "", text,
+        )
+        if consequence == "production_deployment" or re.search(
+            r"\b(?:deploy|deployment|rollout|roll out)\b", legacy_text,
+        ):
+            return "deployment"
     coding = bool(re.search(
         r"\b(?:hotfix|fix|implement|modify|refactor|patch|code change|edit files)\b", text))
     if coding and declared == "analysis":
