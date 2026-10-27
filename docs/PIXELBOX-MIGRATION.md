@@ -767,7 +767,11 @@ release directory is a Git checkout and does not run the source-tree unit suite
 by default; add `--with-tests` only when you deliberately want that extra
 source check. Live mode also checks the coordinator, health timer, MCP socket
 mode, tunnel, optional dashboard and GitHub dispatch broker units, and reports
-`UNCHECKED` separately from `PASS`, `SKIP` and `FAIL`. An MCP socket mode of
+`UNCHECKED` separately from `PASS`, `SKIP` and `FAIL`. The authenticated
+HTTP gateway verifier proves the MCP transport and reports worker readiness
+separately: a valid `/readyz` 503 for an accepting coordinator does not prevent
+release activation, but it does not establish that a coding worker is
+operational. An MCP socket mode of
 `600` or `660` passes; world-accessible modes fail. A degraded health report is
 shown with its warnings and passes by default; add `--require-health` to make
 degraded health or any unchecked required probe fatal.

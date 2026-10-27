@@ -84,6 +84,32 @@ def _json_body(response: Response) -> dict:
     return value
 
 
+def _readiness_status(response: Response) -> str:
+    """Accept a live coordinator with no coding capacity, while proving the
+    gateway reached its readiness projection. Transport is verified below by
+    a full authenticated MCP session.
+    """
+    _require(response.status in {200, 503}, f"unexpected HTTP status {response.status}")
+    try:
+        value = json.loads(response.body)
+    except (ValueError, UnicodeDecodeError):
+        raise VerificationError("readiness response is not valid JSON") from None
+    _require(isinstance(value, dict), "readiness response is not an object")
+    if response.status == 200:
+        _require(value.get("ready") is True and value.get("status") == "ready",
+                 "gateway readiness response is inconsistent")
+        return "ready"
+    _require(
+        value.get("ready") is False
+        and value.get("status") in {"degraded", "unavailable"}
+        and value.get("accepting") is True
+        and value.get("can_complete_now") is False
+        and isinstance(value.get("reasons"), list),
+        "gateway backend readiness is unavailable",
+    )
+    return value["status"]
+
+
 def _notification_ack(response: Response) -> None:
     _require(response.status == 200, "notification was rejected")
     if not response.body:
@@ -133,8 +159,9 @@ def verify(host: str, port: int, token: str, cycles: int = 20) -> dict:
             _request(host, port, method, path, body, auth_headers).status == 401,
             f"{method} {path} accepted a missing or wrong token",
         )
-    ready = _json_body(_request(host, port, "GET", "/readyz", headers=headers))
-    _require(ready.get("ready") is True, "gateway backend is not ready")
+    readiness = _readiness_status(_request(
+        host, port, "GET", "/readyz", headers=headers,
+    ))
 
     for cycle in range(cycles):
         initialize = _request(
@@ -195,7 +222,7 @@ def verify(host: str, port: int, token: str, cycles: int = 20) -> dict:
             b'{"jsonrpc":"2.0","id":4,"method":"tools/list"}',
             session_headers,
         ).status == 400, "deleted session remained usable")
-    return {"cycles": cycles, "status": "ok"}
+    return {"cycles": cycles, "status": "ok", "readiness": readiness}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -218,7 +245,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"gateway verification failed: {exc}", file=sys.stderr)
         return 1
     print(
-        f"MCP HTTP verification passed: {result['cycles']} authenticated cycles",
+        f"MCP HTTP verification passed: {result['cycles']} authenticated cycles; "
+        f"worker readiness: {result['readiness']}",
     )
     return 0
 

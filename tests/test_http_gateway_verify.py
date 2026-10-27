@@ -8,7 +8,8 @@ from pathlib import Path
 
 from omcp.http_gateway import Gateway, GatewayServer, make_handler
 from omcp.http_gateway_verify import (
-    Response, VerificationError, _notification_ack, _rpc, read_token_file, verify,
+    Response, VerificationError, _notification_ack, _readiness_status, _rpc,
+    read_token_file, verify,
 )
 from tests.test_http_gateway import FakeBackend, TOKEN
 
@@ -36,7 +37,28 @@ class GatewayVerifierTests(unittest.TestCase):
 
     def test_verifier_checks_json_rpc_results_and_session_deletion(self):
         result = verify("127.0.0.1", self.server.server_port, TOKEN, cycles=2)
-        self.assertEqual(result, {"cycles": 2, "status": "ok"})
+        self.assertEqual(result, {"cycles": 2, "status": "ok", "readiness": "ready"})
+
+    def test_verifier_checks_mcp_when_coordinator_accepts_but_workers_are_unavailable(self):
+        from unittest.mock import patch
+
+        projection = {
+            "ready": False, "status": "unavailable", "accepting": True,
+            "can_complete_now": False, "reasons": ["no_operational_coding_worker"],
+        }
+        with patch.object(self.gateway, "readiness", return_value=projection):
+            result = verify("127.0.0.1", self.server.server_port, TOKEN, cycles=1)
+        self.assertEqual(result, {"cycles": 1, "status": "ok", "readiness": "unavailable"})
+
+    def test_verifier_rejects_unreachable_or_malformed_readiness(self):
+        for value in (
+            Response(503, b'{"ready":false,"status":"unavailable"}', {}),
+            Response(503, b'{"ready":true,"status":"unavailable","accepting":true}', {}),
+            Response(503, b'bad', {}),
+            Response(200, b'{"ready":false,"status":"ready"}', {}),
+        ):
+            with self.subTest(value=value), self.assertRaises(VerificationError):
+                _readiness_status(value)
 
     def test_verifier_rejects_a_gateway_that_accepts_any_long_token(self):
         class WeakGateway(Gateway):
