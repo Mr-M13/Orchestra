@@ -45,8 +45,11 @@ system:
 ## Destination, encryption and custody options
 
 The backup format is restic: encrypted, deduplicated, incremental, with
-retention and `restic check`/`restore`. The repository path is configured; it
-is **not** hard-coded to the Mbox or another same-host disk.
+retention and `restic check`/`restore`. The example repository uses the
+reviewed `/mnt/mbox/OrchestraBackup/restic` path. The service can write only
+that dedicated Mbox subtree, while the rest of `/mnt/mbox` remains read-only.
+Because Mbox is attached to PixelBox, this remains a local recovery copy and
+must keep `off_device: false`.
 
 Choose one before activation:
 

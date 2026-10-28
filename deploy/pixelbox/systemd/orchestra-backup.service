@@ -21,6 +21,7 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/var/lib/orchestra-backup
+ReadWritePaths=-/mnt/mbox/OrchestraBackup
 ReadOnlyPaths=/etc/orchestra
 ReadOnlyPaths=/home/hamed/orchestra-migration
 ReadOnlyPaths=/opt/orchestra

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "repository": "local:/var/lib/orchestra-backup/repository",
+  "repository": "local:/mnt/mbox/OrchestraBackup/restic",
   "password_file": "/etc/orchestra/backup/restic-password",
   "off_device": false,
   "staging_dir": "/var/lib/orchestra-backup/staging",
