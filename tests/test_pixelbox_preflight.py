@@ -134,6 +134,11 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
             containing = coordinator if "codex" in optional else tunnel
             self.assertIn("ReadWritePaths=-" + optional, containing)
 
+        backup = (DEPLOY / "systemd" / "orchestra-backup.service").read_text()
+        self.assertIn("ReadWritePaths=-/mnt/mbox/OrchestraBackup", backup)
+        self.assertIn("ReadOnlyPaths=/mnt/mbox", backup)
+        self.assertNotIn("ReadWritePaths=/mnt/mbox\n", backup)
+
     def test_dashboard_and_approval_portal_units_are_loopback_only_and_hardened(self):
         dashboard = (DEPLOY / "systemd" / "orchestra-dashboard.service").read_text()
         portal = (DEPLOY / "systemd" / "orchestra-approval-portal.service").read_text()
