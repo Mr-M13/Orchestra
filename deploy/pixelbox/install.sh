@@ -465,6 +465,18 @@ if (len(values) != 1
 PY
 }
 
+wait_for_github_dispatch_socket() {
+  local attempt
+  for attempt in {1..50}; do
+    if sudo test -S /run/orchestra-github-dispatch/dispatch.sock 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "ERROR: the GitHub dispatch broker socket is unavailable" >&2
+  return 1
+}
+
 wait_for_omcp_socket() {
   local attempt
   for attempt in {1..50}; do
@@ -636,9 +648,10 @@ activate_release() {
         "$CONFIG_ROOT/omcp.json" \
       && sudo systemctl enable orchestra-omcp.service \
       && sudo systemctl enable --now orchestra-health.timer \
-      && sudo systemctl restart orchestra-omcp.service \
       && sudo systemctl restart orchestra-github-dispatch.service \
       && sudo systemctl is-active --quiet orchestra-github-dispatch.service \
+      && wait_for_github_dispatch_socket \
+      && sudo systemctl restart orchestra-omcp.service \
       && { ! release_has_gateway_unit "$release_root" || wait_for_omcp_socket; } \
       && { ! release_has_gateway_unit "$release_root" || { sudo systemctl enable orchestra-mcp-http.service && sudo systemctl restart orchestra-mcp-http.service && sudo systemctl is-active --quiet orchestra-mcp-http.service; }; } \
       && { ! release_has_gateway_unit "$release_root" || { wait_for_gateway_health && sudo systemctl is-active --quiet orchestra-mcp-http.service; }; } \
@@ -661,10 +674,12 @@ activate_release() {
     atomic_symlink "releases/$old_sha" "$CURRENT_LINK"
     install_units "$old_root"
     sudo systemctl daemon-reload
-    sudo systemctl restart orchestra-omcp.service \
-      || fail "activation failed and the prior coordinator could not restart"
     sudo systemctl restart orchestra-github-dispatch.service \
       || fail "activation failed and the prior GitHub dispatch broker could not restart"
+    wait_for_github_dispatch_socket \
+      || fail "activation failed and the prior GitHub dispatch broker socket is unavailable"
+    sudo systemctl restart orchestra-omcp.service \
+      || fail "activation failed and the prior coordinator could not restart"
     sudo systemctl start orchestra-health.timer \
       || fail "activation failed and the prior health timer could not restart"
     if release_has_gateway_unit "$old_root"; then
