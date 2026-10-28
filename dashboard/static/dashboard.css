@@ -213,3 +213,8 @@ textarea { min-height: 150px; resize: vertical; }
 .system-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); margin-top: 12px; }
 .system-grid h3 { font-size: .95rem; }
 .system-grid p { white-space: pre-line; overflow-wrap: anywhere; font-size: .88rem; }
+
+nav { display:flex; flex-wrap:wrap; gap:4px; }
+.nav-link { color:#334155; text-decoration:none; padding:9px 11px; border-radius:8px; font-weight:650; }
+.nav-link:hover, .nav-link.active { background:#e6ecef; color:#075e54; }
+@media (max-width:750px) { header { flex-wrap:wrap; } .brand { width:100%; } nav { order:2; width:100%; justify-content:space-between; } }

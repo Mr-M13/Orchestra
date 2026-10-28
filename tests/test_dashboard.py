@@ -151,6 +151,50 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", body)
         self.assertNotIn("<script>alert(1)</script>", body)
 
+    def test_menu_separates_orchestra_pixelbox_mbox_and_settings(self):
+        app = Dashboard(FakeOMCP())
+        for path, title in (("/", "Orchestra tasks"), ("/pixelbox", "PixelBox hardware"),
+                            ("/mbox", "Mbox storage"), ("/settings", "Health and diagnostics")):
+            seen, page = request(app, path)
+            self.assertTrue(seen["status"].startswith("200"))
+            self.assertIn(title, page)
+            for href in ("/", "/pixelbox", "/mbox", "/settings"):
+                self.assertIn(f'href="{href}"', page)
+            self.assertIn('id="refresh-tasks"', page)
+        _, home = request(app)
+        self.assertNotIn('id="system-overview"', home)
+        _, mbox = request(app, "/mbox")
+        self.assertIn('id="system-mbox"', mbox)
+        self.assertNotIn('id="system-photo"', mbox)
+
+    def test_follow_up_review_submits_linked_analysis_task(self):
+        client = FakeOMCP()
+        client.task["status"] = "succeeded"
+        client.task["task_intent"] = "code_change"
+        app = Dashboard(client)
+        _, page = request(app, "/tasks/" + TASK_ID)
+        request_id = re.search(r'name="request_id" value="([^"]+)', page).group(1)
+        form = f"csrf={app.csrf_token}&request_id={request_id}&worker=codex&action=review&instructions=Review+the+result"
+        seen, _ = request(app, "/tasks/" + TASK_ID + "/follow-up", "POST", form)
+        self.assertTrue(seen["status"].startswith("303"))
+        tool, args = client.calls[-1]
+        self.assertEqual(tool, "submit_task")
+        self.assertEqual(args["follow_up_of"], TASK_ID)
+        self.assertEqual(args["task_intent"], "analysis")
+        self.assertEqual(args["worker"], "codex")
+        self.assertIn("Review the result", args["instructions"])
+
+    def test_follow_up_rejects_unproven_coding_worker(self):
+        client = FakeOMCP()
+        client.task["task_intent"] = "code_change"
+        app = Dashboard(client)
+        _, page = request(app, "/tasks/" + TASK_ID)
+        request_id = re.search(r'name="request_id" value="([^"]+)', page).group(1)
+        form = f"csrf={app.csrf_token}&request_id={request_id}&worker=Ina&action=follow_up&instructions=Write+code"
+        seen, _ = request(app, "/tasks/" + TASK_ID + "/follow-up", "POST", form)
+        self.assertTrue(seen["status"].startswith("400"))
+        self.assertNotIn("submit_task", [tool for tool, _ in client.calls])
+
     def test_home_renders_current_readiness_and_worker_roles(self):
         _, body = request(Dashboard(FakeOMCP()))
         self.assertIn("Current readiness: ready", body)
@@ -161,8 +205,8 @@ class DashboardTests(unittest.TestCase):
         _, body = request(Dashboard(FakeOMCP()))
         self.assertIn("last attempt blocked: workspace credits exhausted", body)
         self.assertIn("state-unavailable", body)
-        codex_start = body.index("<h3>codex</h3>")
-        codex_row = body[codex_start:body.index("</article>", codex_start)]
+        codex_start = body.index("<strong>codex</strong>")
+        codex_row = body[body.rfind('<article class="worker">', 0, codex_start):body.index("</article>", codex_start)]
         self.assertIn("state-available", codex_row)
 
     def test_worker_rows_do_not_advertise_a_failed_last_attempt_as_available(self):
@@ -173,8 +217,8 @@ class DashboardTests(unittest.TestCase):
         client.workers[0]["health_reason"] = "last_attempt_failed"
         client.workers[0]["next_action"] = None
         _, body = request(Dashboard(client))
-        ina_start = body.index("<h3>Ina</h3>")
-        ina_row = body[ina_start:body.index("</article>", ina_start)]
+        ina_start = body.index("<strong>Ina</strong>")
+        ina_row = body[body.rfind('<article class="worker">', 0, ina_start):body.index("</article>", ina_start)]
         self.assertIn("state-unavailable", ina_row)
         self.assertIn("last attempt failed: malformed_completion", ina_row)
 
@@ -266,7 +310,7 @@ class DashboardTests(unittest.TestCase):
             self.assertIn(f'data-section-toggle="{name}"', body)
             self.assertIn(f'aria-controls="{name}-panel"', body)
             self.assertIn(f'id="{name}-toggle"', body)
-        self.assertEqual(body.count('type="button"'), 5)  # three sections + task/system Refresh
+        self.assertEqual(body.count('type="button"'), 4)  # three sections + top Refresh
 
     def test_refresh_updates_contents_without_collapsing_or_scrolling(self):
         source = (Path(__file__).resolve().parents[1] / "dashboard/static/dashboard.js").read_text()

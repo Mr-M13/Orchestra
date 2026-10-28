@@ -530,6 +530,7 @@ class Config:
     base_ref: str
     workers: dict[str, Worker]
     principal: Principal
+    enabled_workers: frozenset[str] | None = None
     max_task_bytes: int = 65_536
     max_result_bytes: int = 65_536
     approval_ttl_seconds: int = 1_800
@@ -614,6 +615,16 @@ class Config:
             )
         if not workers:
             raise ValueError("at least one worker is required")
+        enabled_raw = raw.get("enabled_workers")
+        if enabled_raw is None:
+            enabled_workers = None
+        elif (not isinstance(enabled_raw, list) or not enabled_raw
+              or any(not isinstance(name, str) for name in enabled_raw)
+              or len(enabled_raw) != len(set(enabled_raw))
+              or set(enabled_raw) - set(workers)):
+            raise ValueError("enabled_workers must be a nonempty list of distinct configured workers")
+        else:
+            enabled_workers = frozenset(enabled_raw)
         for worker in workers.values():
             if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", worker.name):
                 raise ValueError("invalid worker name")
@@ -1008,6 +1019,7 @@ class Config:
             base_ref=base_ref,
             workers=workers,
             principal=principal,
+            enabled_workers=enabled_workers,
             max_task_bytes=max(
                 1_024, min(int(raw.get("max_task_bytes", 65_536)), 1_048_576),
             ),
@@ -1405,6 +1417,7 @@ class TaskController:
             "remote_status", "remote_conclusion", "remote_artifact",
             "source_sha", "instance_id", "state_store_id", "instance_role",
             "task_intent", "intent_source", "response_status", "objective_status", "artifact_evidence",
+            "follow_up_of", "review_read_only",
         )
         public = {key: task[key] for key in keys if key in task}
         public.setdefault("objective_status", "unverified")
@@ -1530,6 +1543,7 @@ class TaskController:
         self, request_id: str, title: str, instructions: str, worker: str,
         requires_approval: bool = True, repository_profile: str | None = None,
         consequence_class: str = "unclassified", task_intent: str | None = None,
+        follow_up_of: str | None = None, review_read_only: bool = False,
     ) -> dict[str, Any]:
         self._authorize("tasks:submit", "task.submit")
         self._require_authoritative("task.submit")
@@ -1568,10 +1582,20 @@ class TaskController:
                 "autonomous mode accepts only routine_development tasks; "
                 "other classes are rejected without human approval"
             )
+        if follow_up_of is not None:
+            if not isinstance(follow_up_of, str) or follow_up_of not in self.state["tasks"]:
+                raise ValueError("unknown parent task")
+            if self.state["tasks"][follow_up_of].get("repository_profile") != profile.profile_id:
+                raise ValueError("follow-up must use the parent repository profile")
+        if not isinstance(review_read_only, bool):
+            raise ValueError("review_read_only must be a boolean")
+        digest_fields: list[Any] = [title, instructions, worker, profile.profile_id, consequence_class]
+        if task_intent is not None:
+            digest_fields.append(task_intent)
+        if follow_up_of is not None or review_read_only:
+            digest_fields.extend([follow_up_of, review_read_only])
         digest = hashlib.sha256(json.dumps(
-            [title, instructions, worker, profile.profile_id, consequence_class]
-            + ([task_intent] if task_intent is not None else []),
-            separators=(",", ":")
+            digest_fields, separators=(",", ":")
         ).encode()).hexdigest()
         previous_id = self.state["requests"].get(request_id)
         if previous_id:
@@ -1581,7 +1605,11 @@ class TaskController:
                 raise ValueError("request_id was already used with different task content")
             self._audit("task.submit", previous_id, "replayed", {"request_id": request_id})
             return {**self._public(previous), "acknowledged": True, "idempotent_replay": True}
+        if self.config.enabled_workers is not None and worker not in self.config.enabled_workers:
+            raise ValueError("worker is disabled for new tasks")
         intent = classify_task_intent(title, instructions, task_intent, consequence_class)
+        if review_read_only and (intent != "analysis" or self.config.workers[worker].adapter != "codex"):
+            raise ValueError("read-only review requires a Codex analysis task")
         if intent == "deployment" and consequence_class == "routine_development":
             raise ValueError("deployment cannot use routine_development")
         if intent not in WORKER_INTENTS[self.config.workers[worker].adapter]:
@@ -1613,6 +1641,8 @@ class TaskController:
             "base_ref": profile.base_ref,
             "consequence_class": consequence_class,
             "task_intent": intent, "intent_source": "explicit" if task_intent else "legacy_inferred",
+            **({"follow_up_of": follow_up_of} if follow_up_of else {}),
+            **({"review_read_only": True} if review_read_only else {}),
             "objective_status": "pending", "response_status": "pending",
             "submitted_by": self.config.principal.identity,
             "status": status, "created_at": now,
@@ -1649,6 +1679,13 @@ class TaskController:
             task["approval"] = {
                 "status": "pending", "requested_at": now, "expires_at": expires_at,
             }
+        if review_read_only:
+            task["execution_capabilities"] = {
+                "profile": "routine_development_v1",
+                "writable_paths": [], "writable_files": [],
+                "network": False, "external_credentials": False,
+                "git_metadata": "read_only",
+            }
         # The direct DeepSeek adapter is response-only: it reads the task
         # worktree but the sandbox never grants a workspace write.  Do not
         # reserve a writer slot for it.  Standing grants with no writable roots
@@ -1659,7 +1696,7 @@ class TaskController:
             and not standing_authorization.writable_paths
             and not standing_authorization.writable_files
         )
-        access = "read" if response_only or read_only_grant else "write"
+        access = "read" if response_only or read_only_grant or review_read_only else "write"
         task["resource_requirements"] = {
             "worker": worker, "repository": profile.repository.lower(), "access": access,
         }
@@ -1990,7 +2027,9 @@ class TaskController:
                 self._deepseek_guard()
                 if worker_config.provider == DEEPSEEK_PROVIDER else None
             )
-            if guard is not None:
+            if self.config.enabled_workers is not None and name not in self.config.enabled_workers:
+                reason = "disabled"
+            elif guard is not None:
                 reason = "deepseek_account_blocked"
             elif (worker_config.provider == DEEPSEEK_PROVIDER
                   and self._provider_active_count(DEEPSEEK_PROVIDER)
@@ -2011,15 +2050,20 @@ class TaskController:
             health = self._worker_health(name)
             workers.append({
                 "worker": name,
-                "adapter": self.config.workers[name].adapter,
+                "adapter": worker_config.adapter,
+                "provider": worker_config.provider or ("openai" if worker_config.adapter == "codex" else worker_config.adapter),
+                "model": worker_config.model or ("Codex CLI default" if worker_config.adapter == "codex" else None),
+                "enabled": self.config.enabled_workers is None or name in self.config.enabled_workers,
                 "configured": True,
                 "supported_intents": list(WORKER_INTENTS[worker_config.adapter]),
-                "coding_ready": bool(health["proven_healthy"] and "code_change" in WORKER_INTENTS[worker_config.adapter]),
+                "coding_ready": bool((self.config.enabled_workers is None or name in self.config.enabled_workers)
+                                     and health["proven_healthy"]
+                                     and "code_change" in WORKER_INTENTS[worker_config.adapter]),
                 "idle": current is None,
                 "capacity_available": capacity_available,
                 # Legacy field: idle process capacity, not proof that the next
                 # queued task can start.
-                "available": current is None and capacity_available,
+                "available": current is None and capacity_available and reason != "disabled",
                 # Authoritative scheduling readiness.  The dashboard must use
                 # this field (and reason) instead of advertising idle capacity
                 # that a repository or worker block makes unusable.
@@ -2369,6 +2413,9 @@ class TaskController:
         repository_heads: dict[str, dict[str, Any]] = {}
         repository_order: list[str] = []
         for task in accepted:
+            if (self.config.enabled_workers is not None
+                    and task["worker"] not in self.config.enabled_workers):
+                continue
             requirement = task.get("resource_requirements", {})
             repository = requirement.get("repository", task.get("repository", "").lower())
             if repository not in repository_heads:
@@ -2383,6 +2430,9 @@ class TaskController:
         for repository in repository_order:
             task = repository_heads[repository]
             if task["worker"] in active_workers:
+                continue
+            if (self.config.enabled_workers is not None
+                    and task["worker"] not in self.config.enabled_workers):
                 continue
             requirement = task.get("resource_requirements", {})
             access = requirement.get("access", "write")

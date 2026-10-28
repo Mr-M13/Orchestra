@@ -183,6 +183,76 @@ class ControllerTests(unittest.TestCase):
             record["completion_contract"] = "success" if exit_code == 0 else "failure"
         Path(task["completion_path"]).write_text(json.dumps(record))
 
+    def test_enabled_workers_config_rejects_unknown_or_duplicate_names(self):
+        codex = Path(self.temp.name) / "codex"
+        codex.write_text("#!/bin/sh\\nexit 0\\n")
+        codex.chmod(0o700)
+        config_path = Path(self.temp.name) / "enabled-omcp.json"
+        raw = {
+            "repository": "owner/repo", "project_root": str(self.root),
+            "state_dir": str(self.state),
+            "workers": {"ina": {"command": ["codex"]},
+                        "codex": {"command": ["codex"]}},
+            "principal": {"identity": "chatgpt:test", "permissions": ["status:read"]},
+            "enabled_workers": ["codex"],
+        }
+        def load():
+            config_path.write_text(json.dumps(raw))
+            config_path.chmod(0o600)
+            with patch("omcp.controller.shutil.which", return_value=str(codex)):
+                return Config.load(config_path)
+        self.assertEqual(load().enabled_workers, frozenset({"codex"}))
+        raw["enabled_workers"] = ["codex", "codex"]
+        with self.assertRaisesRegex(ValueError, "enabled_workers"):
+            load()
+        raw["enabled_workers"] = ["missing"]
+        with self.assertRaisesRegex(ValueError, "enabled_workers"):
+            load()
+
+    def test_disabled_worker_rejects_new_tasks_and_availability_says_disabled(self):
+        self.controller.config = replace(
+            self.config,
+            workers={"ina": Worker("ina", ("codex",)),
+                     "other": Worker("other", ("codex",))},
+            enabled_workers=frozenset({"other"}),
+            task_approval_mode="disabled",
+        )
+        with self.assertRaisesRegex(ValueError, "disabled"):
+            self.controller.submit_task(
+                "disabled-1", "Simple change", "Create a file", "ina",
+                consequence_class="routine_development", task_intent="code_change",
+            )
+        availability = self.controller.worker_availability()
+        by_name = {item["worker"]: item for item in availability["workers"]}
+        self.assertFalse(by_name["ina"]["enabled"])
+        self.assertFalse(by_name["ina"]["available"])
+        self.assertEqual(by_name["ina"]["reason"], "disabled")
+        self.assertTrue(by_name["other"]["enabled"])
+
+    def test_follow_up_review_is_linked_and_has_no_repository_write_grant(self):
+        self.controller.config = replace(self.config, task_approval_mode="disabled")
+        first = self.controller.submit_task(
+            "parent-1", "Inspect files", "Summarise the files", "ina",
+            consequence_class="routine_development", task_intent="analysis",
+        )
+        self.controller.id_factory = lambda: "22222222-2222-2222-2222-222222222222"
+        review = self.controller.submit_task(
+            "review-1", "Review result", "Check the prior result", "ina",
+            consequence_class="routine_development", task_intent="analysis",
+            follow_up_of=first["task_id"], review_read_only=True,
+        )
+        self.assertEqual(review["follow_up_of"], first["task_id"])
+        self.assertTrue(review["review_read_only"])
+        self.assertEqual(review["resource_requirements"]["access"], "read")
+        self.assertEqual(review["execution_capabilities"]["writable_paths"], [])
+        self.assertEqual(review["execution_capabilities"]["writable_files"], [])
+        with self.assertRaisesRegex(ValueError, "read-only review requires"):
+            self.controller.submit_task(
+                "review-bad", "Write a file", "Create a file", "ina",
+                consequence_class="routine_development", task_intent="code_change",
+                follow_up_of=first["task_id"], review_read_only=True,
+            )
+
     def test_submission_is_durable_acknowledged_and_idempotent(self):
         first = self.submit()
         self.assertTrue(first["acknowledged"])

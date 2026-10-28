@@ -47,7 +47,8 @@ def worker_health_from_state(config: Any, state: dict[str, Any]) -> Callable[[st
         failure = last.get("failure") if isinstance(last.get("failure"), dict) else None
         category = failure.get("category") if failure else None
         adapter = config.workers[name].adapter
-        proven = adapter in CODING_ADAPTERS and last.get("status") == "succeeded"
+        proven = (adapter in CODING_ADAPTERS and last.get("status") == "succeeded"
+                  and last.get("objective_status") == "artifact_verified")
         if adapter == "deepseek":
             reason = "response_only"
         elif proven:
@@ -100,6 +101,8 @@ def build_readiness(
             else {"proven_healthy": False, "health_reason": "unverified", "last_attempt": None}
         )
         current = active_by_worker.get(name)
+        enabled_workers = getattr(config, "enabled_workers", None)
+        enabled = enabled_workers is None or name in enabled_workers
         if worker.adapter == "deepseek":
             role = "response_only"
             operational = bool(
@@ -112,12 +115,14 @@ def build_readiness(
         else:
             role = "coding"
             operational = bool(health.get("proven_healthy"))
+        if not enabled:
+            operational = False
         if role in {"coding", "remote_coding"} and operational:
             coding_operational.append(name)
             if current is None:
                 idle_coding.append(name)
         workers.append({
-            "worker": name, "adapter": worker.adapter, "role": role,
+            "worker": name, "adapter": worker.adapter, "role": role, "enabled": enabled,
             "operational": operational,
             "available_now": current is None and capacity and operational,
             "current_task_id": current.get("task_id") if current else None,
