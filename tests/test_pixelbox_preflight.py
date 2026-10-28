@@ -86,6 +86,17 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
         self.assertLess(backup_pos, install_units_pos)
         self.assertIn("restore_activation_config", source)
 
+        activate = source[source.index("activate_release() {") :]
+        broker_restart = activate.index(
+            "systemctl restart orchestra-github-dispatch.service"
+        )
+        broker_wait = activate.index("wait_for_github_dispatch_socket", broker_restart)
+        coordinator_restart = activate.index(
+            "systemctl restart orchestra-omcp.service", broker_wait
+        )
+        self.assertLess(broker_restart, broker_wait)
+        self.assertLess(broker_wait, coordinator_restart)
+
     def test_installer_reapplies_broker_acl_after_config_directory_install(self):
         source = (DEPLOY / "install.sh").read_text()
         helper = DEPLOY / "config-access.sh"
