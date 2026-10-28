@@ -155,6 +155,7 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
             self.assertIn("ReadWritePaths=-" + optional, containing)
 
         backup = (DEPLOY / "systemd" / "orchestra-backup.service").read_text()
+        self.assertIn("ExecStart=/usr/bin/python3 -B -m omcp.backup", backup)
         self.assertIn("StateDirectory=orchestra-backup", backup)
         self.assertIn("StateDirectoryMode=0700", backup)
         self.assertIn("ReadWritePaths=-/mnt/mbox/OrchestraBackup", backup)

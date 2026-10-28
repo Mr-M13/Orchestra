@@ -100,7 +100,7 @@ test has passed.
   the result. Health treats an integrity check older than 192 hours as failed.
 - Recency: health treats a last successful snapshot older than 30 hours as
   failed. A timer that exists is never evidence of a healthy backup.
-- Restore test: run `python3 -m omcp.backup --config /etc/orchestra/backup.json
+- Restore test: run `python3 -B -m omcp.backup --config /etc/orchestra/backup.json
   restore --snapshot latest --target /var/lib/orchestra-backup/restore-test-<date>`
   into an isolated directory, verify the manifest and representative files, and
   remove the isolated copy after recording evidence. Never restore over
