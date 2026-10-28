@@ -97,6 +97,15 @@ class PixelBoxDeploymentPreflightTests(unittest.TestCase):
         self.assertLess(broker_restart, broker_wait)
         self.assertLess(broker_wait, coordinator_restart)
 
+        dependent_gate = source[
+            source.index("service_active_if_installed() {") : source.index(
+                "activate_release() {"
+            )
+        ]
+        self.assertIn("for attempt in {1..50}", dependent_gate)
+        self.assertIn('systemctl is-active --quiet "$unit"', dependent_gate)
+        self.assertIn("sleep 0.2", dependent_gate)
+
     def test_installer_reapplies_broker_acl_after_config_directory_install(self):
         source = (DEPLOY / "install.sh").read_text()
         helper = DEPLOY / "config-access.sh"
