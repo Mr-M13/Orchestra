@@ -48,6 +48,8 @@ TOOLS = [
             "instructions": {"type": "string", "minLength": 1},
             "worker": {"type": "string", "minLength": 1},
             "repository_profile": {"type": "string", "minLength": 1, "maxLength": 64},
+            "follow_up_of": {"type": "string", "description": "Existing parent task ID; follow-up stays in the same repository profile."},
+            "review_read_only": {"type": "boolean", "description": "Analysis review with no repository write grant."},
             "task_intent": {"type": "string", "enum": ["analysis", "code_change", "deployment"],
                             "description": "Required deliverable. Omitted by legacy clients: conservatively inferred; responses never prove implementation."},
             "consequence_class": {
@@ -139,6 +141,7 @@ class MCPServer:
                 value.get("request_id"), value.get("title"), value.get("instructions"),
                 value.get("worker"), True, value.get("repository_profile"),
                 value.get("consequence_class", "unclassified"), value.get("task_intent"),
+                value.get("follow_up_of"), value.get("review_read_only", False),
             ),
             "submit_host_operation": lambda value: controller.submit_host_operation(
                 value.get("request_id"), value.get("operation_id"), value.get("target_commit"),

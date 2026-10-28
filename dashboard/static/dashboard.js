@@ -500,7 +500,11 @@
     }
 
     var dashboard = document.getElementById("task-dashboard");
-    if (!dashboard || !document.querySelector('[data-section-toggle="running"]')) return;
+    if (!dashboard || !document.querySelector('[data-section-toggle="running"]')) {
+      var pageRefresh = document.getElementById("refresh-tasks");
+      if (pageRefresh) pageRefresh.addEventListener("click", function () { root.location.reload(); });
+      return;
+    }
 
     installSectionToggles();
 

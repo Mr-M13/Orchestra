@@ -6,7 +6,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from omcp.readiness import build_readiness
+from omcp.readiness import build_readiness, worker_health_from_state
 
 
 def _worker(adapter: str) -> SimpleNamespace:
@@ -29,6 +29,15 @@ def _health(**values):
 
 
 class ReadinessTests(unittest.TestCase):
+    def test_state_helper_does_not_trust_response_only_success(self):
+        config = _config({"codex": "codex"})
+        state = _state({"one": {"task_id": "one", "worker": "codex",
+                                "status": "succeeded", "finished_at": "2026-10-27T00:00:00+00:00"}})
+        health = worker_health_from_state(config, state)("codex")
+        self.assertFalse(health["proven_healthy"])
+        state["tasks"]["one"]["objective_status"] = "artifact_verified"
+        self.assertTrue(worker_health_from_state(config, state)("codex")["proven_healthy"])
+
     def test_no_verified_coding_worker_is_unavailable(self):
         readiness = build_readiness(
             _config({"ina": "codex"}), _state(),

@@ -8,7 +8,7 @@
   var status = document.getElementById("system-updated");
   var lastUpdated = "";
   function node(key) { return document.getElementById("system-" + key); }
-  function set(key, value) { node(key).textContent = value; }
+  function set(key, value) { var target = node(key); if (target) target.textContent = value; }
   function label(value) {
     if (value === "up") return "up";
     if (value === "down") return "down";
@@ -83,7 +83,7 @@
   function refresh() {
     if (busy || document.hidden) return;
     busy = true;
-    button.disabled = true;
+    if (button) button.disabled = true;
     var controller = new AbortController();
     var timeout = setTimeout(function () { controller.abort(); }, 12000);
     fetch("/api/system", { method: "GET", credentials: "same-origin", cache: "no-store", headers: { Accept: "application/json" }, signal: controller.signal })
@@ -95,10 +95,10 @@
       }).finally(function () {
         clearTimeout(timeout);
         busy = false;
-        button.disabled = false;
+        if (button) button.disabled = false;
       });
   }
-  button.addEventListener("click", refresh);
+  if (button) button.addEventListener("click", refresh);
   document.addEventListener("visibilitychange", function () { if (!document.hidden) refresh(); });
   var timer = setInterval(refresh, 30000);
   window.addEventListener("pagehide", function () { clearInterval(timer); });

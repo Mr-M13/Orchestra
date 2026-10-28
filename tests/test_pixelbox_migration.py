@@ -674,6 +674,7 @@ class HealthTests(unittest.TestCase):
                     "11111111-1111-1111-1111-111111111111": {
                         "task_id": "11111111-1111-1111-1111-111111111111",
                         "status": "succeeded", "worker": "ina",
+                        "objective_status": "artifact_verified",
                         "created_at": now, "finished_at": now,
                     },
                 },
