@@ -617,9 +617,16 @@ restore_activation_config() {
 }
 
 service_active_if_installed() {
-  local unit="$1"
+  local unit="$1" attempt
   if systemctl list-unit-files --no-legend "$unit" 2>/dev/null | grep -q "^$unit"; then
-    sudo systemctl is-active --quiet "$unit"
+    for attempt in {1..50}; do
+      if sudo systemctl is-active --quiet "$unit"; then
+        return 0
+      fi
+      sleep 0.2
+    done
+    echo "ERROR: installed service did not become active: $unit" >&2
+    return 1
   fi
 }
 
